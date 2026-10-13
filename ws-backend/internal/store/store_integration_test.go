@@ -2,12 +2,14 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -89,6 +91,7 @@ func TestGetAnswerSaveStateReadsCommittedLifecycleRows(t *testing.T) {
 		CREATE TABLE "Exam" (id text PRIMARY KEY, status text NOT NULL, "closedAt" timestamp(3));
 		CREATE TABLE "ExamSession" (
 			id text PRIMARY KEY, "examId" text NOT NULL, status text NOT NULL,
+			"activeAuthSessionId" text, "activeDeviceId" text,
 			"lockedAt" timestamp(3), "submittedAt" timestamp(3),
 			"effectiveEndTime" timestamp(3)
 		);
@@ -112,6 +115,44 @@ func TestGetAnswerSaveStateReadsCommittedLifecycleRows(t *testing.T) {
 		state.LockedAt != nil || state.SubmittedAt != nil {
 		t.Fatalf("unexpected lifecycle state: %+v", state)
 	}
+
+	t.Run("claim waits until authorized answer is buffered", func(t *testing.T) {
+		if _, err := pool.Exec(ctx, `UPDATE "ExamSession" SET "activeAuthSessionId"='login-a', "activeDeviceId"='tab-a' WHERE id='s'`); err != nil {
+			t.Fatal(err)
+		}
+		err := New(pool).WithAnswerSaveState(ctx, "e", "s", time.Now(), func(state *AnswerSaveState) error {
+			if state.ActiveAuthSessionID == nil || *state.ActiveAuthSessionID != "login-a" || state.ActiveDeviceID == nil || *state.ActiveDeviceID != "tab-a" {
+				t.Fatalf("ownership not loaded: %+v", state)
+			}
+			// This callback is where the Redis write runs. A competing claim
+			// must not change ownership until the write has finished.
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+			if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout='100ms'`); err != nil {
+				return err
+			}
+			_, err = tx.Exec(ctx, `UPDATE "ExamSession" SET "activeAuthSessionId"='login-b', "activeDeviceId"='tab-b' WHERE id='s'`)
+			var pgErr *pgconn.PgError
+			if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+				t.Fatalf("claim acquired lock during buffer callback: %v", err)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE "ExamSession" SET "activeAuthSessionId"='login-b', "activeDeviceId"='tab-b' WHERE id='s'`); err != nil {
+			t.Fatal(err)
+		}
+		after, err := New(pool).GetAnswerSaveState(ctx, "e", "s", time.Now())
+		if err != nil || after.ActiveAuthSessionID == nil || *after.ActiveAuthSessionID != "login-b" {
+			t.Fatalf("next save missed claim: %+v, %v", after, err)
+		}
+	})
+
 	lockedAt := time.Now().UTC().Truncate(time.Millisecond)
 	lockTx, err := pool.Begin(ctx)
 	if err != nil {
@@ -462,7 +503,7 @@ func TestFlushAnswers_PreservesPreLockSave(t *testing.T) {
 // Lock waits update row versions, but not the statement's interval snapshot.
 func TestLifecycleReadsRefreshIntervalSnapshotAfterLockWait(t *testing.T) {
 	ctx, setup, _, transition := testPostgres(t)
-	if _, err := setup.Exec(ctx, `CREATE TABLE "Exam" (id text PRIMARY KEY, status text, "closedAt" timestamp(3)); INSERT INTO "Exam" VALUES ('e','ACTIVE',NULL); ALTER TABLE "ExamSession" ADD COLUMN "examId" text DEFAULT 'e', ADD COLUMN "effectiveEndTime" timestamp(3);`); err != nil {
+	if _, err := setup.Exec(ctx, `CREATE TABLE "Exam" (id text PRIMARY KEY, status text, "closedAt" timestamp(3)); INSERT INTO "Exam" VALUES ('e','ACTIVE',NULL); ALTER TABLE "ExamSession" ADD COLUMN "examId" text DEFAULT 'e', ADD COLUMN "effectiveEndTime" timestamp(3), ADD COLUMN "activeAuthSessionId" text, ADD COLUMN "activeDeviceId" text;`); err != nil {
 		t.Fatal(err)
 	}
 	var schema string

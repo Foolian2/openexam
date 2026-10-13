@@ -2,9 +2,11 @@
 import { act, render, screen } from "@testing-library/react"
 import { Storage as BrowserStorage } from "happy-dom"
 import { afterEach, beforeEach, expect, it, vi } from "vitest"
+import type { ClaimOutcome } from "@/lib/exam-device-client"
 
 const mocks = vi.hoisted(() => ({
   fetch: vi.fn(),
+  claim: vi.fn<() => Promise<ClaimOutcome>>(async () => ({ ok: true })),
   router: { push: vi.fn() },
   socket: {
     connected: false,
@@ -18,6 +20,10 @@ vi.mock("next-themes", () => ({ useTheme: () => ({ theme: "light" }) }))
 vi.mock("@/lib/seb-client", () => ({
   sebFetch: mocks.fetch,
   getSebKey: vi.fn(async () => null),
+}))
+vi.mock("@/lib/exam-device-client", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/exam-device-client")>()),
+  claimExamDevice: mocks.claim,
 }))
 vi.mock("@/hooks/use-exam-socket", () => ({
   useExamSocket: () => mocks.socket,
@@ -62,6 +68,7 @@ beforeEach(() => {
   vi.useFakeTimers()
   vi.spyOn(Math, "random").mockReturnValue(0.5)
   mocks.fetch.mockReset()
+  mocks.claim.mockReset().mockResolvedValue({ ok: true })
   mocks.router.push.mockReset()
   // Node 26 also exposes Web Storage globals; use this test browser's
   // storage so the simulated runner exercises browser persistence.
@@ -70,6 +77,8 @@ beforeEach(() => {
     "IntersectionObserver",
     class {
       observe() {}
+      // next/link's prefetch observer unobserves on unmount.
+      unobserve() {}
       disconnect() {}
     }
   )
@@ -88,6 +97,23 @@ async function mount() {
   await act(async () => {})
   return view
 }
+
+it("waits for the initial claim and load before starting status polls", async () => {
+  let finishClaim!: (claim: ClaimOutcome) => void
+  mocks.claim.mockImplementationOnce(
+    () => new Promise<ClaimOutcome>((resolve) => (finishClaim = resolve))
+  )
+  mocks.fetch.mockResolvedValue(response())
+  const view = await mount()
+  await act(async () => vi.advanceTimersByTimeAsync(60_000))
+  expect(mocks.fetch).not.toHaveBeenCalled()
+
+  await act(async () => finishClaim({ ok: true }))
+  expect(mocks.fetch).toHaveBeenCalledTimes(1)
+  await act(async () => vi.advanceTimersByTimeAsync(15_000))
+  expect(mocks.fetch).toHaveBeenCalledTimes(2)
+  view.unmount()
+})
 
 it.each(["request", "body"])(
   "recovers from a stalled status %s and receives a teacher lock",
@@ -146,4 +172,70 @@ it("aborts an active status read and cancels further polling on unmount", async 
   expect(signal.aborted).toBe(true)
   await act(async () => vi.advanceTimersByTimeAsync(60_000))
   expect(mocks.fetch).toHaveBeenCalledTimes(2)
+})
+
+it("shows the takeover screen and stops polling once another login took over", async () => {
+  mocks.fetch.mockResolvedValueOnce(response()).mockResolvedValue(
+    new Response(
+      JSON.stringify({
+        error: { code: "SESSION_REPLACED", message: "replaced" },
+      }),
+      { status: 409 }
+    )
+  )
+  const view = await mount()
+  await act(async () => vi.advanceTimersByTimeAsync(15_000))
+  expect(mocks.fetch).toHaveBeenCalledTimes(2)
+  expect(
+    screen.getByRole("button", { name: "Hier weiterarbeiten" })
+  ).toBeInTheDocument()
+  await act(async () => vi.advanceTimersByTimeAsync(120_000))
+  expect(mocks.fetch).toHaveBeenCalledTimes(2)
+  view.unmount()
+})
+
+it("does not load an editable exam or poll after a failed initial claim", async () => {
+  mocks.claim.mockResolvedValue({
+    ok: false,
+    status: 409,
+    code: "CONFLICT",
+    message: "Sitzung ist nicht mehr aktiv",
+  })
+  mocks.fetch.mockResolvedValue(response())
+  const view = await mount()
+  await act(async () => vi.advanceTimersByTimeAsync(60_000))
+  expect(mocks.fetch).not.toHaveBeenCalled()
+  expect(screen.getByText("Sitzung ist nicht mehr aktiv")).toBeInTheDocument()
+  view.unmount()
+})
+
+it("explains a rate-limited claim instead of only asking for a reload", async () => {
+  mocks.claim.mockResolvedValue({
+    ok: false,
+    status: 429,
+    code: "RATE_LIMITED",
+    message: "Zu viele Anfragen. Bitte später erneut versuchen.",
+  })
+  const view = await mount()
+  await act(async () => vi.advanceTimersByTimeAsync(1_000))
+  expect(
+    screen.getByText(
+      "Zu viele Versuche. Bitte warten Sie eine Minute und laden Sie dann neu."
+    )
+  ).toBeInTheDocument()
+  view.unmount()
+})
+
+it("shows the takeover screen when an upload reports a takeover", async () => {
+  mocks.fetch.mockResolvedValue(response())
+  const view = await mount()
+  const { reportSessionReplaced } = await import("@/lib/exam-device-client")
+  await act(async () => reportSessionReplaced("s1"))
+  expect(screen.getByRole("alert")).toHaveTextContent(
+    "Diese Prüfung wurde auf einem anderen Gerät"
+  )
+  expect(
+    screen.getByRole("button", { name: "Hier weiterarbeiten" })
+  ).toHaveFocus()
+  view.unmount()
 })

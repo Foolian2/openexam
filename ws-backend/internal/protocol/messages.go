@@ -53,6 +53,10 @@ const (
 	ActionSessionUnlocked  = "SESSION_UNLOCKED"
 	ActionSessionExtended  = "SESSION_EXTENDED"
 	ActionSessionSubmitted = "SESSION_SUBMITTED"
+	// ActionSessionReplaced tells a student connection that another login
+	// (or a newer tab) has taken over its session. The client stops
+	// reconnecting on it; see lib/exam-device.ts.
+	ActionSessionReplaced = "SESSION_REPLACED"
 )
 
 // AnswerSaveData is the payload of an answer:save message from a student.

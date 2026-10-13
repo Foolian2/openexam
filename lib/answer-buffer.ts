@@ -16,11 +16,22 @@ export interface AnswerBufferStorage {
   getItem(key: string): string | null
   setItem(key: string, value: string): void
   removeItem(key: string): void
+  /** Key enumeration, as on Web Storage; needed to adopt other tabs' records. */
+  readonly length?: number
+  key?(index: number): string | null
 }
 
 export interface AnswerBufferOptions {
   sessionId: string
   storage: AnswerBufferStorage
+  /**
+   * Scopes the record to one browser tab (lib/exam-tab.ts). Tabs of the same
+   * session must not share a record: each persist rewrites the whole record,
+   * and a tab replaced by another one would otherwise replay its stale edits
+   * over the owner's answers. See hydrate() for how records of tabs that are
+   * gone (a crash, a closed tab) are still recovered.
+   */
+  tabId?: string | (() => string)
   keyPrefix?: string
   debounceMs?: number
   retryIntervalMs?: number
@@ -44,6 +55,13 @@ export interface AnswerBuffer<T = unknown> {
   persistNow(): void
   clearAll(): void
   replay(load: (pending: Array<[string, T]>) => void): void
+  /**
+   * Flags this tab's record as belonging to a replaced tab, so another tab's
+   * replay leaves it alone. Cleared by clearReplaced() once this tab claims
+   * the session back.
+   */
+  markReplaced(): void
+  clearReplaced(): void
   startRetryLoop(
     attempt: (questionId: string, content: T) => Promise<boolean>
   ): () => void
@@ -53,6 +71,8 @@ export interface AnswerBuffer<T = unknown> {
   ): Promise<Array<[string, boolean]>>
   destroy(): void
 }
+
+const REPLACED_SUFFIX = ":replaced"
 
 // Fraction of retryIntervalMs the retry period is scattered over, so
 // `random() === 0.5` reproduces the nominal interval exactly.
@@ -67,7 +87,16 @@ const RETRY_JITTER = 0.25
 export function createAnswerBuffer<T = unknown>(
   options: AnswerBufferOptions
 ): AnswerBuffer<T> {
-  const key = `${options.keyPrefix ?? ANSWER_BUFFER_KEY_PREFIX}:${options.sessionId}`
+  const sessionKey = `${options.keyPrefix ?? ANSWER_BUFFER_KEY_PREFIX}:${options.sessionId}`
+  // Resolved on each use: a tab can mint a new identity after the buffer is
+  // created (lib/exam-tab.ts ensureExclusiveExamTabId), before any edit.
+  const tabIdOf = (): string | undefined =>
+    typeof options.tabId === "function" ? options.tabId() : options.tabId
+  const keyOf = () => {
+    const id = tabIdOf()
+    return id ? `${sessionKey}:${id}` : sessionKey
+  }
+  const replacedKeyOf = () => `${keyOf()}${REPLACED_SUFFIX}`
   const debounceMs = options.debounceMs ?? 800
   const retryIntervalMs = options.retryIntervalMs ?? 10_000
   const maxRetries = options.maxRetries ?? 0
@@ -83,6 +112,7 @@ export function createAnswerBuffer<T = unknown>(
 
   function persistNow() {
     try {
+      const key = keyOf()
       if (record.size === 0) options.storage.removeItem(key)
       else
         options.storage.setItem(key, JSON.stringify(Object.fromEntries(record)))
@@ -91,30 +121,69 @@ export function createAnswerBuffer<T = unknown>(
     }
   }
 
-  function hydrate() {
-    if (hydrated) return
-    hydrated = true
-    let raw: string | null = null
+  function readRecord(recordKey: string): Array<[string, T]> {
     try {
-      raw = options.storage.getItem(key)
-    } catch {
-      // Storage inaccessible (disabled, SecurityError in private browsing,
-      // etc.) — degrade to an empty buffer instead of crashing the load.
-      return
-    }
-    if (raw === null) return
-    try {
+      const raw = options.storage.getItem(recordKey)
+      if (raw === null) return []
       const parsed: unknown = JSON.parse(raw)
       if (
         parsed !== null &&
         typeof parsed === "object" &&
         !Array.isArray(parsed)
-      ) {
-        for (const [questionId, content] of Object.entries(parsed))
-          record.set(questionId, content)
+      )
+        return Object.entries(parsed) as Array<[string, T]>
+    } catch {
+      // Storage inaccessible (disabled, SecurityError in private browsing,
+      // etc.) or a corrupt record — degrade to an empty buffer instead of
+      // crashing the load.
+    }
+    return []
+  }
+
+  // Records of this session's other tabs that were not replaced: a tab that
+  // crashed or was closed with unsaved edits, or a record written before
+  // records were scoped by tab. A replaced tab marks its record, which stays
+  // its own: its edits after the takeover must not overwrite the owner's.
+  function orphanedKeys(): string[] {
+    const { storage } = options
+    const key = keyOf()
+    if (!tabIdOf() || storage.key === undefined) return []
+    const keys: string[] = []
+    try {
+      for (let i = 0; i < (storage.length ?? 0); i++) {
+        const k = storage.key(i)
+        if (
+          k === null ||
+          k === key ||
+          (k !== sessionKey && !k.startsWith(`${sessionKey}:`)) ||
+          k.endsWith(REPLACED_SUFFIX) ||
+          storage.getItem(`${k}${REPLACED_SUFFIX}`) !== null
+        )
+          continue
+        keys.push(k)
       }
     } catch {
-      // Corrupt record — start from an empty buffer instead of crashing the load.
+      return []
+    }
+    return keys
+  }
+
+  function hydrate() {
+    if (hydrated) return
+    hydrated = true
+    const orphans = orphanedKeys()
+    for (const orphan of orphans)
+      for (const [questionId, content] of readRecord(orphan))
+        record.set(questionId, content)
+    // This tab's own edits are the newest local state and win.
+    for (const [questionId, content] of readRecord(keyOf()))
+      record.set(questionId, content)
+    if (orphans.length === 0) return
+    persistNow()
+    try {
+      for (const orphan of orphans) options.storage.removeItem(orphan)
+    } catch {
+      // Adopted entries are persisted under this tab's key either way.
     }
   }
 
@@ -218,10 +287,29 @@ export function createAnswerBuffer<T = unknown>(
     clearAll() {
       record.clear()
       persistNow()
+      try {
+        options.storage.removeItem(replacedKeyOf())
+      } catch {
+        // Nothing to clear.
+      }
     },
     replay(load: (pending: Array<[string, T]>) => void) {
       hydrate()
       load(Array.from(record.entries()))
+    },
+    markReplaced() {
+      try {
+        options.storage.setItem(replacedKeyOf(), "1")
+      } catch {
+        // Without the marker another tab may adopt this record on reload.
+      }
+    },
+    clearReplaced() {
+      try {
+        options.storage.removeItem(replacedKeyOf())
+      } catch {
+        // Nothing to clear.
+      }
     },
     startRetryLoop(
       attempt: (questionId: string, content: T) => Promise<boolean>
@@ -282,9 +370,12 @@ export function createAnswerBuffer<T = unknown>(
  * instead of inheriting a latent throw.
  */
 export function createLocalAnswerBuffer<T = unknown>(
-  sessionId: string
+  sessionId: string,
+  // Lazy: the tab identity is browser-only module state, must not be minted
+  // during a server render, and can change once before the first edit.
+  tabId?: () => string
 ): AnswerBuffer<T> | null {
   const storage = getLocalStorage()
   if (storage === null) return null
-  return createAnswerBuffer<T>({ sessionId, storage })
+  return createAnswerBuffer<T>({ sessionId, storage, tabId })
 }

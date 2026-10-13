@@ -391,3 +391,116 @@ describe("createLocalAnswerBuffer", () => {
     })
   })
 })
+
+describe("tab-scoped records", () => {
+  class EnumerableStorage extends FakeStorage {
+    keys = new Set<string>()
+    get length() {
+      return this.keys.size
+    }
+    key(index: number): string | null {
+      return Array.from(this.keys)[index] ?? null
+    }
+    override setItem(key: string, value: string): void {
+      this.keys.add(key)
+      super.setItem(key, value)
+    }
+    override removeItem(key: string): void {
+      this.keys.delete(key)
+      super.removeItem(key)
+    }
+  }
+
+  const text = (t: string) => ({ type: "FREE_TEXT", text: t })
+
+  function bufferFor(storage: EnumerableStorage, tabId: string) {
+    return createAnswerBuffer({ sessionId: "s1", storage, tabId })
+  }
+
+  function replayed(storage: EnumerableStorage, tabId: string) {
+    let pending: Array<[string, unknown]> = []
+    bufferFor(storage, tabId).replay((p) => (pending = p))
+    return Object.fromEntries(pending)
+  }
+
+  it("keeps each tab's edits under its own key", () => {
+    const storage = new EnumerableStorage()
+    const a = bufferFor(storage, "tab-a")
+    const b = bufferFor(storage, "tab-b")
+    a.enqueue("q1", text("from a"))
+    b.enqueue("q2", text("from b"))
+    a.persistNow()
+    b.persistNow()
+    expect(storage.read(`${STORAGE_KEY}:tab-a`)).toEqual({ q1: text("from a") })
+    expect(storage.read(`${STORAGE_KEY}:tab-b`)).toEqual({ q2: text("from b") })
+  })
+
+  it("does not replay a replaced tab's edits in the owning tab", () => {
+    const storage = new EnumerableStorage()
+    const replacedTab = bufferFor(storage, "tab-a")
+    replacedTab.enqueue("q1", text("stale edit after takeover"))
+    replacedTab.persistNow()
+    replacedTab.markReplaced()
+
+    expect(replayed(storage, "tab-b")).toEqual({})
+    // It stays the replaced tab's own for a reclaim.
+    expect(replayed(storage, "tab-a")).toEqual({
+      q1: text("stale edit after takeover"),
+    })
+  })
+
+  it("adopts the record of a tab that is gone, own edits winning", () => {
+    const storage = new EnumerableStorage()
+    storage.setItem(
+      `${STORAGE_KEY}:tab-crashed`,
+      JSON.stringify({ q1: text("crashed q1"), q2: text("crashed q2") })
+    )
+    storage.setItem(
+      `${STORAGE_KEY}:tab-b`,
+      JSON.stringify({ q2: text("own q2") })
+    )
+    expect(replayed(storage, "tab-b")).toEqual({
+      q1: text("crashed q1"),
+      q2: text("own q2"),
+    })
+    expect(storage.getItem(`${STORAGE_KEY}:tab-crashed`)).toBeNull()
+    expect(storage.read(`${STORAGE_KEY}:tab-b`)).toEqual({
+      q1: text("crashed q1"),
+      q2: text("own q2"),
+    })
+  })
+
+  it("adopts a record written before records were scoped by tab", () => {
+    const storage = new EnumerableStorage()
+    storage.setItem(STORAGE_KEY, JSON.stringify({ q1: text("legacy") }))
+    // Another session whose id extends this one's is not adopted.
+    storage.setItem(`${STORAGE_KEY}0`, JSON.stringify({ q9: text("other") }))
+    expect(replayed(storage, "tab-b")).toEqual({ q1: text("legacy") })
+    expect(storage.getItem(STORAGE_KEY)).toBeNull()
+    expect(storage.getItem(`${STORAGE_KEY}0`)).not.toBeNull()
+  })
+
+  it("resolves a lazy tab identity when the record is first used", () => {
+    const storage = new EnumerableStorage()
+    let tabId = "tab-copied"
+    const buffer = createAnswerBuffer({
+      sessionId: "s1",
+      storage,
+      tabId: () => tabId,
+    })
+    tabId = "tab-minted"
+    buffer.enqueue("q1", text("edit"))
+    buffer.persistNow()
+    expect(storage.read(`${STORAGE_KEY}:tab-minted`)).toEqual({
+      q1: text("edit"),
+    })
+  })
+
+  it("clears the replaced marker with the record after submit", () => {
+    const storage = new EnumerableStorage()
+    const buffer = bufferFor(storage, "tab-a")
+    buffer.markReplaced()
+    buffer.clearAll()
+    expect(storage.getItem(`${STORAGE_KEY}:tab-a:replaced`)).toBeNull()
+  })
+})

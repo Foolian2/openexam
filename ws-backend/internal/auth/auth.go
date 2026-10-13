@@ -32,6 +32,9 @@ const (
 
 // Session is the authenticated identity resolved from a valid cookie.
 type Session struct {
+	// ID is the Better Auth session row id, the identity the active-device
+	// check compares (ExamSession.activeAuthSessionId, lib/exam-device.ts).
+	ID        string
 	Token     string
 	UserID    string
 	Role      string
@@ -40,7 +43,7 @@ type Session struct {
 
 // Store is the subset of DB access auth needs, implemented by internal/store.
 type Store interface {
-	LookupSession(ctx context.Context, token string) (userID, role string, expiresAt time.Time, err error)
+	LookupSession(ctx context.Context, token string) (sessionID, userID, role string, expiresAt time.Time, err error)
 }
 
 // ExtractToken pulls the raw session token out of the request's cookies and
@@ -103,7 +106,7 @@ func ValidateRequest(ctx context.Context, r *http.Request, secret string, store 
 		return nil, err
 	}
 
-	userID, role, expiresAt, err := store.LookupSession(ctx, token)
+	sessionID, userID, role, expiresAt, err := store.LookupSession(ctx, token)
 	if err != nil {
 		return nil, err
 	}
@@ -114,5 +117,5 @@ func ValidateRequest(ctx context.Context, r *http.Request, secret string, store 
 		return nil, ErrSessionExpired
 	}
 
-	return &Session{Token: token, UserID: userID, Role: role, ExpiresAt: expiresAt}, nil
+	return &Session{ID: sessionID, Token: token, UserID: userID, Role: role, ExpiresAt: expiresAt}, nil
 }

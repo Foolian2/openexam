@@ -4,6 +4,8 @@ import (
 	"context"
 	"time"
 
+	"github.com/coder/websocket"
+
 	"openexam/ws-backend/internal/metrics"
 	"openexam/ws-backend/internal/protocol"
 	"openexam/ws-backend/internal/recovery"
@@ -36,7 +38,9 @@ const saveLaneDepth = 32
 
 // saveIOTimeout caps the Redis buffer write in a lane, like asyncJobTimeout
 // caps background jobs: a wedged dependency must not park the lane forever.
-const saveIOTimeout = 5 * time.Second
+// The write runs while the session's share locks are held, so a slow Redis
+// also delays takeover claims and teacher locks; keep it short.
+const saveIOTimeout = 3 * time.Second
 
 type saveJob struct {
 	client   *Client
@@ -97,35 +101,52 @@ func (r *Room) runSaveLane(lane *saveLane) {
 // checkAndBuffer does a save's I/O: the authoritative lifecycle check, then
 // the Redis buffer write. It touches no room state and never enqueues.
 func (r *Room) checkAndBuffer(job saveJob) string {
-	// Background, not the room ctx: the room ctx is cancelled at the start of
-	// shutdown, exactly when in-flight saves should still land.
+	// Keep the session share lock through Redis buffering. A claim must wait
+	// for an already-authorized save; a save after a claim sees its new owner.
+	// This also preserves acknowledged pre-takeover answers for the new tab.
+	ioCtx, cancel := context.WithTimeout(context.Background(), answerStateCheckTimeout+saveIOTimeout)
+	defer cancel()
 	checkStarted := time.Now()
-	checkCtx, cancelCheck := context.WithTimeout(context.Background(), answerStateCheckTimeout)
-	answerState, err := r.store.GetAnswerSaveState(checkCtx, job.examID, job.session, job.recvAt)
-	cancelCheck()
-	metrics.AnswerStateCheckSeconds.Observe(time.Since(checkStarted).Seconds())
-	if err != nil {
-		r.log.Error("answer:save lifecycle check failed", "sessionId", job.session, "error", err)
+	checked := false
+	code := ""
+	err := r.store.WithAnswerSaveState(ioCtx, job.examID, job.session, job.recvAt, func(state *store.AnswerSaveState) error {
+		checked = true
+		metrics.AnswerStateCheckSeconds.Observe(time.Since(checkStarted).Seconds())
+		if state == nil {
+			code = "SAVE_UNAVAILABLE"
+		} else if !clientOwnsSession(job.client, state.ActiveAuthSessionID, state.ActiveDeviceID) {
+			code = "SESSION_REPLACED"
+		} else {
+			code = answerSaveRejection(state, job.recvAt, r.submitGrace)
+		}
+		if code != "" {
+			metrics.AnswerStateCheckOutcomes.WithLabelValues("denied").Inc()
+			return nil
+		}
+		metrics.AnswerStateCheckOutcomes.WithLabelValues("allowed").Inc()
+		meta := store.AnswerMeta{ClientSeq: job.data.ClientSeq, ReceivedAt: job.recvAt}
+		saveCtx, cancelSave := context.WithTimeout(ioCtx, saveIOTimeout)
+		defer cancelSave()
+		if err := r.buffer.SaveAnswer(saveCtx, job.examID, job.session, job.question, job.data.Content, meta); err != nil {
+			code = "SAVE_FAILED"
+			return err
+		}
+		return nil
+	})
+	if !checked {
+		metrics.AnswerStateCheckSeconds.Observe(time.Since(checkStarted).Seconds())
 		metrics.AnswerStateCheckOutcomes.WithLabelValues("error").Inc()
-		return "SAVE_UNAVAILABLE"
 	}
-	if code := answerSaveRejection(answerState, job.recvAt, r.submitGrace); code != "" {
-		metrics.AnswerStateCheckOutcomes.WithLabelValues("denied").Inc()
-		return code
+	if err != nil {
+		r.log.Error("answer:save authorization/buffer failed", "sessionId", job.session, "error", err)
+		// A failed commit after a successful buffer write also lands here:
+		// the answer is buffered, but the client retries it anyway, which is
+		// harmless because the buffer is idempotent by clientSeq.
+		if code == "" {
+			return "SAVE_UNAVAILABLE"
+		}
 	}
-	metrics.AnswerStateCheckOutcomes.WithLabelValues("allowed").Inc()
-
-	// recvAt is when the frame came off the socket. The flusher compares it
-	// against the session's submittedAt so a save that raced past the
-	// submitted gates still can't land after the submission.
-	meta := store.AnswerMeta{ClientSeq: job.data.ClientSeq, ReceivedAt: job.recvAt}
-	saveCtx, cancelSave := context.WithTimeout(context.Background(), saveIOTimeout)
-	defer cancelSave()
-	if err := r.buffer.SaveAnswer(saveCtx, job.examID, job.session, job.question, job.data.Content, meta); err != nil {
-		r.log.Error("answer:save failed", "sessionId", job.session, "error", err)
-		return "SAVE_FAILED"
-	}
-	return ""
+	return code
 }
 
 // handleSaveResult replies to the client on the room goroutine.
@@ -134,6 +155,13 @@ func (r *Room) handleSaveResult(res saveResult) {
 	if res.code != "" {
 		job.client.enqueue(mustEncode(protocol.TypeAnswerError, job.envID, protocol.AnswerErrorData{Code: res.code}))
 		metrics.AnswerAckSeconds.WithLabelValues("rejected").Observe(time.Since(job.recvAt).Seconds())
+		if res.code == "SESSION_REPLACED" {
+			// The committed owner is someone else, whether or not the
+			// advisory Redis event reached this socket. Close it so it
+			// stops sending integrity events into the owner's session.
+			job.client.enqueue(mustEncode(protocol.TypeExamControl, "", protocol.ControlEventData{Action: protocol.ActionSessionReplaced, SessionID: job.session}))
+			job.client.requestClose(websocket.StatusNormalClosure, "replaced by another tab or login")
+		}
 		return
 	}
 	now := nowRFC3339()

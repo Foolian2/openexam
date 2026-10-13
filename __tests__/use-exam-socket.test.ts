@@ -8,6 +8,7 @@ const sebClientMock = vi.hoisted(() => ({
   getSebRequestHash: vi.fn(),
 }))
 vi.mock("@/lib/seb-client", () => sebClientMock)
+vi.mock("@/lib/exam-tab", () => ({ getExamTabId: () => "tab-device-id" }))
 
 import { useExamSocket } from "@/hooks/use-exam-socket"
 
@@ -69,7 +70,7 @@ describe("connection", () => {
     setup()
     await flushConnect()
     expect(FakeWebSocket.last.url).toBe(
-      `${window.location.origin.replace(/^http/, "ws")}/ws/exam/sess-1`
+      `${window.location.origin.replace(/^http/, "ws")}/ws/exam/sess-1?deviceId=tab-device-id`
     )
   })
 
@@ -77,7 +78,9 @@ describe("connection", () => {
     vi.stubEnv("NEXT_PUBLIC_WS_URL", "wss://ws.example.test")
     setup()
     await flushConnect()
-    expect(FakeWebSocket.last.url).toBe("wss://ws.example.test/ws/exam/sess-1")
+    expect(FakeWebSocket.last.url).toBe(
+      "wss://ws.example.test/ws/exam/sess-1?deviceId=tab-device-id"
+    )
   })
 
   it("is connected on open without SEB and pings every 20s", async () => {
@@ -103,7 +106,9 @@ describe("connection", () => {
     rerender({ ...props, sessionId: "sess-2" })
     await flushConnect()
     expect(first.readyState).toBe(FakeWebSocket.CLOSED)
-    expect(FakeWebSocket.last.url).toMatch(/\/ws\/exam\/sess-2$/)
+    expect(FakeWebSocket.last.url).toMatch(
+      /\/ws\/exam\/sess-2\?deviceId=tab-device-id$/
+    )
     // The old socket's close must not schedule a reconnect of its own.
     act(() => vi.advanceTimersByTime(60_000))
     expect(FakeWebSocket.instances).toHaveLength(2)
@@ -181,6 +186,65 @@ describe("SEB handshake", () => {
     unmount()
     await act(async () => resolveKey("seb-key"))
     expect(FakeWebSocket.instances).toHaveLength(0)
+  })
+})
+
+describe("session takeover", () => {
+  it("stops on SESSION_REPLACED returned by an answer save", async () => {
+    const { props, result } = setup()
+    await flushConnect()
+    const ws = FakeWebSocket.last
+    act(() => ws.open())
+    const save = result.current.sendAnswer("q1", "answer", 1)
+    act(() =>
+      ws.receive({
+        type: "answer:error",
+        id: "id-1",
+        data: { code: "SESSION_REPLACED" },
+      })
+    )
+    await expect(save).resolves.toBe(false)
+    expect(props.onControl).toHaveBeenCalledWith({
+      action: "SESSION_REPLACED",
+      sessionId: "sess-1",
+    })
+    expect(ws.readyState).toBe(FakeWebSocket.CLOSED)
+    await act(() => vi.advanceTimersByTimeAsync(120_000))
+    expect(FakeWebSocket.instances).toHaveLength(1)
+  })
+
+  it("stops reconnecting once another login replaced the session", async () => {
+    const { props } = setup()
+    await flushConnect()
+    const ws = FakeWebSocket.last
+    act(() => ws.open())
+    act(() =>
+      ws.receive({
+        type: "exam:control",
+        data: { action: "SESSION_REPLACED", sessionId: "sess-1" },
+      })
+    )
+    act(() => ws.close())
+
+    expect(props.onControl).toHaveBeenCalledWith({
+      action: "SESSION_REPLACED",
+      sessionId: "sess-1",
+    })
+    await act(() => vi.advanceTimersByTimeAsync(120_000))
+    expect(FakeWebSocket.instances).toHaveLength(1)
+  })
+
+  it("keeps reconnecting after other control events", async () => {
+    setup()
+    await flushConnect()
+    const ws = FakeWebSocket.last
+    act(() => ws.open())
+    act(() =>
+      ws.receive({ type: "exam:control", data: { action: "SESSION_LOCKED" } })
+    )
+    act(() => ws.close())
+    await act(() => vi.advanceTimersByTimeAsync(1_000))
+    expect(FakeWebSocket.instances).toHaveLength(2)
   })
 })
 

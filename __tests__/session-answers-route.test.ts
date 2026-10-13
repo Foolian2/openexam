@@ -4,7 +4,7 @@ import { NextRequest } from "next/server"
 const { prismaMock, txMock, authMock, rateLimitMock, sebGuardMock } =
   vi.hoisted(() => {
     const txMock = {
-      examSession: { updateMany: vi.fn() },
+      examSession: { updateMany: vi.fn(), findUnique: vi.fn() },
       $queryRaw: vi.fn(),
       answer: { findUniqueOrThrow: vi.fn() },
     }
@@ -60,6 +60,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   authMock.api.getSession.mockResolvedValue({
     user: { id: "student1", role: "STUDENT" },
+    session: { id: "auth-1" },
   })
   rateLimitMock.mockResolvedValue({ allowed: true })
   sebGuardMock.mockResolvedValue({ ok: true })
@@ -119,6 +120,35 @@ describe("PUT /api/sessions/[id]/answers: access", () => {
     sebGuardMock.mockResolvedValue({ ok: false })
     expect((await save()).status).toBe(403)
     expectNothingWritten()
+  })
+
+  it("refuses a login that another login has replaced", async () => {
+    prismaMock.examSession.findUnique.mockResolvedValue({
+      id: SESSION_ID,
+      examId: EXAM_ID,
+      userId: "student1",
+      status: "IN_PROGRESS",
+      effectiveEndTime: null,
+      activeAuthSessionId: "auth-2",
+      exam: { id: EXAM_ID },
+    })
+    const res = await save()
+    expect(res.status).toBe(409)
+    expect((await res.json()).error.code).toBe("SESSION_REPLACED")
+    expectNothingWritten()
+  })
+
+  it("accepts the login that holds the session", async () => {
+    prismaMock.examSession.findUnique.mockResolvedValue({
+      id: SESSION_ID,
+      examId: EXAM_ID,
+      userId: "student1",
+      status: "IN_PROGRESS",
+      effectiveEndTime: null,
+      activeAuthSessionId: "auth-1",
+      exam: { id: EXAM_ID },
+    })
+    expect((await save()).status).toBe(200)
   })
 
   it("refuses the save after the deadline and its grace window", async () => {
@@ -211,6 +241,7 @@ describe("PUT /api/sessions/[id]/answers: write", () => {
       where: {
         id: SESSION_ID,
         status: { in: expect.arrayContaining(["IN_PROGRESS"]) },
+        AND: expect.any(Array),
       },
       data: { lastSeenAt: expect.any(Date) },
     })
@@ -222,6 +253,18 @@ describe("PUT /api/sessions/[id]/answers: write", () => {
     const res = await save()
     expect(res.status).toBe(409)
     expect((await res.json()).error.message).toBe("Sitzung ist nicht aktiv")
+    expect(txMock.$queryRaw).not.toHaveBeenCalled()
+  })
+
+  it("rejects a takeover after the first session read and before the answer write", async () => {
+    txMock.examSession.updateMany.mockResolvedValue({ count: 0 })
+    txMock.examSession.findUnique.mockResolvedValue({
+      id: SESSION_ID,
+      activeAuthSessionId: "auth-2",
+    })
+    const res = await save()
+    expect(res.status).toBe(409)
+    expect((await res.json()).error.code).toBe("SESSION_REPLACED")
     expect(txMock.$queryRaw).not.toHaveBeenCalled()
   })
 

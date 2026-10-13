@@ -5,6 +5,7 @@ import { Upload, File, Loader2, Download } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { sebFetch } from "@/lib/seb-client"
 import { apiMutate } from "@/lib/api-mutate"
+import { reportSessionReplaced } from "@/lib/exam-device-client"
 import type { FileUploadConfig } from "@/lib/types/questions"
 import type { FileUploadAnswer } from "@/lib/types/answers"
 import { effectiveMaxFileSizeMB } from "@/lib/upload-budget"
@@ -64,6 +65,7 @@ export function FileUploadViewer({
         }
       )
       if (!result.ok) {
+        if (result.code === "SESSION_REPLACED") reportSessionReplaced(sessionId)
         setError(result.message)
         return
       }
@@ -179,8 +181,7 @@ export function FileUploadViewer({
               Datei hierher ziehen oder klicken
             </p>
             <p className="text-xs text-muted-foreground">
-              {config.allowedExtensions.join(", ")} · max.{" "}
-              {maxMB} MB
+              {config.allowedExtensions.join(", ")} · max. {maxMB} MB
             </p>
           </div>
         )}

@@ -31,23 +31,24 @@ func New(pool *pgxpool.Pool) *Store {
 }
 
 // LookupSession implements auth.Store: it resolves a raw session token to
-// the owning user's id and role, ignoring the "session_data" cookie cache.
-func (s *Store) LookupSession(ctx context.Context, token string) (userID, role string, expiresAt time.Time, err error) {
+// its own row id plus the owning user's id and role, ignoring the
+// "session_data" cookie cache.
+func (s *Store) LookupSession(ctx context.Context, token string) (sessionID, userID, role string, expiresAt time.Time, err error) {
 	row := s.pool.QueryRow(ctx, `
-		SELECT u.id, u.role, sess."expiresAt"
+		SELECT sess.id, u.id, u.role, sess."expiresAt"
 		FROM "session" sess
 		JOIN "User" u ON u.id = sess."userId"
 		WHERE sess.token = $1
 	`, token)
 
-	err = row.Scan(&userID, &role, &expiresAt)
+	err = row.Scan(&sessionID, &userID, &role, &expiresAt)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return "", "", time.Time{}, ErrNotFound
+		return "", "", "", time.Time{}, ErrNotFound
 	}
 	if err != nil {
-		return "", "", time.Time{}, err
+		return "", "", "", time.Time{}, err
 	}
-	return userID, role, expiresAt, nil
+	return sessionID, userID, role, expiresAt, nil
 }
 
 var _ auth.Store = (*Store)(nil)
@@ -71,6 +72,15 @@ type ExamSessionAuth struct {
 	SebUserAgent          *string
 	SebBrowserExamKey     *string
 	SebIntegrityFlaggedAt *time.Time
+
+	// ActiveAuthSessionID is the login that currently owns the session (see
+	// lib/exam-device.ts). Nil means unclaimed, which admits any login of
+	// the owner.
+	ActiveAuthSessionID *string
+	// ActiveDeviceID identifies the browser tab that currently owns the exam.
+	// Nil is a legacy, unclaimed session.
+	ActiveDeviceID      *string
+	DeviceReplacedCount int
 
 	// SessionSebConfigKey is the Config Key of the personalized config issued
 	// to this session, whose startURL embeds a one-time login token (see
@@ -104,6 +114,7 @@ func (s *Store) GetExamSessionAuth(ctx context.Context, sessionID string) (*Exam
 		       es."sebConfigKey",
 		       es."sebKeyHash", es."sebUserAgent",
 		       es."sebBrowserExamKey", es."sebIntegrityFlaggedAt",
+		       es."activeAuthSessionId", es."activeDeviceId", es."deviceReplacedCount",
 		       (SELECT count(*) FROM "IntegrityEvent" ie WHERE ie."sessionId" = es.id)
 		FROM "ExamSession" es
 		JOIN "Exam" e ON e.id = es."examId"
@@ -116,7 +127,8 @@ func (s *Store) GetExamSessionAuth(ctx context.Context, sessionID string) (*Exam
 		&out.ExamStatus, &out.ExamCreatorID, &out.SebRequired, &out.SebConfigKey,
 		&out.SessionSebConfigKey,
 		&out.SebKeyHash, &out.SebUserAgent,
-		&out.SebBrowserExamKey, &out.SebIntegrityFlaggedAt, &out.IntegrityEventCount)
+		&out.SebBrowserExamKey, &out.SebIntegrityFlaggedAt,
+		&out.ActiveAuthSessionID, &out.ActiveDeviceID, &out.DeviceReplacedCount, &out.IntegrityEventCount)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -149,6 +161,8 @@ func (s *Store) GetExamSessionAuth(ctx context.Context, sessionID string) (*Exam
 type AnswerSaveState struct {
 	SessionStatus       string
 	ExamStatus          string
+	ActiveAuthSessionID *string
+	ActiveDeviceID      *string
 	LockedAt            *time.Time
 	SubmittedAt         *time.Time
 	EffectiveEndTime    *time.Time
@@ -161,30 +175,50 @@ type AnswerSaveState struct {
 // therefore serializes with this check; the receive timestamp is also tested
 // against durable intervals so a delayed check sees completed lock cycles.
 func (s *Store) GetAnswerSaveState(ctx context.Context, examID, sessionID string, receivedAt time.Time) (*AnswerSaveState, error) {
+	var state *AnswerSaveState
+	err := s.WithAnswerSaveState(ctx, examID, sessionID, receivedAt, func(current *AnswerSaveState) error {
+		state = current
+		return nil
+	})
+	return state, err
+}
+
+// WithAnswerSaveState holds the ExamSession share lock through the callback.
+// A takeover's update must wait for a checked answer to reach Redis, and a
+// save arriving afterward sees the new claim before it can buffer anything.
+func (s *Store) WithAnswerSaveState(ctx context.Context, examID, sessionID string, receivedAt time.Time, use func(*AnswerSaveState) error) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
+	// The share locks below are held through the caller's Redis write. Bound
+	// the wait for them: behind a queued exclusive lock (a takeover claim, a
+	// teacher lock or close) every later save would otherwise queue too and
+	// pin a pool connection each. A timed-out save is refused and retried.
+	if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '2s'`); err != nil {
+		return err
+	}
 	// Row-lock waits can see newer row versions without refreshing a
 	// statement's snapshot of SessionLockInterval. Acquire both locks first,
 	// then read lifecycle and intervals in a new READ COMMITTED statement.
 	var lockedID string
 	if err := tx.QueryRow(ctx, `SELECT id FROM "Exam" WHERE id=$1 FOR SHARE`, examID).Scan(&lockedID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, ErrNotFound
+			return ErrNotFound
 		}
-		return nil, err
+		return err
 	}
 	if err := tx.QueryRow(ctx, `SELECT id FROM "ExamSession" WHERE id=$1 AND "examId"=$2 FOR SHARE`, sessionID, examID).Scan(&lockedID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, ErrNotFound
+			return ErrNotFound
 		}
-		return nil, err
+		return err
 	}
 	receivedAtValue := pgTimestamp(&receivedAt)
 	row := tx.QueryRow(ctx, `
-		SELECT es.status, e.status, es."lockedAt", es."submittedAt",
+		SELECT es.status, e.status, es."activeAuthSessionId", es."activeDeviceId",
+		       es."lockedAt", es."submittedAt",
 		       es."effectiveEndTime", e."closedAt",
 		       EXISTS (
 		         SELECT 1 FROM "SessionLockInterval" sli
@@ -200,18 +234,19 @@ func (s *Store) GetAnswerSaveState(ctx context.Context, examID, sessionID string
 	`, examID, sessionID, receivedAtValue)
 
 	var out AnswerSaveState
-	if err := row.Scan(&out.SessionStatus, &out.ExamStatus, &out.LockedAt,
+	if err := row.Scan(&out.SessionStatus, &out.ExamStatus,
+		&out.ActiveAuthSessionID, &out.ActiveDeviceID, &out.LockedAt,
 		&out.SubmittedAt, &out.EffectiveEndTime, &out.ExamClosedAt,
 		&out.ReceivedWhileLocked); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, ErrNotFound
+			return ErrNotFound
 		}
-		return nil, err
+		return err
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
+	if err := use(&out); err != nil {
+		return err
 	}
-	return &out, nil
+	return tx.Commit(ctx)
 }
 
 // BindSebSession persists the first-seen SEB Config Key token and
@@ -375,6 +410,8 @@ type MonitorSession struct {
 	// connecting after the event sees the same flag the live patch carried.
 	SebIntegrityFlagged bool    `json:"sebIntegrityFlagged"`
 	SebIntegrityReason  *string `json:"sebIntegrityReason"`
+	// Mirrors the live delta key published by lib/exam-device.ts.
+	DeviceReplacedCount int `json:"deviceReplacedCount"`
 }
 
 func (s *Store) ListMonitorSessions(ctx context.Context, examID string) ([]MonitorSession, error) {
@@ -389,7 +426,8 @@ func (s *Store) ListMonitorSessions(ctx context.Context, examID string) ([]Monit
 			(SELECT coalesce(sum(g.points), 0) FROM "Grade" g WHERE g."sessionId" = es.id),
 			(SELECT coalesce(sum(g."maxPoints"), 0) FROM "Grade" g WHERE g."sessionId" = es.id),
 			(SELECT count(*) FROM "IntegrityEvent" ie WHERE ie."sessionId" = es.id),
-			es."sebIntegrityFlaggedAt" IS NOT NULL, es."sebIntegrityReason"
+			es."sebIntegrityFlaggedAt" IS NOT NULL, es."sebIntegrityReason",
+			es."deviceReplacedCount"
 		FROM "ExamSession" es
 		JOIN "User" u ON u.id = es."userId"
 		WHERE es."examId" = $1
@@ -410,6 +448,7 @@ func (s *Store) ListMonitorSessions(ctx context.Context, examID string) ([]Monit
 			&m.AnswerCount, &m.GradedCount, &m.ManuallyGradedCount, &m.TotalPoints, &m.MaxPoints,
 			&m.IntegrityEventCount,
 			&m.SebIntegrityFlagged, &m.SebIntegrityReason,
+			&m.DeviceReplacedCount,
 		); err != nil {
 			return nil, err
 		}

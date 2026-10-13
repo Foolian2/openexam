@@ -4,8 +4,13 @@ import { requireSession } from "@/lib/api-auth"
 import { prisma } from "@/lib/prisma"
 import { getClientIp } from "@/lib/client-ip"
 import { storeAnswerFile } from "@/lib/answer-files"
-import { isOpen, pastDeadline } from "@/lib/session-state"
+import { OPEN_STATUSES, isOpen, pastDeadline } from "@/lib/session-state"
 import { verifySebAccess } from "@/lib/seb-guard"
+import {
+  activeDeviceWhere,
+  getExamDeviceId,
+  isActiveDevice,
+} from "@/lib/exam-device"
 import { publicRequestUrl } from "@/lib/seb-urls"
 import { buildFileKey, FILE_EXTENSION_RE } from "@/lib/answer-file-key"
 import { rateLimit } from "@/lib/rate-limit"
@@ -17,11 +22,13 @@ import {
 } from "@/lib/upload-budget"
 import { asTypedQuestion, type FileUploadConfig } from "@/lib/types/questions"
 import {
+  ApiError,
   apiError,
   conflict,
   forbidden,
   notFound,
   rateLimited,
+  sessionReplaced,
   validationError,
 } from "@/lib/api-response"
 
@@ -53,6 +60,7 @@ export async function POST(request: NextRequest, { params }: Params) {
   const authed = await requireSession(request)
   if (authed instanceof NextResponse) return authed
   const session = authed
+  const deviceId = getExamDeviceId(request.headers)
 
   const limit = await rateLimit(
     `session-upload:${session.user.id}`,
@@ -82,6 +90,9 @@ export async function POST(request: NextRequest, { params }: Params) {
   })
   if (!guard.ok) {
     return forbidden("Safe Exam Browser erforderlich")
+  }
+  if (!isActiveDevice(examSession, session.session.id, deviceId)) {
+    return sessionReplaced()
   }
   if (!isOpen(examSession.status)) {
     return conflict("Sitzung ist nicht aktiv")
@@ -187,7 +198,11 @@ export async function POST(request: NextRequest, { params }: Params) {
   // this session actually stores and insert under a per-session advisory
   // lock, so two concurrent uploads can't both pass the same stale total.
   // An advisory lock rather than a row lock: the ExamSession row is what the
-  // WS flusher locks, and a 25 MB insert must not hold up answer flushes.
+  // WS flusher locks, and a 25 MB insert must not hold up answer flushes. The
+  // guarded ExamSession update therefore runs last, after the insert: it
+  // still serializes the commit with device takeovers and session locks, and
+  // a failed gate rolls the insert back, but the row lock is held only for
+  // the commit.
   let stored: boolean
   try {
     stored = await prisma.$transaction(
@@ -198,12 +213,35 @@ export async function POST(request: NextRequest, { params }: Params) {
         `
         if (Number(row?.bytes ?? 0) + file.size > budgetBytes) return false
         await storeAnswerFile(fileKey, id, questionId, bytes, tx)
+        const gate = await tx.examSession.updateMany({
+          where: {
+            id,
+            status: { in: OPEN_STATUSES },
+            ...activeDeviceWhere(session.session.id, deviceId),
+          },
+          data: { lastSeenAt: new Date() },
+        })
+        if (gate.count === 0) {
+          const current = await tx.examSession.findUnique({ where: { id } })
+          if (
+            current &&
+            !isActiveDevice(current, session.session.id, deviceId)
+          ) {
+            throw new ApiError(
+              409,
+              "SESSION_REPLACED",
+              "Sitzung wurde übernommen"
+            )
+          }
+          throw new ApiError(409, "CONFLICT", "Sitzung ist nicht aktiv")
+        }
         return true
       },
       { timeout: 30_000 }
     )
   } catch (err) {
     await redis.decrby(budgetKey, file.size)
+    if (err instanceof ApiError) return err.toResponse()
     throw err
   }
   if (!stored) {

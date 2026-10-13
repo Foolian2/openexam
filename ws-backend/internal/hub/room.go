@@ -99,6 +99,11 @@ type redisControlMessage struct {
 	EffectiveEndTime *string `json:"effectiveEndTime,omitempty"`
 	TimeExtensionMin *int    `json:"timeExtensionMin,omitempty"`
 	NamApplied       *bool   `json:"namApplied,omitempty"`
+	// ActiveAuthSessionID accompanies SESSION_REPLACED: the login that now
+	// owns the session, whose own socket must survive the event.
+	ActiveAuthSessionID string `json:"activeAuthSessionId,omitempty"`
+	ActiveDeviceID      string `json:"activeDeviceId,omitempty"`
+	DeviceReplacedCount int    `json:"deviceReplacedCount"`
 }
 
 // redisMonitorMessage is what Go instances publish to exam:{id}:monitor to
@@ -115,7 +120,7 @@ type redisMonitorMessage struct {
 // interface so tests can drive a Room without a real Postgres connection.
 type RoomStore interface {
 	ListMonitorSessions(ctx context.Context, examID string) ([]store.MonitorSession, error)
-	GetAnswerSaveState(ctx context.Context, examID, sessionID string, receivedAt time.Time) (*store.AnswerSaveState, error)
+	WithAnswerSaveState(ctx context.Context, examID, sessionID string, receivedAt time.Time, use func(*store.AnswerSaveState) error) error
 	SaveIntegrityEvent(ctx context.Context, sessionID, kind, detail string, clientTime time.Time) error
 }
 
@@ -371,8 +376,17 @@ func (r *Room) handleRegister(ctx context.Context, reg registration) {
 		return
 	}
 
+	c.claimVersion = reg.sessionAuth.DeviceReplacedCount
+	if old, ok := r.students[c.sessionID]; ok && old != c && old.claimVersion > c.claimVersion {
+		// The new socket was authorized against an older claim than the one
+		// already registered (e.g. its SEB handshake straddled a takeover
+		// whose owner connected first). It must not evict the owner.
+		c.enqueue(mustEncode(protocol.TypeExamControl, "", protocol.ControlEventData{Action: protocol.ActionSessionReplaced, SessionID: c.sessionID}))
+		c.requestClose(websocket.StatusNormalClosure, "replaced by another tab or login")
+		return
+	}
 	if old, ok := r.students[c.sessionID]; ok && old != c {
-		old.enqueue(mustEncode(protocol.TypeExamControl, "", protocol.ControlEventData{Action: "SESSION_REPLACED"}))
+		old.enqueue(mustEncode(protocol.TypeExamControl, "", protocol.ControlEventData{Action: protocol.ActionSessionReplaced}))
 		old.requestClose(websocket.StatusNormalClosure, "replaced by new connection")
 	}
 	r.students[c.sessionID] = c
@@ -718,7 +732,30 @@ func (r *Room) handleControl(ctx context.Context, msg redisControlMessage) {
 		}
 		r.offloadFlush("force flush on SESSION_SUBMITTED")
 		r.broadcastMonitorUpdate(msg.SessionID, map[string]any{"status": "SUBMITTED"})
+
+	case protocol.ActionSessionReplaced:
+		// Published by every claim that took the session from another login,
+		// so the old login's socket goes away on whichever instance it is
+		// connected to. The new login may already be connected here; keep
+		// it. A socket carries the takeover count read at its handshake, so
+		// an older event delayed behind a newer claim cannot evict its owner.
+		// The monitor patch travels separately on exam:{id}:monitor.
+		if msg.ActiveAuthSessionID == "" || msg.ActiveDeviceID == "" {
+			return
+		}
+		if c, ok := r.students[msg.SessionID]; ok && msg.DeviceReplacedCount > c.claimVersion &&
+			(c.authSessionID != msg.ActiveAuthSessionID || c.deviceID != msg.ActiveDeviceID) {
+			c.enqueue(mustEncode(protocol.TypeExamControl, "", protocol.ControlEventData{Action: msg.Type, SessionID: msg.SessionID}))
+			c.requestClose(websocket.StatusNormalClosure, "replaced by another tab or login")
+		}
 	}
+}
+
+// A nil claim dimension leaves legacy sessions open to their owner. Once
+// present, both the login and tab must match the committed claim.
+func clientOwnsSession(c *Client, authSessionID, deviceID *string) bool {
+	return (authSessionID == nil || *authSessionID == "" || *authSessionID == c.authSessionID) &&
+		(deviceID == nil || *deviceID == "" || *deviceID == c.deviceID)
 }
 
 // offloadFlush runs a force-flush in its own goroutine so a slow Postgres
