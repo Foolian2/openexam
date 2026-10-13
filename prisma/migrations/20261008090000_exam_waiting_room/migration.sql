@@ -1,0 +1,5 @@
+-- AlterEnum
+ALTER TYPE "SessionStatus" ADD VALUE 'WAITING' BEFORE 'IN_PROGRESS';
+
+-- AlterTable
+ALTER TABLE "Exam" ADD COLUMN "waitingRoom" BOOLEAN NOT NULL DEFAULT false;

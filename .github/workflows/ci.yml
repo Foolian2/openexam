@@ -1,0 +1,464 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Build-time placeholders only — no job here talks to a real database,
+  # or cache. They exist because `next build`/`prisma generate`
+  # evaluate module-level code at import time, and `next build` always runs
+  # with NODE_ENV=production internally regardless of the job's shell env:
+  #   - lib/prisma.ts reads DATABASE_URL to construct the pg adapter
+  #   - lib/exam-session.ts throws if MATCHING_ID_SECRET is unset
+  #   - lib/auth.ts (better-auth) throws without BETTER_AUTH_SECRET
+  #   - lib/redis.ts falls back to a default if REDIS_URL is unset, but
+  #     setting it keeps behavior identical across local/CI
+  # No MICROSOFT_* placeholder: setting any of them opts Microsoft login in
+  # (lib/env.ts's microsoftConfigured), and since Better Auth 1.7 the
+  # provider resolves its issuer from the tenant's discovery document when
+  # the auth handler initializes — a placeholder tenant would fail that
+  # lookup and 500 every /api/auth request in the e2e job.
+  DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
+  REDIS_URL: redis://localhost:6379
+  MATCHING_ID_SECRET: ci-placeholder-secret
+  BETTER_AUTH_SECRET: ci-placeholder-secret-value-32-chars-min
+  BETTER_AUTH_URL: http://localhost:3000
+
+jobs:
+  secret-scan:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # gitleaks-action lists the PR's commits via the API on pull_request
+      # events; without this it 403s ("Resource not accessible by integration").
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          # Full history so gitleaks can scan all commits on the branch.
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # v3 crashes trying to upload a SARIF artifact even on a clean scan
+          # (no report file exists yet, so the upload call throws on an
+          # undefined rootDirectory). Disable the upload; findings still show
+          # in the job log and PR comments.
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        # v6.1.0 is the floor for pnpm 12: every earlier release bootstraps
+        # with pnpm 11, whose self-installer expects the target version to
+        # expose `bin/pnpm.mjs`. pnpm 12 replaced that with a native launcher
+        # (`pnpm`) backed by platform-specific `@pnpm/exe.*` packages, so
+        # bootstrapping 12.3.4 from 11 installed a pnpm it could not run and
+        # aborted with ERR_PNPM_BROKEN_PNPM_INSTALL. v6.1.0 adds a native
+        # pnpm 12 bootstrap and picks it based on the resolved version.
+        #
+        # No `version:` input on purpose — the action reads the pnpm version
+        # from package.json's `packageManager` field. Pinning it in both places
+        # let them drift (the pnpm 12.3.4 bump left this at 11.21.0), and
+        # action-setup hard-fails on a mismatch with "Multiple versions of pnpm
+        # specified" before a single step runs.
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm exec prisma generate
+
+      - name: ESLint
+        run: pnpm run lint
+
+  typecheck:
+    name: Typecheck
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        # v6.1.0 is the floor for pnpm 12: every earlier release bootstraps
+        # with pnpm 11, whose self-installer expects the target version to
+        # expose `bin/pnpm.mjs`. pnpm 12 replaced that with a native launcher
+        # (`pnpm`) backed by platform-specific `@pnpm/exe.*` packages, so
+        # bootstrapping 12.3.4 from 11 installed a pnpm it could not run and
+        # aborted with ERR_PNPM_BROKEN_PNPM_INSTALL. v6.1.0 adds a native
+        # pnpm 12 bootstrap and picks it based on the resolved version.
+        #
+        # No `version:` input on purpose — the action reads the pnpm version
+        # from package.json's `packageManager` field. Pinning it in both places
+        # let them drift (the pnpm 12.3.4 bump left this at 11.21.0), and
+        # action-setup hard-fails on a mismatch with "Multiple versions of pnpm
+        # specified" before a single step runs.
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm exec prisma generate
+
+      - name: Validate Prisma schema
+        run: pnpm exec prisma validate
+
+      - name: tsc --noEmit
+        run: pnpm run typecheck
+
+      - name: Check for schema/migration drift
+        # Applies prisma/migrations onto the throwaway shadow DB and diffs
+        # the result against schema.prisma. A non-empty diff means the
+        # schema was edited without generating a matching migration.
+        #
+        # One expected exception: the pg_trgm GIN index on Exam.title
+        # (migrations/20260806180836_add_exam_title_trgm_index) is applied via
+        # raw SQL because Prisma's schema DSL can't express gin_trgm_ops GIN
+        # indexes — see the comment above the Exam model in schema.prisma.
+        # `migrate diff` will always report it as a DropIndex since schema.prisma
+        # has no way to declare it; filter that one expected line out and fail
+        # only on anything else.
+        run: |
+          diff_output=$(pnpm exec prisma migrate diff --from-migrations prisma/migrations --to-schema prisma/schema.prisma --script)
+          echo "$diff_output"
+          unexpected=$(echo "$diff_output" | grep -v -E '^(-- DropIndex|DROP INDEX "Exam_title_trgm_idx";|)$' || true)
+          if [ -n "$unexpected" ]; then
+            echo "::error::Unexpected schema/migration drift detected (beyond the known pg_trgm index)"
+            exit 1
+          fi
+        env:
+          SHADOW_DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        # v6.1.0 is the floor for pnpm 12: every earlier release bootstraps
+        # with pnpm 11, whose self-installer expects the target version to
+        # expose `bin/pnpm.mjs`. pnpm 12 replaced that with a native launcher
+        # (`pnpm`) backed by platform-specific `@pnpm/exe.*` packages, so
+        # bootstrapping 12.3.4 from 11 installed a pnpm it could not run and
+        # aborted with ERR_PNPM_BROKEN_PNPM_INSTALL. v6.1.0 adds a native
+        # pnpm 12 bootstrap and picks it based on the resolved version.
+        #
+        # No `version:` input on purpose — the action reads the pnpm version
+        # from package.json's `packageManager` field. Pinning it in both places
+        # let them drift (the pnpm 12.3.4 bump left this at 11.21.0), and
+        # action-setup hard-fails on a mismatch with "Multiple versions of pnpm
+        # specified" before a single step runs.
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm exec prisma generate
+
+      - name: Vitest (with coverage thresholds)
+        run: pnpm run test:coverage
+
+      # Vitest only collects __tests__/; the CLA workflow script runs with a
+      # write token, so its node:test suite runs here too.
+      - name: CLA script tests
+        run: node --test .github/tests/test_cla.mjs
+
+  e2e:
+    name: E2E
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:18-alpine@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2
+        env:
+          POSTGRES_USER: openexam
+          POSTGRES_PASSWORD: openexam
+          POSTGRES_DB: openexam
+        ports:
+          - 5455:5432
+        options: >-
+          --health-cmd "pg_isready -U openexam"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      # Valkey — see docker-compose.prod.yml's redis service for why. The
+      # healthcheck runs INSIDE the container, where the binary is
+      # valkey-cli; the flush step further down runs on the runner host
+      # against the published port, where redis-tools' redis-cli talks to
+      # Valkey fine.
+      redis:
+        image: valkey/valkey:9.1.2-alpine@sha256:48332870af354a799964c0012ae1194a0bf2bf894eb508f945810596dc2d8d11
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # E2E runs against a real production build (`pnpm build` + `pnpm
+      # start`, see E2E_PROD_SERVER below): realistic behavior and a fraction
+      # of the memory the turbopack dev server needs.
+      # NODE_ENV is "production" under the prod server, so email verification
+      # and CAPTCHA must be skipped explicitly (see lib/auth.ts).
+      DATABASE_URL: postgresql://openexam:openexam@localhost:5455/openexam
+      TEACHER_ACCESS_CODE: dev-teacher-code
+      # The production server's env validation (instrumentation.ts +
+      # lib/env.ts) is fail-closed: AT_REST_ENC_KEY must be set and every
+      # secret must meet its production minimum length. Values are ≥32 chars
+      # of hyphenated words only — a hex tail trips gitleaks'
+      # generic-api-key rule, and real-looking values would too.
+      AT_REST_ENC_KEY: ci-at-rest-enc-value-without-keywords-abcdefghijklmn
+      MATCHING_ID_SECRET: ci-matching-id-value-without-keywords-abcdefghijklmn
+      BETTER_AUTH_SECRET: ci-better-auth-value-without-keywords-abcdefghijklmn
+      # Port for the Playwright-managed server; playwright.config.ts and the
+      # Origin headers in e2e/ key off E2E_PORT.
+      E2E_PORT: "3100"
+      # Playwright webServer starts `pnpm start` (production build) instead
+      # of `pnpm dev --turbopack` — see playwright.config.ts.
+      E2E_PROD_SERVER: "true"
+      # Build a plain (non-standalone) server: `next start` can't run with
+      # output: standalone, and the standalone trace misses @swc/helpers
+      # under pnpm. Only the e2e job sets this; Docker keeps standalone.
+      E2E_NONSTANDALONE: "true"
+      NEXT_PUBLIC_BASE_URL: http://localhost:3100
+      BETTER_AUTH_URL: http://localhost:3100
+      # No Cap service in CI, so any real sign-up/sign-in/access-code-join
+      # call would otherwise 403 on a captcha check it can never satisfy.
+      # Honored under NODE_ENV=production because CI=true (lib/auth.ts).
+      DISABLE_CAPTCHA: "true"
+      # No mailbox in CI: the prod build must not require (or send) email
+      # verification on sign-up. CI-only flag (lib/auth.ts).
+      DISABLE_EMAIL_VERIFICATION: "true"
+      # Required by the production env validation (lib/env.ts) — they only
+      # fill in /datenschutz and /impressum.
+      LEGAL_CONTROLLER_NAME: OpenExam CI
+      LEGAL_CONTROLLER_ADDRESS: Teststrasse 1\n8000 Zürich
+      LEGAL_CONTACT_EMAIL: ci@openexam.test
+      LEGAL_HOSTING_PROVIDER: GitHub Actions runner
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        # v6.1.0 is the floor for pnpm 12: every earlier release bootstraps
+        # with pnpm 11, whose self-installer expects the target version to
+        # expose `bin/pnpm.mjs`. pnpm 12 replaced that with a native launcher
+        # (`pnpm`) backed by platform-specific `@pnpm/exe.*` packages, so
+        # bootstrapping 12.3.4 from 11 installed a pnpm it could not run and
+        # aborted with ERR_PNPM_BROKEN_PNPM_INSTALL. v6.1.0 adds a native
+        # pnpm 12 bootstrap and picks it based on the resolved version.
+        #
+        # No `version:` input on purpose — the action reads the pnpm version
+        # from package.json's `packageManager` field. Pinning it in both places
+        # let them drift (the pnpm 12.3.4 bump left this at 11.21.0), and
+        # action-setup hard-fails on a mismatch with "Multiple versions of pnpm
+        # specified" before a single step runs.
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm exec prisma generate
+
+      - name: Run migrations
+        run: pnpm exec prisma migrate deploy
+
+      - name: Cache Next.js build cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: .next/cache
+          key: nextjs-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles('**/*.ts', '**/*.tsx') }}
+          restore-keys: |
+            nextjs-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-
+
+      # Prod server the suite runs against. Same shape as the Build job
+      # (NEXT_PUBLIC_BASE_URL etc. are set above); the cache step keeps
+      # repeat builds fast across runs.
+      - name: Build production server
+        run: pnpm run build
+
+      - name: Install Playwright browsers
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Clear Valkey rate-limit state
+        # beforeAll in toctou-fixes.spec.ts creates users and sign-ins. On a
+        # Playwright retry the same beforeAll re-runs against the same Redis,
+        # quickly exhausting the Better Auth 5-req/60s sign-up/sign-in budget.
+        # This CI instance is ephemeral (service container), so a full flush is
+        # safe. redis-tools' redis-cli speaks to the Valkey service unchanged.
+        run: |
+          sudo apt-get install -y --no-install-recommends redis-tools
+          redis-cli -h 127.0.0.1 FLUSHALL
+
+      - name: Playwright
+        run: pnpm run test:e2e
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7
+
+  go-lint:
+    name: Go lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: "1.26.9"
+          cache-dependency-path: ws-backend/go.sum
+
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
+        with:
+          working-directory: ws-backend
+          version: v2.12.2
+
+      # ws-backend has had tests since it was written and CI never ran them —
+      # only the linter. The room/hub suites cover the answer-save state machine
+      # (lock, submit, expiry, rate limit) and the answer buffer's restore
+      # semantics: regressions there lose students' answers, which is the worst
+      # thing this service can do.
+      - name: Go test
+        working-directory: ws-backend
+        run: go test -race ./...
+
+  shell:
+    name: Shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      # The installer and the scripts it drives. Warnings and errors only:
+      # the ops scripts carry info-level findings (a literal $ in
+      # single-quoted container commands) on purpose.
+      - name: ShellCheck
+        run: >-
+          docker run --rm -v "$PWD:/mnt:ro" -w /mnt
+          koalaman/shellcheck@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d
+          -x --severity=warning
+          openexam scripts/lib/ui.sh scripts/lib/detect.sh scripts/lib/env-file.sh
+          scripts/cli/*.sh scripts/test-cli.sh
+          scripts/offsite.sh scripts/install-docker.sh scripts/install-cron.sh
+          scripts/create-cap-site-key.sh scripts/gen-env-prod.sh scripts/issue-cert.sh
+          scripts/setup-prod.sh scripts/deploy.sh scripts/backup.sh scripts/check-dns.sh
+          scripts/bootstrap-cert.sh scripts/configure-firewall.sh scripts/rollback.sh
+
+      # ./openexam install local must run on macOS, whose /bin/bash is still
+      # 3.2 — bash-4-only syntax (associative arrays, mapfile, ${v,,}) would
+      # only break there. The bash:3.2 image is that exact release, and its
+      # busybox sed/awk/grep also catch GNU-only flags.
+      - name: CLI self-test under bash 3.2
+        run: >-
+          docker run --rm -v "$PWD:/w:ro" -w /w
+          bash@sha256:0fd7cb8499c63a3c9345e7088a9cd83bb69f6e895e83833859aff838a0312091
+          bash scripts/test-cli.sh
+
+      - name: CLI self-test under the runner's bash
+        run: bash scripts/test-cli.sh
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    env:
+      # lib/auth.ts derives the WebAuthn rpID from this and throws at import
+      # time in production (i.e. during `next build` page-data collection)
+      # when it's unset. Same value as the E2E job.
+      NEXT_PUBLIC_BASE_URL: http://localhost:3000
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        # v6.1.0 is the floor for pnpm 12: every earlier release bootstraps
+        # with pnpm 11, whose self-installer expects the target version to
+        # expose `bin/pnpm.mjs`. pnpm 12 replaced that with a native launcher
+        # (`pnpm`) backed by platform-specific `@pnpm/exe.*` packages, so
+        # bootstrapping 12.3.4 from 11 installed a pnpm it could not run and
+        # aborted with ERR_PNPM_BROKEN_PNPM_INSTALL. v6.1.0 adds a native
+        # pnpm 12 bootstrap and picks it based on the resolved version.
+        #
+        # No `version:` input on purpose — the action reads the pnpm version
+        # from package.json's `packageManager` field. Pinning it in both places
+        # let them drift (the pnpm 12.3.4 bump left this at 11.21.0), and
+        # action-setup hard-fails on a mismatch with "Multiple versions of pnpm
+        # specified" before a single step runs.
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm exec prisma generate
+
+      - name: Cache Next.js build cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: .next/cache
+          key: nextjs-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles('**/*.ts', '**/*.tsx') }}
+          restore-keys: |
+            nextjs-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-
+
+      - name: next build
+        run: pnpm run build

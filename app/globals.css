@@ -1,0 +1,471 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+@custom-variant dark (&:is(.dark *));
+
+/* The system math fonts, scaled to Geist's x-height (0.53 vs 0.473 and 0.449)
+   so a letter that falls back for its arrow isn't visibly smaller. */
+@font-face {
+    font-family: "Math Fallback STIX";
+    src: local("STIX Two Math");
+    size-adjust: 112%;
+}
+
+@font-face {
+    font-family: "Math Fallback Cambria";
+    src: local("Cambria Math");
+    size-adjust: 118%;
+}
+
+@theme inline {
+    /* Geist and its Arial fallback lack combining marks such as the vector
+       arrow U+20D7 in "x⃗", which then renders as a box; the math fonts below
+       cover them. Appended here rather than via next/font's `fallback`, which
+       would drop the metric-matched "Geist Fallback". */
+    --font-heading: var(--font-sans), "Math Fallback STIX", "Math Fallback Cambria", math, sans-serif;
+    --font-sans: var(--font-sans), "Math Fallback STIX", "Math Fallback Cambria", math, sans-serif;
+    --font-dyslexic: var(--font-dyslexic);
+    --color-sidebar-ring: var(--sidebar-ring);
+    --color-sidebar-border: var(--sidebar-border);
+    --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+    --color-sidebar-accent: var(--sidebar-accent);
+    --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+    --color-sidebar-primary: var(--sidebar-primary);
+    --color-sidebar-foreground: var(--sidebar-foreground);
+    --color-sidebar: var(--sidebar);
+    --color-chart-5: var(--chart-5);
+    --color-chart-4: var(--chart-4);
+    --color-chart-3: var(--chart-3);
+    --color-chart-2: var(--chart-2);
+    --color-chart-1: var(--chart-1);
+    --color-ring: var(--ring);
+    --color-input: var(--input);
+    --color-border: var(--border);
+    --color-destructive: var(--destructive);
+    --color-destructive-foreground: var(--destructive-foreground);
+    --color-success: var(--success);
+    --color-success-foreground: var(--success-foreground);
+    --color-warning: var(--warning);
+    --color-warning-foreground: var(--warning-foreground);
+    --color-info: var(--info);
+    --color-info-foreground: var(--info-foreground);
+    --color-accent-foreground: var(--accent-foreground);
+    --color-accent: var(--accent);
+    --color-muted-foreground: var(--muted-foreground);
+    --color-muted: var(--muted);
+    --color-secondary-foreground: var(--secondary-foreground);
+    --color-secondary: var(--secondary);
+    --color-primary-foreground: var(--primary-foreground);
+    --color-primary: var(--primary);
+    --color-popover-foreground: var(--popover-foreground);
+    --color-popover: var(--popover);
+    --color-card-foreground: var(--card-foreground);
+    --color-card: var(--card);
+    --color-foreground: var(--foreground);
+    --color-background: var(--background);
+    --radius-sm: calc(var(--radius) * 0.6);
+    --radius-md: calc(var(--radius) * 0.8);
+    --radius-lg: var(--radius);
+    --radius-xl: calc(var(--radius) * 1.4);
+    --radius-2xl: calc(var(--radius) * 1.8);
+    --radius-3xl: calc(var(--radius) * 2.2);
+    --radius-4xl: calc(var(--radius) * 2.6);
+    --ease-out-quart: cubic-bezier(0.25, 1, 0.5, 1);
+}
+
+/* Easing tokens. Redefining Tailwind's own --ease-* keys upgrades the
+   `ease-out` / `ease-in-out` utilities app-wide to stronger curves; the
+   drawer curve is iOS-like, for panels that slide in from an edge.
+   These are consumed as utilities (ease-out), never as a global --tw-ease
+   default: Tailwind registers --tw-ease with `inherits: false`, so a value
+   set on :root reaches no element and would be silently dead. */
+@theme {
+    --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+    --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+    --ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+:root {
+    /* Motion tokens. Tailwind v4 has no --duration-* theme namespace, so
+       these are consumed as duration-[var(--duration-fast)] rather than a
+       duration-fast utility (which would silently generate nothing). */
+    --duration-fast: 150ms;
+    --duration-normal: 250ms;
+
+    /* Brand highlighter yellow: logo fold and highlighted answer line
+       (components/brand/logo.tsx). Theme-independent on purpose. */
+    --brand-accent: #FFD23F;
+    --background: oklch(1 0 0);
+    --foreground: oklch(0.145 0 0);
+    --card: oklch(1 0 0);
+    --card-foreground: oklch(0.145 0 0);
+    --popover: oklch(1 0 0);
+    --popover-foreground: oklch(0.145 0 0);
+    --primary: oklch(0.205 0 0);
+    --primary-foreground: oklch(0.985 0 0);
+    --secondary: oklch(0.97 0 0);
+    --secondary-foreground: oklch(0.205 0 0);
+    --muted: oklch(0.97 0 0);
+    --muted-foreground: oklch(0.5 0 0);
+    --accent: oklch(0.97 0 0);
+    --accent-foreground: oklch(0.205 0 0);
+    --destructive: oklch(0.577 0.245 27.325);
+    --destructive-foreground: oklch(0.985 0 0);
+    --success: oklch(0.5 0.16 150);
+    --success-foreground: oklch(0.985 0 0);
+    --warning: oklch(0.68 0.13 75);
+    --warning-foreground: oklch(0.55 0.15 60);
+    --info: oklch(0.55 0.16 255);
+    --info-foreground: oklch(0.985 0 0);
+    --border: oklch(0.922 0 0);
+    --input: oklch(0.922 0 0);
+    --ring: oklch(0.708 0 0);
+    --chart-1: oklch(0.87 0 0);
+    --chart-2: oklch(0.556 0 0);
+    --chart-3: oklch(0.439 0 0);
+    --chart-4: oklch(0.371 0 0);
+    --chart-5: oklch(0.269 0 0);
+    --radius: 0.625rem;
+    --sidebar: oklch(0.985 0 0);
+    --sidebar-foreground: oklch(0.145 0 0);
+    --sidebar-primary: oklch(0.205 0 0);
+    --sidebar-primary-foreground: oklch(0.985 0 0);
+    --sidebar-accent: oklch(0.97 0 0);
+    --sidebar-accent-foreground: oklch(0.205 0 0);
+    --sidebar-border: oklch(0.922 0 0);
+    --sidebar-ring: oklch(0.708 0 0);
+}
+
+.dark {
+    --background: oklch(0.145 0 0);
+    --foreground: oklch(0.985 0 0);
+    --card: oklch(0.205 0 0);
+    --card-foreground: oklch(0.985 0 0);
+    --popover: oklch(0.205 0 0);
+    --popover-foreground: oklch(0.985 0 0);
+    --primary: oklch(0.922 0 0);
+    --primary-foreground: oklch(0.205 0 0);
+    --secondary: oklch(0.269 0 0);
+    --secondary-foreground: oklch(0.985 0 0);
+    --muted: oklch(0.269 0 0);
+    --muted-foreground: oklch(0.708 0 0);
+    --accent: oklch(0.269 0 0);
+    --accent-foreground: oklch(0.985 0 0);
+    --destructive: oklch(0.704 0.191 22.216);
+    --destructive-foreground: oklch(0.205 0 0);
+    --success: oklch(0.72 0.15 155);
+    --success-foreground: oklch(0.205 0 0);
+    --warning: oklch(0.76 0.13 80);
+    --warning-foreground: oklch(0.85 0.13 85);
+    --info: oklch(0.7 0.15 255);
+    --info-foreground: oklch(0.205 0 0);
+    --border: oklch(1 0 0 / 10%);
+    --input: oklch(1 0 0 / 15%);
+    --ring: oklch(0.556 0 0);
+    --chart-1: oklch(0.87 0 0);
+    --chart-2: oklch(0.556 0 0);
+    --chart-3: oklch(0.439 0 0);
+    --chart-4: oklch(0.371 0 0);
+    --chart-5: oklch(0.269 0 0);
+    --sidebar: oklch(0.205 0 0);
+    --sidebar-foreground: oklch(0.985 0 0);
+    --sidebar-primary: oklch(0.488 0.243 264.376);
+    --sidebar-primary-foreground: oklch(0.985 0 0);
+    --sidebar-accent: oklch(0.269 0 0);
+    --sidebar-accent-foreground: oklch(0.985 0 0);
+    --sidebar-border: oklch(1 0 0 / 10%);
+    --sidebar-ring: oklch(0.556 0 0);
+}
+
+.dyslexic {
+    --font-sans: var(--font-dyslexic);
+}
+
+.high-contrast {
+    --background: oklch(1 0 0);
+    --foreground: oklch(0 0 0);
+    --card: oklch(1 0 0);
+    --card-foreground: oklch(0 0 0);
+    --popover: oklch(1 0 0);
+    --popover-foreground: oklch(0 0 0);
+    --primary: oklch(0 0 0);
+    --primary-foreground: oklch(1 0 0);
+    --secondary: oklch(0.9 0 0);
+    --secondary-foreground: oklch(0 0 0);
+    --muted: oklch(0.9 0 0);
+    --muted-foreground: oklch(0.32 0 0);
+    --accent: oklch(0.9 0 0);
+    --accent-foreground: oklch(0 0 0);
+    --destructive: oklch(0.52 0.2 27);
+    --destructive-foreground: oklch(1 0 0);
+    --success: oklch(0.45 0.2 150);
+    --success-foreground: oklch(1 0 0);
+    --warning: oklch(0.55 0.2 70);
+    --warning-foreground: oklch(0.42 0.18 60);
+    --info: oklch(0.42 0.2 255);
+    --info-foreground: oklch(1 0 0);
+    --border: oklch(0.35 0 0);
+    --input: oklch(0.35 0 0);
+    --ring: oklch(0.2 0 0);
+    --sidebar: oklch(1 0 0);
+    --sidebar-foreground: oklch(0 0 0);
+    --sidebar-primary: oklch(0 0 0);
+    --sidebar-primary-foreground: oklch(1 0 0);
+    --sidebar-accent: oklch(0.9 0 0);
+    --sidebar-accent-foreground: oklch(0 0 0);
+    --sidebar-border: oklch(0.35 0 0);
+    --sidebar-ring: oklch(0.2 0 0);
+}
+
+.high-contrast.dark {
+    --background: oklch(0 0 0);
+    --foreground: oklch(1 0 0);
+    --card: oklch(0.12 0 0);
+    --card-foreground: oklch(1 0 0);
+    --popover: oklch(0.12 0 0);
+    --popover-foreground: oklch(1 0 0);
+    --primary: oklch(1 0 0);
+    --primary-foreground: oklch(0 0 0);
+    --secondary: oklch(0.3 0 0);
+    --secondary-foreground: oklch(1 0 0);
+    --muted: oklch(0.3 0 0);
+    --muted-foreground: oklch(0.88 0 0);
+    --accent: oklch(0.3 0 0);
+    --accent-foreground: oklch(1 0 0);
+    --destructive: oklch(0.72 0.17 22);
+    --destructive-foreground: oklch(0.205 0 0);
+    --success: oklch(0.7 0.2 155);
+    --success-foreground: oklch(0 0 0);
+    --warning: oklch(0.8 0.18 80);
+    --warning-foreground: oklch(0.85 0.16 85);
+    --info: oklch(0.68 0.2 255);
+    --info-foreground: oklch(0 0 0);
+    --border: oklch(1 0 0 / 45%);
+    --input: oklch(1 0 0 / 45%);
+    --ring: oklch(1 0 0);
+    --sidebar: oklch(0 0 0);
+    --sidebar-foreground: oklch(1 0 0);
+    --sidebar-primary: oklch(1 0 0);
+    --sidebar-primary-foreground: oklch(0 0 0);
+    --sidebar-accent: oklch(0.3 0 0);
+    --sidebar-accent-foreground: oklch(1 0 0);
+    --sidebar-border: oklch(1 0 0 / 45%);
+    --sidebar-ring: oklch(1 0 0);
+}
+
+.reduce-motion,
+.reduce-motion *,
+.reduce-motion *::before,
+.reduce-motion *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+}
+
+/* Reduced motion means fewer and gentler animations, not zero. These two are
+   continuous state indicators, not decoration: freezing them removes the only
+   signal that something is loading, or that the caret is where you type. The
+   two-class selector outranks `.reduce-motion *`, both sides !important. */
+.reduce-motion .animate-spin {
+    animation: var(--animate-spin) !important;
+}
+.reduce-motion .animate-caret-blink {
+    animation: var(--animate-caret-blink) !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+    }
+
+    .animate-spin {
+        animation: var(--animate-spin) !important;
+    }
+    .animate-caret-blink {
+        animation: var(--animate-caret-blink) !important;
+    }
+}
+
+@media (prefers-contrast: more) {
+    :root:not(.high-contrast) {
+        --muted-foreground: oklch(0.35 0 0);
+        --border: oklch(0.45 0 0);
+        --input: oklch(0.45 0 0);
+        --ring: oklch(0.25 0 0);
+        --sidebar-border: oklch(0.45 0 0);
+    }
+}
+
+@media (prefers-contrast: more) {
+    :root.dark:not(.high-contrast) {
+        --muted-foreground: oklch(0.85 0 0);
+        --border: oklch(1 0 0 / 40%);
+        --input: oklch(1 0 0 / 40%);
+        --ring: oklch(1 0 0);
+        --sidebar-border: oklch(1 0 0 / 40%);
+    }
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+    }
+  body {
+    @apply bg-background text-foreground;
+    }
+  html {
+    @apply font-sans;
+    }
+}
+
+@layer components {
+  /* Rich-text editor (FREE_TEXT with richText enabled) */
+  .rich-text-editor .tiptap {
+    @apply min-h-32 px-3 py-2 outline-none;
+  }
+  .rich-text-editor .tiptap > *:first-child {
+    margin-top: 0;
+  }
+  .rich-text-editor .tiptap > *:last-child {
+    margin-bottom: 0;
+  }
+  .rich-text-editor .tiptap p {
+    @apply my-1;
+  }
+  .rich-text-editor .tiptap h1,
+  .rich-text-editor .tiptap h2,
+  .rich-text-editor .tiptap h3,
+  .rich-text-editor .tiptap h4,
+  .rich-text-editor .tiptap h5,
+  .rich-text-editor .tiptap h6 {
+    @apply my-2 font-semibold text-foreground;
+  }
+  .rich-text-editor .tiptap h1 {
+    @apply text-xl;
+  }
+  .rich-text-editor .tiptap h2 {
+    @apply text-lg;
+  }
+  .rich-text-editor .tiptap h3,
+  .rich-text-editor .tiptap h4,
+  .rich-text-editor .tiptap h5,
+  .rich-text-editor .tiptap h6 {
+    @apply text-base;
+  }
+  .rich-text-editor .tiptap ul,
+  .rich-text-editor .tiptap ol {
+    @apply my-1 ps-6;
+  }
+  .rich-text-editor .tiptap ul {
+    @apply list-disc;
+  }
+  .rich-text-editor .tiptap ol {
+    @apply list-decimal;
+  }
+  .rich-text-editor .tiptap blockquote {
+    @apply my-1 border-l-2 border-muted-foreground/40 ps-3 text-muted-foreground;
+  }
+  .rich-text-editor .tiptap code {
+    @apply rounded bg-muted px-1 py-0.5 text-[0.85em] font-mono;
+  }
+  .rich-text-editor .tiptap pre {
+    @apply my-2 overflow-x-auto rounded-lg bg-muted p-3 font-mono text-sm;
+  }
+  .rich-text-editor .tiptap pre code {
+    @apply bg-transparent p-0 text-inherit;
+  }
+  .rich-text-editor .tiptap hr {
+    @apply my-3 border-border;
+  }
+  .rich-text-editor .tiptap a {
+    @apply text-primary underline;
+  }
+  .rich-text-editor .tiptap p.is-editor-empty:first-child::before {
+    content: attr(data-placeholder);
+    @apply pointer-events-none float-left h-0 text-muted-foreground;
+  }
+
+  /* Read-only rich-text answers */
+  .rich-text-content > :first-child {
+    margin-top: 0;
+  }
+  .rich-text-content > :last-child {
+    margin-bottom: 0;
+  }
+  .rich-text-content p,
+  .rich-text-content ul,
+  .rich-text-content ol,
+  .rich-text-content blockquote {
+    @apply my-1;
+  }
+  .rich-text-content ul,
+  .rich-text-content ol {
+    @apply ps-5;
+  }
+  .rich-text-content ul {
+    @apply list-disc;
+  }
+  .rich-text-content ol {
+    @apply list-decimal;
+  }
+  .rich-text-content h1,
+  .rich-text-content h2,
+  .rich-text-content h3,
+  .rich-text-content h4,
+  .rich-text-content h5,
+  .rich-text-content h6 {
+    @apply my-2 font-semibold;
+  }
+  .rich-text-content blockquote {
+    @apply border-l-2 border-muted-foreground/40 ps-3 text-muted-foreground;
+  }
+  .rich-text-content code {
+    @apply rounded bg-muted px-1 py-0.5 text-[0.85em] font-mono;
+  }
+  .rich-text-content pre {
+    @apply my-2 overflow-x-auto rounded-lg bg-muted p-3 font-mono text-sm;
+  }
+  .rich-text-content a {
+    @apply text-primary underline;
+  }
+  .rich-text-content mark {
+    @apply bg-amber-200/70 px-0.5 rounded-sm;
+  }
+  .dark .rich-text-content mark {
+    @apply bg-amber-400/30;
+  }
+
+  /* Cap CAPTCHA widget (components/auth/cap-widget.tsx) ships light-mode-only
+     default colors, so wire its CSS variables to our design tokens — they
+     already flip under .dark, so this widget follows along automatically. */
+  cap-widget {
+    --cap-background: var(--card);
+    --cap-border-color: var(--border);
+    --cap-border-radius: var(--radius-md);
+    --cap-color: var(--foreground);
+    --cap-checkbox-background: var(--background);
+    --cap-checkbox-border: 1px solid var(--border);
+    --cap-spinner-background-color: var(--muted);
+    --cap-spinner-color: var(--foreground);
+    --cap-focus-ring: var(--ring);
+    --cap-invalid-border-color: var(--destructive);
+    --cap-invalid-ring-color: color-mix(in oklch, var(--destructive) 20%, transparent);
+    --cap-troubleshoot-color: var(--primary);
+  }
+}
+
+@keyframes monitor-row-flash {
+    from {
+        background-color: color-mix(in oklch, var(--warning) 22%, transparent);
+    }
+    to {
+        background-color: transparent;
+    }
+}

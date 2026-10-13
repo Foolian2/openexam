@@ -1,0 +1,156 @@
+# Vector config: turns nginx's machine-readable access log into Prometheus
+# metrics. Committed, no secrets: it describes a log format, not credentials.
+# Bind-mounted read-only into the nginx-log-exporter service
+# (docker-compose.prod.yml).
+#
+# This exists because stub_status -- the only thing nginx/nginx-prometheus-exporter
+# can read -- exposes connection and request counts with no status-code or
+# per-route breakdown. The SLO alerts in monitoring/prometheus/rules/alerts.yml
+# need error rate and latency percentiles, and an access log is the only place
+# nginx emits either.
+#
+# This replaced martin-helmich/prometheus-nginxlog-exporter, whose last image
+# was built in 2021 against Go 1.13 and carried 69 unfixable stdlib CVEs with
+# no newer image published. Every metric name, label and bucket boundary below
+# is chosen to match that exporter byte-for-byte, so alerts.yml, the Grafana
+# dashboards and nginx.conf did not have to change.
+#
+# Note on `$$` below: Vector expands `$VAR` from the environment anywhere in
+# this file, comments included, and aborts startup on an undefined name. The
+# nginx log variables are therefore written `$$route`, `$$status` and so on --
+# an escaped literal `$`, not a typo.
+
+sources:
+  # nginx ships its metrics access log here over UDP syslog (see the
+  # `access_log syslog:...` directive in nginx/nginx.conf). UDP is deliberate:
+  # if this container is down or restarting, nginx drops the datagrams rather
+  # than blocking a request at the edge.
+  #
+  # Loopback, because this process shares nginx's network namespace -- that is
+  # what lets nginx address it as 127.0.0.1 and never resolve a name while
+  # parsing its config. Binding 0.0.0.0 would additionally expose the syslog
+  # port on nginx's `edge` address for no reason.
+  nginx_syslog:
+    type: syslog
+    mode: udp
+    address: 127.0.0.1:9514
+
+transforms:
+  # Must stay in step with `log_format metrics` in nginx/nginx.conf -- the
+  # parser is positional, so a field added on one side and not the other
+  # silently misparses every line from then on.
+  #
+  #   $$route $$request_method $$status $$request_time $$upstream_response_time
+  parse:
+    type: remap
+    inputs: [nginx_syslog]
+    drop_on_error: true
+    reroute_dropped: true
+    source: |
+      # limit: 5 keeps everything after the fourth space in the last element.
+      # That matters because nginx writes $$upstream_response_time as a
+      # comma-AND-space separated list ("0.12, 0.09") when a request touched
+      # more than one upstream -- splitting unbounded would turn one line into
+      # six fields and drop it as unparseable.
+      parts = split(string!(.message), " ", limit: 5)
+      if length(parts) != 5 { abort }
+
+      .route = parts[0]
+      .method = parts[1]
+      .status = parts[2]
+      .request_time = to_float!(parts[3])
+
+      # "-" whenever no upstream was involved at all (static files, redirects,
+      # nginx-generated 4xx). Those requests have no upstream time to record,
+      # so the field is left unset and the histogram below simply skips them.
+      upstream = string!(parts[4])
+      if upstream != "-" {
+        .upstream_time = to_float!(strip_whitespace(string!(split(upstream, ",")[0])))
+      }
+
+  response_metrics:
+    type: log_to_metric
+    inputs: [parse]
+    metrics:
+      - type: counter
+        field: status
+        name: http_response_count_total
+        namespace: nginx
+        tags: &response_tags
+          route: "{{route}}"
+          method: "{{method}}"
+          status: "{{status}}"
+
+      # Named *_hist to match the old exporter, which emitted both a histogram
+      # under this name and a summary under the un-suffixed name. Only the
+      # histogram is used (alerts.yml, openexam-overview.json), and Vector's
+      # prometheus_exporter renders a distribution as one or the other, so the
+      # unread summaries are gone on purpose.
+      - type: histogram
+        field: request_time
+        name: http_response_time_seconds_hist
+        namespace: nginx
+        tags: *response_tags
+
+  # Split out so that requests with no upstream (upstream_time unset) do not
+  # make the counter and latency metrics above fail to render.
+  upstream_metrics:
+    type: filter
+    inputs: [parse]
+    condition: exists(.upstream_time)
+
+  upstream_histogram:
+    type: log_to_metric
+    inputs: [upstream_metrics]
+    metrics:
+      - type: histogram
+        field: upstream_time
+        name: http_upstream_time_seconds_hist
+        namespace: nginx
+        tags: *response_tags
+
+  # Same name and meaning as the old exporter's counter: lines the parser could
+  # not read. A nonzero rate here means nginx.conf and the `parse` transform
+  # above have drifted apart.
+  parse_errors:
+    type: log_to_metric
+    inputs: [parse.dropped]
+    metrics:
+      - type: counter
+        field: message
+        name: parse_errors_total
+        namespace: nginx
+
+sinks:
+  prometheus:
+    type: prometheus_exporter
+    inputs: [response_metrics, upstream_histogram, parse_errors]
+    # 0.0.0.0, unlike the syslog source above, which is deliberately loopback.
+    # The asymmetry is the point: nginx reaches the syslog port from inside the
+    # shared namespace, but Prometheus is a different container and connects to
+    # nginx's address on the `internal` network (prometheus.yml scrapes
+    # nginx:4040). Binding this to 127.0.0.1 makes that scrape fail with
+    # "connection refused" -- and, because the metrics endpoint IS the scrape
+    # target, that shows up as ContainerDown for the nginx-log job. This port
+    # is still not published to the host; only 80 and 443 are.
+    address: 0.0.0.0:4040
+
+    # Bucket boundaries are the SLOs themselves, not a generic spread: 0.2 is
+    # the p95 REST target and 2 the page-load target. Having
+    # the thresholds land exactly on bucket edges means histogram_quantile
+    # reports them without interpolating across a boundary, so an alert firing
+    # at 0.2 means 0.2.
+    buckets: [0.01, 0.025, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10]
+
+    # Vector otherwise stamps each sample with the time the log line arrived and
+    # keeps that timestamp frozen until the series next moves. Prometheus drops
+    # a re-scraped sample whose explicit timestamp has not advanced, so an idle
+    # route's series would go stale instead of holding its last value. Letting
+    # Prometheus apply its own scrape time is what the old exporter did.
+    suppress_timestamp: true
+
+    # Counters must survive quiet periods. If a series were expired for going
+    # idle it would restart at zero on its next request, and rate() would read
+    # that as a counter reset -- precisely on the low-traffic routes
+    # RouteErrorRateHigh exists to watch.
+    flush_period_secs: 86400

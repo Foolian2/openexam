@@ -1,0 +1,63 @@
+{
+  "_comment": "Shared vectors for the SEB token construction sha256(urlWithoutFragment + key). Consumed by __tests__/seb-token-vectors.test.ts (configKeyTokenForUrl) and ws-backend/internal/seb/seb_test.go (TestSharedTokenVectors). Both the Config Key token and the Browser Exam Key RequestHash use this same construction, so one table covers both. bekVectors pins the BEK decision rule: consumed by __tests__/seb-token-vectors.test.ts (decideBekAction) and ws-backend/main_test.go (TestSebIntegrityDecision_SharedVectors). Regenerate deliberately: a changed value here means the wire format changed.",
+  "vectors": [
+    {
+      "name": "take page URL, config key",
+      "url": "http://localhost:3000/exam/exam1/take",
+      "key": "the-config-key",
+      "expected": "a7088b04dc90eb0ef92a4a7f0e12dc2821537b1c6dce9687c014f081a527a7c5"
+    },
+    {
+      "name": "take page URL, browser exam key",
+      "url": "http://localhost:3000/exam/exam1/take",
+      "key": "the-browser-exam-key",
+      "expected": "ddd13ae2a3d7b4efa4d98c1b9582b78a52b7a6020e01f6f0a6118dc8bbba3a99"
+    },
+    {
+      "name": "per-URL REST path (Windows native header)",
+      "url": "http://localhost:3000/api/sessions/session1",
+      "key": "the-config-key",
+      "expected": "aa966077638fb8f899ff1e58fdf84ca4b3b9343d105ff9b7410ddcfb84a8302e"
+    },
+    {
+      "name": "URL with query string",
+      "url": "http://localhost:3000/api/sessions/s1/download?questionId=q1",
+      "key": "the-config-key",
+      "expected": "8f148ac7b2a443841f32777560e6e0a02140c2ae34a127677bfb2bb23c5a5c02"
+    },
+    {
+      "name": "fragment is stripped before hashing",
+      "url": "http://localhost:3000/exam/exam1/take#frag",
+      "key": "the-config-key",
+      "expected": "a7088b04dc90eb0ef92a4a7f0e12dc2821537b1c6dce9687c014f081a527a7c5"
+    },
+    {
+      "name": "https origin",
+      "url": "https://exam.example.com/exam/exam1/take",
+      "key": "the-config-key",
+      "expected": "de1eca1e382ad4144e12f2bceeea3e517f06523a46fe070a64edbe7aca0dcfe2"
+    },
+    {
+      "name": "64-hex key as pasted from SEB Preferences",
+      "url": "https://exam.example.com/exam/exam1/take",
+      "key": "3f9a1c2b4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8",
+      "expected": "d89e9a8e49c69a92db80bafdff361eff2125e1b1a3749039d5629a8d632ea951"
+    },
+    {
+      "name": "empty key",
+      "url": "http://localhost:3000/exam/exam1/take",
+      "key": "",
+      "expected": "23cab8b291ebe28c809ad3e312fd6ba7615a6708d8e626f8aab6e440c5b2f4cd"
+    }
+  ],
+  "bekVectors": [
+    { "name": "nothing bound, nothing presented", "bound": null, "presented": "", "alreadyFlagged": false, "action": "noop", "reason": null },
+    { "name": "nothing bound, presented binds", "bound": null, "presented": "bek-abc", "alreadyFlagged": false, "action": "bind", "reason": null },
+    { "name": "empty bound, presented binds", "bound": "", "presented": "bek-abc", "alreadyFlagged": false, "action": "bind", "reason": null },
+    { "name": "matches bound", "bound": "bek-abc", "presented": "bek-abc", "alreadyFlagged": false, "action": "noop", "reason": null },
+    { "name": "changed and not flagged", "bound": "bek-abc", "presented": "bek-xyz", "alreadyFlagged": false, "action": "flag", "reason": "bek_changed" },
+    { "name": "disappeared and not flagged", "bound": "bek-abc", "presented": "", "alreadyFlagged": false, "action": "flag", "reason": "bek_disappeared" },
+    { "name": "changed but already flagged", "bound": "bek-abc", "presented": "bek-xyz", "alreadyFlagged": true, "action": "noop", "reason": null },
+    { "name": "disappeared but already flagged", "bound": "bek-abc", "presented": "", "alreadyFlagged": true, "action": "noop", "reason": null }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "_comment": "Shared status-vector fixture pinning the TS predicates (lib/session-state.ts) and the Go maps (ws-backend/main.go) to the same membership + the grace constant. Consumed by __tests__/session-state.test.ts and ws-backend/main_test.go.",
+  "submitGraceMs": 30000,
+  "statuses": [
+    {
+      "status": "WAITING",
+      "open": false,
+      "socketJoinable": false,
+      "active": false,
+      "submitted": false
+    },
+    {
+      "status": "IN_PROGRESS",
+      "open": true,
+      "socketJoinable": true,
+      "active": true,
+      "submitted": false
+    },
+    {
+      "status": "LOCKED",
+      "open": false,
+      "socketJoinable": true,
+      "active": true,
+      "submitted": false
+    },
+    {
+      "status": "SUBMITTED",
+      "open": false,
+      "socketJoinable": false,
+      "active": false,
+      "submitted": true
+    },
+    {
+      "status": "AUTO_SUBMITTED",
+      "open": false,
+      "socketJoinable": false,
+      "active": false,
+      "submitted": true
+    }
+  ]
+}

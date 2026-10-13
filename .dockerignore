@@ -1,0 +1,54 @@
+# Build artifacts and dependencies (rebuilt inside the image)
+node_modules
+.next
+generated
+ws-backend
+
+# Local state, secrets, deployment artifacts
+# Audit evidence and load seeds contain local session cookies/credentials.
+audit
+load/data
+.env*
+secrets
+certs
+backups
+*.log
+
+# VCS / tooling
+.git
+.github
+.worktrees
+.claude
+.codex
+.vscode
+.idea
+
+# Large local-only trees and tool caches (build-context bloat, ~18 GB)
+desktop
+seb
+.pnpm-store
+graphify-out
+
+# Tests
+e2e
+__tests__
+test-results
+playwright-report
+coverage
+vitest.config.ts
+playwright.config.ts
+
+# Docs and non-app content
+openexam
+*.md
+docker-compose*.yml
+nginx
+scripts
+# ...except the one-off data migrations, which run inside the migrate image
+# (see Dockerfile's migrate stage). Docker applies these patterns in order and
+# the last match wins, so a file inside an excluded directory can be re-added.
+!scripts/migrate-account-identity.ts
+# Operator tool built into the walg-setup stage (scripts/setup-walg-sftp.sh).
+!scripts/setup-walg-sftp.mjs
+Dockerfile
+.dockerignore

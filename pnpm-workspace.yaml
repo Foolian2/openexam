@@ -1,0 +1,58 @@
+overrides:
+  deepmerge-ts: ^8.0.0
+  # GHSA for nanoid <3.3.17 (custom generators loop on size 0) — scoped to
+  # 3.x so the direct nanoid@6 dependency is unaffected.
+  'nanoid@>=3.0.0 <3.3.17': ^3.3.17
+  hono: ^4.12.25
+  dompurify: ^3.4.16
+  # Floors track the patched version of whatever advisory forced the pin —
+  # bump the floor, don't just widen the range, or the lockfile keeps
+  # resolving vulnerable releases (GHSA-7p8r-x3mc-p8w7, -mwp4-54f8-5fhr,
+  # -5p4m-2wfm-xmqj, -4cwx-7wf7-3272, -rgw5-rvv9-x895, -55q2-fjhq-7xh7,
+  # -5jgf-p345-68v8, -f65p-4m7j-42xc, -fph4-wmhf-6fwf, -jqff-g426-hqxp,
+  # plus the two fast-uri 3.1.6 authority-parsing advisories fixed in 3.1.7+).
+  fast-uri: ^3.1.8
+  fast-xml-parser: ^5.7.0
+  fast-xml-builder: ^1.1.7
+  find-my-way: ^9.7.0
+  ip-address: ^10.3.1
+  js-yaml: ^4.3.1
+  # Reached only through prisma's optional MySQL driver, which this
+  # Postgres-only deployment never loads — but it is in the prod tree,
+  # so the audit gate sees it (GHSA-3f6p-5ww8-9rcr).
+  mysql2: ^3.22.0
+  qs: ^6.15.2
+  # Reached only through plist (.seb config generation), whose own ^0.8.8
+  # range still resolves the vulnerable releases. Scoped to the 0.8.x line
+  # so a future 0.9.x consumer resolves normally (GHSA-w2rr-34g9-rvrj,
+  # -4w3w-2rp5-g8jm, -c7q8-3ch8-vqpv, -27p8-2357-5qqv, -8344-3jmq-59r6,
+  # -x4fp-j954-r2f4, -965w-775f-mr7g, -93r5-fhx6-vmg9).
+  '@xmldom/xmldom@<0.8.15': ^0.8.15
+  # next pulls sharp in for image optimization; the floor tracks the
+  # release that vendors the fixed libheif (GHSA-rgj7-g3m4-5g8c) and
+  # librsvg (GHSA-wq5f-xc86-pv6w).
+  sharp: ^0.35.5
+  undici: ^7.29.0
+  'brace-expansion@>=4.0.0 <5.0.11': ^5.0.11
+  '@babel/core': ^7.29.6
+  postcss: ^8.5.10
+  # Pulled in by postcss, vite and prisma's config loader (magicast); all
+  # still allow 1.2.1, which hangs on crafted section offsets (GHSA-68fv-2mgg-jv7q).
+  source-map-js: ^1.2.2
+  '@hono/node-server': ^1.19.13
+allowBuilds:
+  '@prisma/engines': true
+  # sentry-cli's postinstall only fetches a native binary for uploading
+  # source maps to a Sentry-compatible release API — unused here (GlitchTip
+  # capture goes through instrumentation.ts/instrumentation-client.ts
+  # directly, no source-map upload step), so its build script stays denied.
+  '@sentry/cli': false
+  esbuild: true
+  msw: true
+  prisma: true
+  sharp: true
+  unrs-resolver: true
+onlyBuiltDependencies:
+  - '@prisma/engines'
+  - msw
+  - prisma

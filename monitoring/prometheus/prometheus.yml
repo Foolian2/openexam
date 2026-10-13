@@ -1,0 +1,104 @@
+# Committed, no secrets — every target is an internal Docker DNS name, and
+# the monitoring stack shares docker-compose.prod.yml's `internal` network
+# with everything it scrapes. Bind-mounted read-only into the prometheus
+# service (docker-compose.prod.yml).
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # Docker DNS round-robins A records across the web replicas, so a static
+  # `web:3000` target would flip identity between scrapes and break every
+  # rate()/staleness signal (counters would appear to reset). dns_sd_configs
+  # instead discovers ALL replica IPs as separate instances, so per-instance
+  # series stay stable and aggregation happens in PromQL, not by luck.
+  - job_name: web
+    metrics_path: /api/metrics
+    dns_sd_configs:
+      - names: ["web"]
+        type: A
+        port: 3000
+        refresh_interval: 30s
+
+  - job_name: ws-backend
+    static_configs:
+      - targets: ["ws-backend:8080"]
+
+  - job_name: node
+    static_configs:
+      - targets: ["node-exporter:9100"]
+
+  - job_name: postgres
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
+
+  - job_name: redis
+    static_configs:
+      - targets: ["redis-exporter:9121"]
+
+  - job_name: nginx
+    static_configs:
+      - targets: ["nginx-exporter:9113"]
+
+  # Access-log-derived request metrics (status codes, per-route latency
+  # histograms) — the signals stub_status cannot produce. Single instance, so
+  # a static target is right here; contrast the web job above, which needs
+  # dns_sd_configs only because it is replicated.
+  #
+  # Addressed as nginx:4040, not nginx-log-exporter:4040: that exporter runs in
+  # nginx's network namespace so that nginx can log to it over loopback and
+  # therefore never has to resolve a container name at config-parse time (see
+  # the comment on its service in docker-compose.prod.yml). Its ports are
+  # nginx's ports.
+  - job_name: nginx-log
+    static_configs:
+      - targets: ["nginx:4040"]
+
+  # cap serves no /metrics of its own, so it cannot be scraped directly and
+  # ContainerDown (`up == 0`) could never cover it. This job asks
+  # blackbox-exporter to POST cap's challenge endpoint — the same call the
+  # widget makes in a student's browser — and turns the result into
+  # probe_success. See monitoring/blackbox/blackbox.yml for the incident that
+  # motivated probing behaviour rather than liveness.
+  #
+  # The probed URL contains the deployed Cap site key, which is generated per
+  # installation by scripts/create-cap-site-key.sh and rotated by it. A literal
+  # here would be wrong on every host but the one it was committed from, and
+  # would turn into a permanent critical CapChallengeFailing after any
+  # rotation — alerting that CAPTCHA is down while it works fine. So the target
+  # is discovered from a file that scripts/setup-monitoring.sh generates from
+  # .env.prod's NEXT_PUBLIC_CAP_WIDGET_ENDPOINT.
+  #
+  # file_sd rather than a rendered template: Prometheus re-reads these files on
+  # its own, so rotating the key needs no reload and no container recreate.
+  #
+  # The relabel dance is the standard blackbox pattern: the probe TARGET
+  # travels as a query param, and `instance` is rewritten back to the probed
+  # URL so alerts name cap rather than naming the exporter.
+  - job_name: cap-probe
+    metrics_path: /probe
+    params:
+      module: [cap_challenge]
+    file_sd_configs:
+      - files: ["/etc/prometheus/targets/cap-probe.json"]
+        refresh_interval: 60s
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115

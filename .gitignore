@@ -1,0 +1,105 @@
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# env files
+.env
+.env*.local
+.env.prod
+# ./openexam: .env backups, the restore scratch copy, offsite credentials, log
+.env.bak-*
+.env.prod.*
+.rclone.conf
+.rclone.conf.prev
+/logs/
+.openexam-install.log
+
+# production deployment artifacts (server-local)
+/certs/
+/backups/
+/monitoring-data/textfile-collector/*
+!/monitoring-data/textfile-collector/.gitkeep
+
+# rendered from monitoring/alertmanager/alertmanager.yml.tmpl by
+# scripts/setup-monitoring.sh — contains SMTP_PASSWORD, unlike the template
+/monitoring/alertmanager/alertmanager.yml
+
+# Generated from .env.prod's NEXT_PUBLIC_CAP_WIDGET_ENDPOINT by
+# scripts/setup-monitoring.sh — carries the per-installation Cap site key,
+# which scripts/create-cap-site-key.sh rotates.
+/monitoring/prometheus/targets/cap-probe.json
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+/generated/prisma
+
+# worktrees
+.worktrees/
+.superpowers/
+
+# playwright
+.playwright-mcp/
+/test-results/
+/playwright-report/
+
+# local checkouts (scripts/sync-seb-defaults.ts reads seb/seb-mac)
+/seb/
+
+# k6 load test seed data (synthetic, generated per-run)
+/load/data/*.json
+
+# k6 load-test result artifacts (contain session cookies)
+/load/results/
+
+# local agent/tooling config
+.claude/
+.codex/
+.opencode/
+.mcp.json
+opencode.json
+CLAUDE.md
+AGENTS.md
+
+# local pnpm store (reproduced via pnpm install)
+.pnpm-store/
+
+# generated knowledge-graph artifacts
+graphify-out/
+
+*.patch
+
+# Written by scripts/deploy.sh, read by scripts/rollback.sh: which image tag
+# was deployed to THIS host and when. Host-local state, not repo content.
+.deploy-history
+
+# Backup keys and recovery PDFs; never commit these.
+/secrets/
+

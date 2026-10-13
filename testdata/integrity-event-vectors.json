@@ -1,0 +1,23 @@
+{
+  "_comment": "Shared integrity-signal fixture. Kinds are the allow-list contract: the DB enum (prisma/schema.prisma IntegrityEventKind), the TS types (lib/monitor-patch.ts EXHAUSTIVE_KINDS / INTEGRITY_KIND_LABELS, derived from the Prisma enum), the Go gate (ws-backend/internal/protocol/messages.go IntegrityEventKinds) and the monitor labels must all cover exactly these. patchKeys are the only keys the monitor patch merge (lib/monitor-patch.ts mergeKnownPatchKeys) may accept — the true set as published by ws-backend (room.go broadcastMonitorUpdate call sites and main.go's BEK attestation notify); sebIntegrityStatus was a candidate but the real producer emits sebIntegrityFlagged/sebIntegrityReason.",
+  "kinds": [
+    "TAB_HIDDEN",
+    "WINDOW_BLUR",
+    "COPY_BLOCKED",
+    "PASTE_BLOCKED",
+    "CONTEXT_MENU_BLOCKED",
+    "DEVTOOLS_SUSPECTED",
+    "SHORTCUT_BLOCKED"
+  ],
+  "patchKeys": [
+    "integrityEventCount",
+    "lastIntegrityEvent",
+    "lastSeenAt",
+    "status",
+    "effectiveEndTime",
+    "timeExtensionMin",
+    "namApplied",
+    "sebIntegrityFlagged",
+    "sebIntegrityReason"
+  ]
+}

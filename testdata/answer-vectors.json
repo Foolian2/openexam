@@ -1,0 +1,234 @@
+{
+  "_comment": "Shared answer-contract fixture pinning TS (lib/validators/answer.ts answerContentSchema + lib/answer-file-key.ts) and Go (ws-backend/internal/hub/answer_validation.go) to identical accept/reject behavior. Precedent: testdata/seb-token-vectors.json. schemaValid = the zod schema / Go validAnswerContent field checks AND the content's type matching the vector's expected 'type'; ownershipValid = the fileKeyBelongsTo check as both sides implement it (TS: route-level; Go: inside validAnswerContent). A vector is accepted end-to-end iff schemaValid && ownershipValid. NOTE: Go's 52KB envelope cap is transport-level and deliberately not represented here; count/length boundary cases (e.g. 201-item arrays, 10001-char text) are likewise kept out — each side's tests cover those with hardcoded boundaries, so every vector here must be decidable from its static content alone.",
+  "fileNamePattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.[a-z0-9]{1,16}$",
+  "vectors": [
+    {
+      "name": "MULTIPLE_CHOICE valid",
+      "type": "MULTIPLE_CHOICE",
+      "content": { "type": "MULTIPLE_CHOICE", "selectedOptionIds": ["a", "b"] },
+      "sessionId": "sess1",
+      "questionId": "q1",
+      "schemaValid": true,
+      "ownershipValid": true
+    },
+    {
+      "name": "FREE_TEXT valid",
+      "type": "FREE_TEXT",
+      "content": { "type": "FREE_TEXT", "text": "hello" },
+      "sessionId": "sess1",
+      "questionId": "q1",
+      "schemaValid": true,
+      "ownershipValid": true
+    },
+    {
+      "name": "FILL_IN_THE_BLANK valid",
+      "type": "FILL_IN_THE_BLANK",
+      "content": {
+        "type": "FILL_IN_THE_BLANK",
+        "blanks": [{ "id": "b1", "value": "x" }]
+      },
+      "sessionId": "sess1",
+      "questionId": "q1",
+      "schemaValid": true,
+      "ownershipValid": true
+    },
+    {
+      "name": "MATCHING valid",
+      "type": "MATCHING",
+      "content": {
+        "type": "MATCHING",
+        "matches": [{ "leftId": "l1", "rightId": "r1" }]
+      },
+      "sessionId": "sess1",
+      "questionId": "q1",
+      "schemaValid": true,
+      "ownershipValid": true
+    },
+    {
+      "name": "CODE valid",
+      "type": "CODE",
+      "content": {
+        "type": "CODE",
+        "code": "let x = 1",
+        "language": "javascript"
+      },
+      "sessionId": "sess1",
+      "questionId": "q1",
+      "schemaValid": true,
+      "ownershipValid": true
+    },
+    {
+      "name": "TRUE_FALSE valid",
+      "type": "TRUE_FALSE",
+      "content": { "type": "TRUE_FALSE", "selected": true },
+      "sessionId": "sess1",
+      "questionId": "q1",
+      "schemaValid": true,
+      "ownershipValid": true
+    },
+    {
+      "name": "SHORT_ANSWER valid",
+      "type": "SHORT_ANSWER",
+      "content": { "type": "SHORT_ANSWER", "text": "hi" },
+      "sessionId": "sess1",
+      "questionId": "q1",
+      "schemaValid": true,
+      "ownershipValid": true
+    },
+    {
+      "name": "ORDERING valid",
+      "type": "ORDERING",
+      "content": { "type": "ORDERING", "orderedIds": ["o1"] },
+      "sessionId": "sess1",
+      "questionId": "q1",
+      "schemaValid": true,
+      "ownershipValid": true
+    },
+    {
+      "name": "FILE_UPLOAD valid",
+      "type": "FILE_UPLOAD",
+      "content": {
+        "type": "FILE_UPLOAD",
+        "fileKey": "sessions/sess1/q1/01234567-89ab-cdef-0123-456789abcdef.pdf",
+        "fileName": "upload.pdf"
+      },
+      "sessionId": "sess1",
+      "questionId": "q1",
+      "schemaValid": true,
+      "ownershipValid": true
+    },
+    {
+      "name": "FILE_UPLOAD wrong session (shape ok)",
+      "type": "FILE_UPLOAD",
+      "content": {
+        "type": "FILE_UPLOAD",
+        "fileKey": "sessions/other-sess/q1/01234567-89ab-cdef-0123-456789abcdef.pdf",
+        "fileName": "upload.pdf"
+      },
+      "sessionId": "sess1",
+      "questionId": "q1",
+      "schemaValid": true,
+      "ownershipValid": false
+    },
+    {
+      "name": "FILE_UPLOAD wrong question (shape ok)",
+      "type": "FILE_UPLOAD",
+      "content": {
+        "type": "FILE_UPLOAD",
+        "fileKey": "sessions/sess1/other-q/01234567-89ab-cdef-0123-456789abcdef.pdf",
+        "fileName": "upload.pdf"
+      },
+      "sessionId": "sess1",
+      "questionId": "q1",
+      "schemaValid": true,
+      "ownershipValid": false
+    },
+    {
+      "name": "FILE_UPLOAD bad filename shape",
+      "type": "FILE_UPLOAD",
+      "content": {
+        "type": "FILE_UPLOAD",
+        "fileKey": "sessions/sess1/q1/../../etc/passwd",
+        "fileName": "x"
+      },
+      "sessionId": "sess1",
+      "questionId": "q1",
+      "schemaValid": false,
+      "ownershipValid": false
+    },
+    {
+      "name": "FILE_UPLOAD non-uuid filename",
+      "type": "FILE_UPLOAD",
+      "content": {
+        "type": "FILE_UPLOAD",
+        "fileKey": "sessions/sess1/q1/not-a-uuid.pdf",
+        "fileName": "x"
+      },
+      "sessionId": "sess1",
+      "questionId": "q1",
+      "schemaValid": false,
+      "ownershipValid": false
+    },
+    {
+      "name": "FILE_UPLOAD empty fileKey",
+      "type": "FILE_UPLOAD",
+      "content": { "type": "FILE_UPLOAD", "fileKey": "", "fileName": "x" },
+      "sessionId": "sess1",
+      "questionId": "q1",
+      "schemaValid": false,
+      "ownershipValid": false
+    },
+    {
+      "name": "FILE_UPLOAD missing fileKey",
+      "type": "FILE_UPLOAD",
+      "content": { "type": "FILE_UPLOAD", "fileName": "x" },
+      "sessionId": "sess1",
+      "questionId": "q1",
+      "schemaValid": false,
+      "ownershipValid": false
+    },
+    {
+      "name": "wrong type field for question type",
+      "type": "FREE_TEXT",
+      "content": { "type": "MULTIPLE_CHOICE", "selectedOptionIds": ["a"] },
+      "sessionId": "sess1",
+      "questionId": "q1",
+      "schemaValid": false,
+      "ownershipValid": true
+    },
+    {
+      "name": "unknown type",
+      "type": "FREE_TEXT",
+      "content": { "type": "ESSAY", "text": "x" },
+      "sessionId": "sess1",
+      "questionId": "q1",
+      "schemaValid": false,
+      "ownershipValid": true
+    },
+    {
+      "name": "non-object content",
+      "type": "FREE_TEXT",
+      "content": "just a string",
+      "sessionId": "sess1",
+      "questionId": "q1",
+      "schemaValid": false,
+      "ownershipValid": true
+    },
+    {
+      "name": "content array",
+      "type": "FREE_TEXT",
+      "content": [1, 2, 3],
+      "sessionId": "sess1",
+      "questionId": "q1",
+      "schemaValid": false,
+      "ownershipValid": true
+    },
+    {
+      "name": "numeric value instead of string",
+      "type": "FREE_TEXT",
+      "content": { "type": "FREE_TEXT", "text": 42 },
+      "sessionId": "sess1",
+      "questionId": "q1",
+      "schemaValid": false,
+      "ownershipValid": true
+    },
+    {
+      "name": "string-typed boolean",
+      "type": "TRUE_FALSE",
+      "content": { "type": "TRUE_FALSE", "selected": "true" },
+      "sessionId": "sess1",
+      "questionId": "q1",
+      "schemaValid": false,
+      "ownershipValid": true
+    },
+    {
+      "name": "TRUE_FALSE null",
+      "type": "TRUE_FALSE",
+      "content": { "type": "TRUE_FALSE", "selected": null },
+      "sessionId": "sess1",
+      "questionId": "q1",
+      "schemaValid": false,
+      "ownershipValid": true
+    }
+  ]
+}

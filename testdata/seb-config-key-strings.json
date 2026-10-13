@@ -1,0 +1,54 @@
+{
+  "sources": [
+    "https://github.com/SafeExamBrowser/seb-mac/blob/43ba8c54/Classes/Cryptography/SEBCryptor.m",
+    "https://github.com/SafeExamBrowser/seb-win-refactoring/blob/016d2341/SafeExamBrowser.Configuration/ConfigurationData/Json.cs"
+  ],
+  "note": "String bytes transcribed from upstream serializers: wrap with quotes, without escaping. SHA-256 digests calculated independently with Python hashlib and verified using the extracted Windows Json.cs serializer on .NET 10 and the extracted macOS jsonStringForObject method with Foundation. These fixtures do not represent a full client run.",
+  "vectors": [
+    {
+      "name": "plain",
+      "settings": {
+        "s": "plain"
+      },
+      "canonical": "{\"s\":\"plain\"}",
+      "configKey": "23b7e7ab30f2d297d38d27946f6994793930d04d9b664a97bab87afc9b8ad5a9"
+    },
+    {
+      "name": "quoted-path",
+      "settings": {
+        "s": "\"C:\\Program Files\\SEB\""
+      },
+      "canonical": "{\"s\":\"\"C:\\Program Files\\SEB\"\"}",
+      "configKey": "1e0bae8018acdd0759a74221130a694aacf4c791c7914fd691c468ce27d2b73e"
+    },
+    {
+      "name": "controls",
+      "settings": {
+        "s": "line1\nline2\r\t\u0001\u001f"
+      },
+      "canonical": "{\"s\":\"line1\nline2\r\t\u0001\u001f\"}",
+      "configKey": "d5868f70fc7ab82794be9b825fe32ff45c3ab72fafcc7a3835940d3e69d195d3"
+    },
+    {
+      "name": "quoted-key",
+      "settings": {
+        "a\"b": "Grüezi 📝"
+      },
+      "canonical": "{\"a\"b\":\"Grüezi 📝\"}",
+      "configKey": "90eda1e4b83a062358f61a217c6aede2858f4e88f62da8864a1574ca1b0645e4"
+    },
+    {
+      "name": "nested",
+      "settings": {
+        "a": [
+          {
+            "s": "a\"b"
+          },
+          "C:\\Windows"
+        ]
+      },
+      "canonical": "{\"a\":[{\"s\":\"a\"b\"},\"C:\\Windows\"]}",
+      "configKey": "a4fb5cdea6bb6e661ed8e93cbb0d482a52c7aeb1c4549516a2e33c88418dd4c6"
+    }
+  ]
+}

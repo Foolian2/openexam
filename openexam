@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# OpenExam command-line installer and operations tool.
+#
+#   ./openexam install local     set up a development environment (Linux, macOS)
+#   ./openexam install           guided production install (Linux server)
+#   ./openexam help              everything else
+#
+# A guided layer over scripts/*.sh: it detects what it can, asks for what it
+# can't, shows a summary, then runs the same idempotent scripts the docs
+# describe (scripts/setup-prod.sh, deploy.sh, …), which all keep working on
+# their own. Pure bash, no dependencies; bash 3.2 compatible for macOS.
+set -euo pipefail
+
+OE_ROOT=$(cd "$(dirname "$0")" && pwd)
+cd "$OE_ROOT"
+
+# shellcheck source=scripts/lib/ui.sh
+. scripts/lib/ui.sh
+# shellcheck source=scripts/lib/detect.sh
+. scripts/lib/detect.sh
+# shellcheck source=scripts/lib/env-file.sh
+. scripts/lib/env-file.sh
+# shellcheck source=scripts/cli/common.sh
+. scripts/cli/common.sh
+
+usage() {
+  cat <<EOF
+${C_BOLD}Usage:${C_RESET} ./openexam <command> [options]
+
+${C_BOLD}Development${C_RESET}
+  install local        Set up a dev environment (.env, services, database)
+  dev                  Start services + Next.js dev server (--stop: stop services)
+
+${C_BOLD}Production${C_RESET}
+  install              Guided install on a Linux server (domain, TLS, backups, …)
+  update               Pull the latest code and deploy (offers rollback on failure)
+  status               Containers, health, TLS, cron, last deploy and backup
+  doctor               Check configuration and host (--smtp also sends a test mail)
+  backup               Dump the database now (and push offsite when configured)
+  restore [file]       Restore a dump (--from-offsite to pick a remote one)
+  backup-offsite       Set up or change encrypted offsite backups
+  create-teacher       Create a teacher/admin login (--local for dev)
+  uninstall            Stop and remove the stack (--purge also deletes data)
+
+${C_BOLD}Options${C_RESET}
+  -y, --yes            Never prompt: take defaults and flags (for automation)
+      --no-color       Plain output (also: NO_COLOR=1)
+  -h, --help           Show help for a command
+
+Run ${C_BOLD}./openexam <command> --help${C_RESET} for a command's own options.
+EOF
+}
+
+# Global flags may appear anywhere; strip them before dispatch.
+args=()
+for arg in "$@"; do
+  case "$arg" in
+    -y | --yes) OE_ASSUME_YES=1 ;;
+    --no-color) C_RESET=; C_BOLD=; C_DIM=; C_RED=; C_GREEN=; C_YELLOW=; C_BLUE=; C_CYAN= ;;
+    *) args+=("$arg") ;;
+  esac
+done
+set -- ${args[@]+"${args[@]}"}
+
+# The log can hold demo passwords and command output with hostnames: keep it
+# private like the env files.
+if [ ! -e "$OE_LOG" ]; then
+  (umask 077 && : > "$OE_LOG")
+fi
+
+cmd="${1:-help}"
+[ $# -gt 0 ] && shift
+
+case "$cmd" in
+  install)
+    if [ "${1:-}" = local ]; then
+      shift
+      # shellcheck source=scripts/cli/local.sh
+      . scripts/cli/local.sh
+      cmd_install_local "$@"
+    else
+      # shellcheck source=scripts/cli/install.sh
+      . scripts/cli/install.sh
+      cmd_install "$@"
+    fi
+    ;;
+  dev)
+    # shellcheck source=scripts/cli/local.sh
+    . scripts/cli/local.sh
+    cmd_dev "$@"
+    ;;
+  update)
+    # shellcheck source=scripts/cli/ops.sh
+    . scripts/cli/ops.sh
+    cmd_update "$@"
+    ;;
+  status)
+    # shellcheck source=scripts/cli/ops.sh
+    . scripts/cli/ops.sh
+    cmd_status "$@"
+    ;;
+  doctor)
+    # shellcheck source=scripts/cli/ops.sh
+    . scripts/cli/ops.sh
+    cmd_doctor "$@"
+    ;;
+  backup | restore | backup-offsite)
+    # shellcheck source=scripts/cli/backup.sh
+    . scripts/cli/backup.sh
+    case "$cmd" in
+      backup) cmd_backup "$@" ;;
+      restore) cmd_restore "$@" ;;
+      backup-offsite) cmd_backup_offsite "$@" ;;
+    esac
+    ;;
+  create-teacher)
+    # shellcheck source=scripts/cli/teacher.sh
+    . scripts/cli/teacher.sh
+    cmd_create_teacher "$@"
+    ;;
+  uninstall)
+    # shellcheck source=scripts/cli/ops.sh
+    . scripts/cli/ops.sh
+    cmd_uninstall "$@"
+    ;;
+  help | -h | --help)
+    usage
+    ;;
+  *)
+    ui_err "Unknown command: $cmd"
+    echo
+    usage
+    exit 2
+    ;;
+esac

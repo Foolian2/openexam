@@ -1,0 +1,97 @@
+services:
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: openexam
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-openexam}
+      POSTGRES_DB: openexam
+      # MUST stay set explicitly. The official image made PGDATA
+      # version-specific in 18 (/var/lib/postgresql/18/docker) and moved its
+      # declared VOLUME up to /var/lib/postgresql. Without this, the
+      # postgres_data mount below is silently ignored: 18 initializes a fresh
+      # cluster elsewhere in the container, starts cleanly, passes pg_isready
+      # and serves an empty database. Pinning PGDATA keeps the data directory
+      # where it has always been — which is also where
+      # scripts/pitr-backup.sh and scripts/pitr-restore.sh expect to find it
+      # (both expand $PGDATA inside the container on purpose).
+      PGDATA: /var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openexam"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Valkey, not Redis: BSD-licensed (Redis 8 moved to AGPLv3) and wire-
+  # compatible (but NOT able to read a Redis 7.4 volume — see the redis
+  # service in docker-compose.prod.yml). The service is
+  # still named `redis` and still speaks redis:// on 6379 so REDIS_URL,
+  # lib/redis.ts, ws-backend's go-redis client and the `cap` container below
+  # need no changes. Note the binaries ARE renamed — this image ships
+  # valkey-cli/valkey-server with no redis-* symlinks, so anything doing
+  # `docker exec` into this container must call valkey-cli.
+  redis:
+    image: valkey/valkey:9.1.2-alpine@sha256:48332870af354a799964c0012ae1194a0bf2bf894eb508f945810596dc2d8d11
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  ws-backend:
+    build:
+      context: ./ws-backend
+    restart: unless-stopped
+    environment:
+      PORT: 8080
+      DATABASE_URL: postgresql://openexam:${POSTGRES_PASSWORD:-openexam}@postgres:5432/openexam
+      REDIS_URL: redis://redis:6379
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET}
+      ALLOWED_ORIGINS: ${NEXT_PUBLIC_BASE_URL:-http://localhost:3000}
+      # Used to reconstruct exam take-page URLs for SEB Config Key
+      # verification — must be the same origin the web tier serves. Read
+      # first by the Go config; APP_BASE_URL below is kept as a legacy
+      # fallback so a host that only sets the old name keeps working.
+      NEXT_PUBLIC_BASE_URL: ${NEXT_PUBLIC_BASE_URL:-http://localhost:3000}
+      # Legacy name, deprecated in favor of NEXT_PUBLIC_BASE_URL above.
+      APP_BASE_URL: ${NEXT_PUBLIC_BASE_URL:-http://localhost:3000}
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # Self-hosted CAPTCHA (trycap.dev) — invisible proof-of-work bot check for
+  # sign-up/sign-in/access-code join. Shares the redis service above via
+  # REDIS_PREFIX instead of a dedicated instance of its own.
+  cap:
+    image: tiago2/cap:latest
+    restart: unless-stopped
+    environment:
+      ADMIN_KEY: ${CAP_ADMIN_KEY:-dev-cap-admin-key-change-me}
+      REDIS_URL: redis://redis:6379
+      REDIS_PREFIX: "cap:"
+      CORS_ORIGIN: ${NEXT_PUBLIC_BASE_URL:-http://localhost:3000}
+    # Published (unlike prod, where nothing but nginx/edge is exposed) because
+    # `pnpm dev` runs on the host, not in this compose network, and needs to
+    # reach both the siteverify API and the admin dashboard directly.
+    ports:
+      - "127.0.0.1:8090:3000"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:

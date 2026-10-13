@@ -1,0 +1,31 @@
+# prometheus-blackbox-exporter config. Committed, no secrets: it describes how
+# to probe an endpoint, not how to authenticate to one. Bind-mounted read-only
+# into the blackbox-exporter service (docker-compose.prod.yml).
+#
+# This exists because cap serves no /metrics endpoint of its own, so it cannot
+# be scraped directly and `up == 0` (ContainerDown) could never cover it. The
+# 2026-08-26 incident is the case that matters: cap's Redis client entered a
+# permanently-failed state, cap kept answering HTTP — so its container
+# healthcheck and Docker both called it healthy — and every sign-up, sign-in
+# and access-code join failed for 17 hours with nothing firing. A liveness
+# check that only asks "is the process listening" cannot see that. A probe
+# that asks cap to actually issue a challenge can.
+
+modules:
+  # cap's challenge endpoint is the exact call the widget makes in a student's
+  # browser, and the one that reaches Redis (cap.js -> hget). A 200 here means
+  # the whole path works: process up, Redis reachable, site key resolvable.
+  # Anything else — 500 from a dead Redis client, 404 from an unknown site
+  # key, connection refused, hang — is the failure we want to alert on.
+  cap_challenge:
+    prober: http
+    timeout: 10s
+    http:
+      method: POST
+      headers:
+        Content-Type: application/json
+      body: "{}"
+      valid_status_codes: [200]
+      valid_http_versions: ["HTTP/1.1", "HTTP/2.0"]
+      # cap is plain HTTP on the internal network; nginx terminates TLS.
+      fail_if_not_ssl: false

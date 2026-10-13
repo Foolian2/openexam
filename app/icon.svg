@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <style>
+    .sheet { fill: #1E1B18; }
+    @media (prefers-color-scheme: dark) { .sheet { fill: #FBF8F1; } }
+  </style>
+  <path class="sheet" fill-rule="evenodd" d="M18 4H70L96 30V82Q96 96 82 96H18Q4 96 4 82V18Q4 4 18 4ZM70 4V22Q70 30 78 30H96ZM27 33H59A7 7 0 0 1 59 47H27A7 7 0 0 1 27 33ZM27 53H47A7 7 0 0 1 47 67H27A7 7 0 0 1 27 53Z"/>
+  <path fill="#FFD23F" d="M70 4V22Q70 30 78 30H96Z"/>
+  <rect x="20" y="53" width="34" height="14" rx="7" fill="#FFD23F"/>
+</svg>

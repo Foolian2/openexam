@@ -1,0 +1,68 @@
+name: CLA
+
+# Asks outside contributors to sign the Contributor License Agreement
+# (CLA.md) by commenting on their pull request, and reports the result as the
+# "CLA" commit status. Logic: .github/scripts/cla.cjs.
+
+on:
+  # pull_request_target, not pull_request: fork PRs get a read-only token on
+  # pull_request, which can't post the comment or the commit status. It runs
+  # this file from master with a write token, so the job below must never
+  # check out or run the PR's code.
+  # edited: a new base branch can add commits (and authors) to the PR without
+  # changing its head sha; the script ignores edits that don't change the base.
+  pull_request_target:
+    types: [opened, reopened, synchronize, edited]
+  issue_comment:
+    types: [created]
+
+# A group keeps one pending run and replaces it when another queues, so only
+# PR events, signatures and rechecks share the per-PR group. Any other comment
+# gets a group of its own and can't push a pending signature out. (contains()
+# ignores case; the script does the exact matching.)
+concurrency:
+  group: >-
+    cla-${{ github.event.pull_request.number || github.event.issue.number }}${{
+      github.event_name == 'issue_comment' &&
+      !contains(github.event.comment.body, 'I agree to its terms') &&
+      !contains(github.event.comment.body, 'recheck') &&
+      format('-{0}', github.run_id) || ''
+    }}
+  cancel-in-progress: false
+
+permissions:
+  # Signatures are committed to the cla-signatures branch.
+  contents: write
+  issues: write
+  pull-requests: read
+  statuses: write
+
+jobs:
+  cla:
+    name: CLA check
+    if: >-
+      github.event_name == 'pull_request_target' || (
+        github.event.issue.pull_request && (
+          contains(github.event.comment.body, 'I agree to its terms') ||
+          contains(github.event.comment.body, 'recheck')
+        )
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Default-branch checkout, just for the script. Never the PR head.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          # Comma-separated GitHub logins that never need to sign. The repo
+          # owner and bot accounts are always exempt.
+          CLA_ALLOWLIST: ""
+        with:
+          script: |
+            const cla = require('./.github/scripts/cla.cjs');
+            await cla({ github, context, core });

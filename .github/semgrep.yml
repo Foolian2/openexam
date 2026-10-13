@@ -1,0 +1,362 @@
+rules:
+  - id: openexam-hardcoded-credential
+    languages: [typescript, javascript, go]
+    severity: ERROR
+    message: >
+      Possible hardcoded credential. Load secrets
+      from environment variables, never assign literal connection strings or
+      keys to source.
+    patterns:
+      - pattern-either:
+          - pattern: $VAR = "postgresql://$USER:$PASS@..."
+          - pattern: $VAR = "redis://:$PASS@..."
+          - pattern: const $VAR = "$STR"
+      - metavariable-regex:
+          metavariable: $VAR
+          regex: (?i)(password|secret|access_key|secret_key|api_key|token)$
+
+  - id: openexam-ws-answer-missing-validation
+    languages: [go]
+    severity: WARNING
+    message: >
+      WebSocket answer-save handler should validate payload content before
+      persisting. Confirm this path runs the
+      same schema/size checks as the REST answer route before storing.
+    patterns:
+      - pattern-either:
+          - pattern: json.Unmarshal($DATA, &$MSG)
+          - pattern: json.NewDecoder($R).Decode(&$MSG)
+      - pattern-inside: |
+          func $HANDLER(...) {
+            ...
+          }
+      - metavariable-regex:
+          metavariable: $HANDLER
+          regex: (?i)(answer|save)
+
+  - id: openexam-mutation-missing-origin-check
+    languages: [typescript]
+    severity: WARNING
+    message: >
+      State-changing route handler with no strict Origin check. The global
+      middleware in proxy.ts allows a request with NO Origin header through;
+      lib/csrf.ts verifyOrigin() rejects it. Routes that call verifyOrigin()
+      are strict, routes that rely on the middleware alone are not. Either
+      call verifyOrigin(request) here or record why the middleware's weaker
+      guarantee is sufficient for this route.
+    patterns:
+      - pattern-either:
+          - pattern: export async function POST($REQ) { ... }
+          - pattern: export async function PATCH($REQ) { ... }
+          - pattern: export async function DELETE($REQ) { ... }
+      # `pattern-not-inside` cannot express these exclusions: the positive
+      # term matches the WHOLE handler and a match is never "inside" itself,
+      # so the previous negation suppressed nothing at all (same defect as
+      # openexam-admin-route-missing-role-check, fixed in #228). `pattern-not`
+      # on the same node shape is what works.
+      #
+      # The check normally lives behind lib/csrf.ts verifyOrigin() rather than
+      # inline, which is why every origin-checked route was still reported.
+      #
+      # Matching a bare `verifyOrigin($REQ)` call would be wrong: it returns a
+      # 403 response, it does not throw, so a handler that calls it and drops
+      # the result is exactly as unprotected as one that never called it. The
+      # returned response has to be propagated, which is the idiom all eight
+      # current callers use verbatim.
+      - pattern-not: |
+          export async function $METHOD($REQ) {
+            ...
+            const $ERR = verifyOrigin($REQ)
+            if ($ERR) return $ERR
+            ...
+          }
+      # Reading Origin is not an enforcement check by itself. Keep the
+      # exclusion tied to verifyOrigin's returned error so logging or copying
+      # the header cannot accidentally silence this rule.
+      # Scope note: this deliberately matches only single-parameter handlers.
+      # Widening to `(...)` would pull in the 36 handlers that take
+      # `(request, { params })`, nearly none of which call verifyOrigin --
+      # they inherit the proxy.ts middleware check, which is the primary
+      # control. Reporting all of them would say "the architecture is CSRF
+      # protection by middleware", not "this route has a defect".
+
+  - id: openexam-auth-endpoint-missing-rate-limit
+    languages: [typescript]
+    severity: WARNING
+    message: >
+      Auth endpoint (login/signup/verify) with no visible rate-limit wrapper.
+    patterns:
+      - pattern-either:
+          - pattern: export async function POST($REQ) { ... }
+      - pattern-not-inside: |
+          export async function POST($REQ) {
+            ...
+            rateLimit(...)
+            ...
+          }
+    paths:
+      include:
+        - "**/app/api/auth/**"
+        - "**/app/api/**/login/**"
+        - "**/app/api/**/signup/**"
+
+  - id: openexam-admin-route-missing-role-check
+    languages: [typescript]
+    severity: WARNING
+    message: >
+      Admin route with no visible role check. Confirm this route rejects non-ADMIN sessions.
+    patterns:
+      - pattern-either:
+          - pattern: export async function $METHOD(...) { ... }
+          - pattern: export default async function $FN(...) { ... }
+          - pattern: export default function $FN(...) { ... }
+          # Function-valued named exports are route handlers too
+          # (`export const PATCH = async (req) => { ... }`); without these an
+          # unguarded const-style handler never reaches the checks below.
+          - pattern: "export const $METHOD = async (...) => { ... }"
+          - pattern: "export const $METHOD = (...) => { ... }"
+      # Suppression deliberately requires an ENFORCED guard shape, not any
+      # occurrence of the string "ADMIN". The previous deep-expression match
+      # on the literal (`<... "ADMIN" ...>`) counted a switch, a ternary, a
+      # discarded guard (`if (...) console.log(...)`), or even the word in a
+      # heading as enforcement, so the rule reported nothing once any of them
+      # appeared. Only two shapes suppress now: the early-return role check
+      # `if ($SESSION.user.role !== "ADMIN") redirect(...)` (brace-less and
+      # braced variants below — semgrep matches statement shapes literally)
+      # and a requireAdmin(...) result that is actually propagated.
+      # Trade-off: an admin route that enforces its check in another style
+      # (switch, helper that throws, ...) will false-positive. The fix is a
+      # new pattern-not for that exact shape, not widening these back to the
+      # bare literal.
+      - pattern-not: |
+          export default async function $FN(...) {
+            ...
+            if ($SESSION.user.role !== "ADMIN") redirect(...)
+            ...
+          }
+      - pattern-not: |
+          export default async function $FN(...) {
+            ...
+            if ($SESSION.user.role !== "ADMIN") {
+              redirect(...)
+            }
+            ...
+          }
+      - pattern-not: |
+          export default function $FN(...) {
+            ...
+            if ($SESSION.user.role !== "ADMIN") redirect(...)
+            ...
+          }
+      - pattern-not: |
+          export default function $FN(...) {
+            ...
+            if ($SESSION.user.role !== "ADMIN") {
+              redirect(...)
+            }
+            ...
+          }
+      - pattern-not: |
+          export async function $METHOD(...) {
+            ...
+            if ($SESSION.user.role !== "ADMIN") redirect(...)
+            ...
+          }
+      - pattern-not: |
+          export async function $METHOD(...) {
+            ...
+            if ($SESSION.user.role !== "ADMIN") {
+              redirect(...)
+            }
+            ...
+          }
+      # requireAdmin returns either the authenticated session or an error
+      # response. Merely calling it is not enforcement: the handler must
+      # propagate that response before doing privileged work. One pattern-not
+      # per export shape matched above — a negation only suppresses matches
+      # whose root node has the same shape.
+      - pattern-not: |
+          export async function $METHOD(...) {
+            ...
+            const $AUTH = await requireAdmin(...)
+            if ($AUTH instanceof $RESPONSE) return $AUTH
+            ...
+          }
+      - pattern-not: |
+          export default async function $FN(...) {
+            ...
+            const $AUTH = await requireAdmin(...)
+            if ($AUTH instanceof $RESPONSE) return $AUTH
+            ...
+          }
+      - pattern-not: |
+          export default function $FN(...) {
+            ...
+            const $AUTH = await requireAdmin(...)
+            if ($AUTH instanceof $RESPONSE) return $AUTH
+            ...
+          }
+      - pattern-not: |
+          export const $METHOD = async (...) => {
+            ...
+            const $AUTH = await requireAdmin(...)
+            if ($AUTH instanceof $RESPONSE) return $AUTH
+            ...
+          }
+      - pattern-not: |
+          export const $METHOD = async (...) => {
+            ...
+            if ($SESSION.user.role !== "ADMIN") redirect(...)
+            ...
+          }
+      - pattern-not: |
+          export const $METHOD = async (...) => {
+            ...
+            if ($SESSION.user.role !== "ADMIN") {
+              redirect(...)
+            }
+            ...
+          }
+    paths:
+      include:
+        - "**/app/**/admin/**"
+        - "**/app/api/admin/**"
+      exclude:
+        - "**/loading.tsx"
+
+  - id: openexam-file-upload-trusts-client-content-type
+    languages: [typescript]
+    severity: WARNING
+    message: >
+      Uploaded file accepted on client-controlled metadata alone (audit
+      finding L2: file upload validates only by extension; content-type is
+      client-controlled). Both File.name and File.type are copied verbatim
+      out of the multipart body, so an extension or MIME allowlist proves
+      nothing about the bytes that get stored. Read the leading bytes and
+      verify the magic number before uploading, then this rule goes quiet.
+    patterns:
+      # The old rule was `$FILE.type === $STR` with no scope at all, so it
+      # matched every `.type === "..."` comparison in the repo -- question
+      # kinds, WebSocket envelope tags, test fixtures -- 26 hits, not one of
+      # them an upload. Binding $FILE to a value taken off a multipart body
+      # is what makes this rule about uploads.
+      - pattern-inside: |
+          const $FILE = $FORM.get($KEY)
+          ...
+      - pattern-either:
+          - pattern: $FILE.type === $STR
+          - pattern: $FILE.name.endsWith($STR)
+          - pattern: $FILE.name.split($SEP)
+      # Deliberately no suppression clause. An exclusion like
+      # `sniffFileType(...)` would be satisfied by a call on unrelated data,
+      # or by one whose result is never consulted -- it would let the rule go
+      # quiet without the magic-number check it is asking for, which is the
+      # failure mode this rule exists to catch. The suppression should be
+      # written against the real remediation once L2 is fixed, not invented
+      # here against a helper that does not exist yet.
+
+  - id: openexam-audit-write-failure-swallowed
+    languages: [typescript]
+    severity: WARNING
+    message: >
+      Audit-log write failure caught and dropped with no fallback or alerting.
+    patterns:
+      - pattern-either:
+          - pattern: audit(...).catch(() => { ... })
+          - pattern: |
+              try {
+                await audit(...)
+              } catch ($E) {
+                console.error(...)
+              }
+
+  - id: openexam-database-url-non-null-assertion
+    languages: [typescript]
+    severity: WARNING
+    message: >
+      Non-null assertion on DATABASE_URL with no startup guard. Validate the env var at startup and fail with a clear
+      error instead.
+    patterns:
+      - pattern: process.env.DATABASE_URL!
+
+  - id: openexam-markdown-dangerously-set-inner-html
+    languages: [typescript, javascript]
+    severity: ERROR
+    message: >
+      react-markdown/remark-gfm output rendered via dangerouslySetInnerHTML.
+      Render through
+      ReactMarkdown's component tree, never raw HTML injection.
+    patterns:
+      - pattern: '<$EL dangerouslySetInnerHTML={{ __html: $EXPR }} />'
+      - metavariable-regex:
+          metavariable: $EXPR
+          regex: (?i)(markdown|remark)
+
+  - id: openexam-raw-error-forwarded-to-ui
+    languages: [typescript, rust]
+    severity: WARNING
+    message: >
+      Raw error text forwarded to the UI or client response (IDEAS.md finding
+      D9: raw server error strings surfaced to the UI). Map to a fixed,
+      user-safe message and log the raw error server-side instead.
+    patterns:
+      - pattern-either:
+          - pattern: setError(String($ERR))
+          - pattern: format!("...{}...", $ERR)
+
+  - id: openexam-findunique-missing-ownership-check
+    languages: [typescript]
+    severity: WARNING
+    message: >
+      Route handler loads a record by id via findUnique/findUniqueOrThrow but
+      the enclosing function has no visible ownership check comparing an
+      owner field (creatorId/userId) against session.user.id (every route that hands back exam/session/folder data must verify
+      the caller owns it before returning anything — see the
+      getOwnedExam/assertOwner pattern used throughout app/api). Confirm this
+      handler can't return another account's data.
+    patterns:
+      - pattern-either:
+          - pattern: const $X = await $PRISMA.$MODEL.findUnique($ARGS)
+          - pattern: const $X = await $PRISMA.$MODEL.findUniqueOrThrow($ARGS)
+      - pattern-inside: |
+          export async function $METHOD($REQ, $CTX) {
+            ...
+          }
+      # Two defects here. The rule knew only one of the two idioms for the
+      # caller's id -- `requireSession()` is assigned to `authed` in some
+      # routes and aliased to `session` in others -- so every
+      # `authed.user.id` ownership check read as no check at all.
+      #
+      # And merely mentioning the id was never enough to prove ownership was
+      # checked: `rateLimit(`session-upload:${session.user.id}`, ...)`, an
+      # audit record or the `userId` of a freshly created row all mention it
+      # while the loaded record goes back to the caller unchecked. Matching
+      # the comparison instead covers both idioms at once and means what the
+      # rule's message says.
+      - pattern-not-inside: |
+          export async function $METHOD($REQ, $CTX) {
+            ...
+            <... $OWNER !== $AUTH.user.id ...>
+            ...
+          }
+      - pattern-not-inside: |
+          export async function $METHOD($REQ, $CTX) {
+            ...
+            <... $OWNER === $AUTH.user.id ...>
+            ...
+          }
+      # The comparison is often delegated to a per-file helper -- the
+      # assertOwner/getOwnedExam pattern this rule's message points at. Those
+      # take the caller's id as an argument and return null when the record
+      # is not theirs, so the null check is the enforcement and is required
+      # here for the same reason the verifyOrigin exclusion requires it.
+      - pattern-not-inside: |
+          export async function $METHOD($REQ, $CTX) {
+            ...
+            const $REC = await $OWN(..., $AUTH.user.id)
+            if (!$REC) { ... }
+            ...
+          }
+    paths:
+      include:
+        - "**/app/api/**/route.ts"

@@ -1,0 +1,599 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─── ENUMS ───────────────────────────────────────────────────
+
+enum Role {
+  STUDENT
+  TEACHER
+  ADMIN
+}
+
+enum ExamStatus {
+  DRAFT
+  PUBLISHED
+  ACTIVE
+  CLOSED
+  GRADED
+  ARCHIVED
+}
+
+enum QuestionType {
+  MULTIPLE_CHOICE
+  FREE_TEXT
+  FILL_IN_THE_BLANK
+  FILE_UPLOAD
+  MATCHING
+  CODE
+  TRUE_FALSE
+  SHORT_ANSWER
+  ORDERING
+}
+
+enum SessionStatus {
+  // In the waiting room of a shared-start exam (Exam.waitingRoom): joined,
+  // but no clock yet. Start converts every WAITING session to IN_PROGRESS
+  // with one shared startedAt (app/api/exams/[id]/activate/route.ts).
+  WAITING
+  IN_PROGRESS
+  SUBMITTED
+  AUTO_SUBMITTED
+  LOCKED
+}
+
+enum SubmissionType {
+  MANUAL
+  AUTO_TIME
+  TEACHER_FORCED
+}
+
+// Source of truth for the integrity-signal allow-list. Every other
+// declaration of these kinds (the TS types in lib/monitor-patch.ts, the Go
+// runtime gate in ws-backend/internal/protocol/messages.go, the monitor
+// labels) must cover exactly these members — testdata/
+// integrity-event-vectors.json pins them together. FULLSCREEN_EXIT was
+// dropped historically; do not re-add it.
+enum IntegrityEventKind {
+  TAB_HIDDEN
+  WINDOW_BLUR
+  COPY_BLOCKED
+  PASTE_BLOCKED
+  CONTEXT_MENU_BLOCKED
+  DEVTOOLS_SUSPECTED
+  SHORTCUT_BLOCKED
+}
+
+// ─── BETTER AUTH TABLES ──────────────────────────────────────
+
+model Session {
+  id        String   @id @default(cuid())
+  expiresAt DateTime
+  token     String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  ipAddress String?
+  userAgent String?
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Sign-out-all and user-deletion cascades look sessions up by userId; small
+  // table today, but unindexed it becomes a full scan as accounts accumulate.
+  @@index([userId])
+  @@map("session")
+}
+
+model Account {
+  id                    String    @id @default(cuid())
+  accountId             String
+  providerId            String
+  userId                String
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  password              String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  // One external identity maps to exactly one account row. better-auth
+  // resolves sign-in by this pair (internal-adapter's findAccountByKey) and
+  // refuses to continue when more than one row matches, so a duplicate would
+  // let the same provider identity resolve to two local accounts.
+  //
+  // better-auth 1.7.0-1.7.2 keyed accounts by (issuer, accountId) instead and
+  // required an `issuer` column; 1.7.3 reverted that upstream and stopped
+  // writing the column, which made every account write fail against a schema
+  // that still required it. See 20260916120000_account_identity_drop_issuer.
+  @@unique([providerId, accountId], map: "account_providerId_accountId_uidx")
+  // Covers the settings-page lookup (userId + providerId) and OAuth link/
+  // sign-in flows that filter by userId alone.
+  @@index([userId, providerId])
+  @@map("account")
+}
+
+model Verification {
+  id         String   @id @default(cuid())
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  // Email verification / password reset look this up by identifier (the
+  // email address), never by id.
+  @@index([identifier])
+  @@map("verification")
+}
+
+model Passkey {
+  id           String   @id @default(cuid())
+  name         String?
+  publicKey    String
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  credentialID String   @unique
+  counter      Int
+  deviceType   String
+  backedUp     Boolean
+  transports   String?
+  createdAt    DateTime @default(now())
+  aaguid       String?
+
+  @@index([userId])
+  @@map("passkey")
+}
+
+// ─── USERS ────────────────────────────────────────────────────
+
+model User {
+  id                   String    @id @default(cuid())
+  email                String    @unique
+  name                 String
+  role                 Role      @default(STUDENT)
+  emailVerified        Boolean   @default(false)
+  dyslexicFont         Boolean   @default(false)
+  highContrast         Boolean   @default(false)
+  reducedMotion        Boolean   @default(false)
+  hideExamTimer        Boolean   @default(false)
+  autoArchiveEnabled   Boolean   @default(false)
+  onboardingDismissed  Boolean   @default(false)
+  // Datenschutzerklärung acknowledgement at registration (lib/legal/). Null
+  // for accounts created before the policy page existed.
+  privacyAcceptedAt    DateTime?
+  privacyPolicyVersion String?
+  image                String?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  createdExams       Exam[]             @relation("ExamCreator")
+  folders            Folder[]           @relation("FolderCreator")
+  examSessions       ExamSession[]
+  auditLogs          AuditLog[]
+  gradesByTeacher    Grade[]            @relation("GradedBy")
+  gradesReviewedByMe Grade[]            @relation("ReviewedBy")
+  sessions           Session[]
+  accounts           Account[]
+  passkeys           Passkey[]
+  questionBankItems  QuestionBankItem[] @relation("QuestionBankCreator")
+
+  @@index([email])
+  @@index([role])
+}
+
+// ─── EXAMS ────────────────────────────────────────────────────
+
+model Folder {
+  id        String   @id @default(cuid())
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  creatorId String
+  creator   User   @relation("FolderCreator", fields: [creatorId], references: [id])
+
+  exams             Exam[]
+  questionBankItems QuestionBankItem[]
+
+  @@unique([creatorId, name])
+  @@index([creatorId])
+}
+
+model Exam {
+  id               String     @id @default(cuid())
+  title            String
+  description      String?
+  status           ExamStatus @default(DRAFT)
+  accessCode       String     @unique
+  timeLimitMin     Int
+  shuffleQuestions Boolean    @default(false)
+  shuffleOptions   Boolean    @default(false)
+  showResults      Boolean    @default(false)
+
+  sebRequired     Boolean @default(false)
+  sebConfigKey    String?
+  // Emergency override, shown to the exam's creator only. SEB needs the
+  // literal password typed in to unlock the quit button, so this cannot be
+  // stored as a one-way hash; only its SHA256 goes into the .seb file.
+  // Stored AES-256-GCM encrypted at rest (lib/at-rest-encryption.ts):
+  // decrypted only at the moment it is displayed or embedded. Legacy
+  // plaintext rows read back unchanged and are re-wrapped by
+  // ensureSebQuitPassword / scripts/encrypt-at-rest.ts.
+  sebQuitPassword String?
+  allowSpellCheck Boolean @default(false)
+  // 32-byte HMAC salt embedded in this exam's .seb file as `examKeySalt`.
+  // SEB derives the Browser Exam Key as HMAC-SHA256(config, examKeySalt)
+  // (seb-mac SEBCryptor.m generateChecksumForBEK) and generates a RANDOM salt
+  // on every launch when the config carries none — so without this the BEK
+  // differs on every launch and cannot be compared against anything. Pinning
+  // it per exam is what makes the BEK stable enough to bind per session.
+  //
+  // This IS part of the .seb file and IS hashed into the Config Key (SEB
+  // excludes only `originatorVersion`), so rotating it invalidates every
+  // already-downloaded config for this exam.
+  sebExamKeySalt  Bytes?
+
+  scheduledStart      DateTime?
+  scheduledEnd        DateTime?
+  // Shared start: from scheduledStart students wait in a waiting room until
+  // the teacher presses Start, and everyone's clock starts then. Late joiners
+  // still get the full time limit; scheduledEnd is not used for these exams.
+  waitingRoom         Boolean     @default(false)
+  activatedAt         DateTime?
+  closedAt            DateTime?
+  createdAt           DateTime    @default(now())
+  updatedAt           DateTime    @updatedAt
+  archivedAt          DateTime?
+  statusBeforeArchive ExamStatus?
+
+  creatorId String
+  creator   User   @relation("ExamCreator", fields: [creatorId], references: [id])
+
+  folderId String?
+  folder   Folder? @relation(fields: [folderId], references: [id], onDelete: SetNull)
+
+  questions Question[]
+  sessions  ExamSession[]
+  auditLogs AuditLog[]
+  // GIN trigram index on `title` (pg_trgm) is added via raw SQL in
+  // migrations/20260806180836_add_exam_title_trgm_index — Prisma's DSL can't
+  // express operator-class GIN indexes without the postgresqlExtensions
+  // preview feature, so it isn't declared here.
+
+  @@index([accessCode])
+  @@index([status])
+  @@index([creatorId])
+  @@index([folderId])
+}
+
+// ─── QUESTIONS ───────────────────────────────────────────────
+
+model Question {
+  id       String       @id @default(cuid())
+  examId   String
+  exam     Exam         @relation(fields: [examId], references: [id], onDelete: Cascade)
+  type     QuestionType
+  order    Int
+  title    String
+  points   Float
+  required Boolean      @default(true)
+  config   Json
+
+  // Provenance only, not a live link: inserting a bank item COPIES its
+  // config/title/points/required into a brand-new Question row (mirrors
+  // EXAM_DUPLICATED's copy behavior in duplicate/route.ts). Editing the bank
+  // item afterward never touches exams that already used it — this FK exists
+  // purely so "which exams use this bank item" can be answered, and is set
+  // null (not cascaded) if the bank item is later deleted.
+  bankItemId String?
+  bankItem   QuestionBankItem? @relation(fields: [bankItemId], references: [id], onDelete: SetNull)
+
+  answers   Answer[]
+  bookmarks QuestionBookmark[]
+  answerFiles AnswerFile[]
+
+  @@unique([examId, order])
+  @@index([examId])
+  @@index([bankItemId])
+}
+
+// A reusable question definition a teacher can insert into multiple exams.
+// Copy-on-insert: see the bankItemId comment on Question above for why this
+// is not a live-synced link.
+model QuestionBankItem {
+  id       String       @id @default(cuid())
+  type     QuestionType
+  title    String
+  points   Float
+  required Boolean      @default(true)
+  config   Json
+
+  creatorId String
+  creator   User   @relation("QuestionBankCreator", fields: [creatorId], references: [id])
+
+  folderId String?
+  folder   Folder? @relation(fields: [folderId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Link-sharing: a teacher generates a token to share this item with other
+  // teachers. Anyone with the token (and a logged-in account) can view the
+  // item and copy it into their own bank — never a live link, matching the
+  // copy-on-insert philosophy. Regenerating rotates the token; null = not
+  // shared. Tokens are unguessable (random 32 hex chars) and scoped to the
+  // item, so exposing one only leaks that single question.
+  shareToken String? @unique
+
+  usedBy Question[]
+
+  @@index([creatorId])
+  @@index([folderId])
+}
+
+// ─── EXAM SESSIONS ────────────────────────────────────────────
+
+model ExamSession {
+  id            String                @id @default(cuid())
+  examId        String
+  exam          Exam                  @relation(fields: [examId], references: [id])
+  userId        String
+  user          User                  @relation(fields: [userId], references: [id])
+  status        SessionStatus         @default(IN_PROGRESS)
+  lockIntervals SessionLockInterval[]
+
+  startedAt        DateTime?
+  submittedAt      DateTime?
+  timeExtensionMin Int       @default(0)
+  effectiveEndTime DateTime?
+  // Authoritative lock boundary for draining acknowledged pre-lock WS saves.
+  lockedAt         DateTime?
+
+  // Nachteilsausgleich (+15%) may be granted once per session; a second
+  // application would stack another 15% on top of the first. See
+  // app/api/sessions/[id]/extend/route.ts.
+  namApplied Boolean @default(false)
+
+  // Not globally unique: replay detection only ever compares this against
+  // the same session's own stored value (see the submit route), so a global
+  // constraint bought nothing but let one session's key collide with an
+  // unrelated session's, turning the submit into an uncaught 500.
+  idempotencyKey String?
+  submissionType SubmissionType?
+
+  lastSeenAt     DateTime?
+  reconnectCount Int       @default(0)
+
+  // Set by the ws-backend flusher when a buffered answer (acked before the
+  // submit) lands after the session was already submitted, so its
+  // auto-grades may predate it. Cleared by autoGradeSession; the grading
+  // safety nets regrade sessions that carry it.
+  needsRegrade Boolean @default(false)
+
+  // Durable deadline-finalization retry marker: a process may stop after
+  // claiming the session but before publishing/grading/auditing it.
+  deadlineFinalizationPending Boolean @default(false)
+
+  // Config Key of the *personalized* .seb config issued to this student, whose
+  // startURL carries a one-time login token so SEB's cookieless first request
+  // arrives authenticated (see app/exam/[id]/seb-enter/route.ts). That token
+  // is part of the settings dict, so personalizing it necessarily forks the
+  // Config Key per student — hence this column rather than Exam.sebConfigKey.
+  //
+  // Additive, not a replacement: Exam.sebConfigKey stays the frozen canonical
+  // key for the anonymous config (teacher previews, and any student who never
+  // got a personalized one), and lib/seb-guard.ts accepts a token matching
+  // EITHER. Null here simply means "this session only ever used the anonymous
+  // config", which is exactly the pre-auto-login behaviour.
+  sebConfigKey String?
+
+  // First-seen SEB Config Key token and User-Agent for this session, used to
+  // detect a mid-exam switch away from the validated SEB config. See
+  // lib/seb-guard.ts for what this binding does and does not prove.
+  sebKeyHash   String?
+  sebUserAgent String?
+
+  // First-seen SEB Browser Exam Key RequestHash, bound trust-on-first-use.
+  // Unlike sebKeyHash this NEVER denies a request — a change only raises a
+  // signal, because a false positive mid-exam is worse than a missed
+  // detection. Requires Exam.sebExamKeySalt to be stable, or SEB's per-launch
+  // random salt would make this differ on every legitimate restart.
+  sebBrowserExamKey     String?
+  // Set once and never cleared, so the invigilator sees it live and the
+  // grader sees it afterwards. Reason is `bek_changed` or `bek_disappeared`.
+  sebIntegrityFlaggedAt DateTime?
+  sebIntegrityReason    String?
+
+  answers         Answer[]
+  bookmarks       QuestionBookmark[]
+  answerFiles     AnswerFile[]
+  grades          Grade[]
+  integrityEvents IntegrityEvent[]
+  // Tighter autovacuum scale factors (raw SQL in
+  // migrations/20260811100000_tune_autovacuum_high_churn_tables — storage
+  // parameters aren't expressible in the Prisma DSL) for the same reason as
+  // Answer below: lastSeenAt/status update on every autosave tick.
+
+  @@unique([examId, userId])
+  @@index([examId, status])
+  // Covers the monitor endpoint's `WHERE examId = ? ORDER BY startedAt` —
+  // [examId, status] above doesn't help an unfiltered-by-status sort.
+  @@index([examId, startedAt])
+  @@index([userId])
+}
+
+// Durable lock windows let WS saves be checked against the exact interval
+// they were received in, even if handling is delayed until after unlock.
+model SessionLockInterval {
+  id         BigInt      @id @default(autoincrement())
+  sessionId  String
+  session    ExamSession @relation(fields: [sessionId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  lockedAt   DateTime    @db.Timestamp(3)
+  unlockedAt DateTime?   @db.Timestamp(3)
+
+  @@index([sessionId, lockedAt, unlockedAt])
+}
+
+// ─── INTEGRITY EVENTS ────────────────────────────────────────
+// Best-effort client-reported behavioral signals (tab switch, window blur,
+// clipboard/devtools attempt) surfaced to the teacher's live monitor.
+// Not proof of cheating on their own — see hooks/use-integrity-monitor.ts.
+// `kind` is the DB enum IntegrityEventKind — the single source of truth for
+// the allow-list (see testdata/integrity-event-vectors.json).
+
+model IntegrityEvent {
+  id         String             @id @default(cuid())
+  sessionId  String
+  session    ExamSession        @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  kind       IntegrityEventKind
+  detail     String?
+  clientTime DateTime
+  createdAt  DateTime           @default(now())
+
+  @@index([sessionId])
+}
+
+// ─── ANSWERS ─────────────────────────────────────────────────
+
+model Answer {
+  id         String      @id @default(cuid())
+  sessionId  String
+  session    ExamSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  questionId String
+  question   Question    @relation(fields: [questionId], references: [id])
+
+  content       Json
+  version       Int     @default(1)
+  // Client-assigned save order (lib/answer-seq.ts). The REST autosave route
+  // and the ws-backend flusher both only overwrite a row holding a lower
+  // value, so a save delayed in the Redis buffer can't clobber a newer one
+  // that arrived over the other path. Float, not BigInt: the values are
+  // millisecond-scale integers (exact in a double up to 2^53) and a BigInt
+  // field would make every route that returns Answer rows fail
+  // JSON.stringify. Null for rows written before the column existed.
+  clientSeq     Float?
+  fileUrl       String?
+  fileName      String?
+  fileSizeBytes Int?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  // Every autosave is an UPDATE on this table (the write-behind flusher in
+  // ws-backend upserts one row per question per flush interval), so churn is
+  // high relative to row count. Measured on a 4 vCPU box at 1,600 concurrent
+  // students: 10.7M UPDATEs against 195k live rows left
+  // 24,466 dead tuples outstanding despite 77 autovacuum passes, costing
+  // ~4x p95 answer-save latency until a manual vacuum. Tighter autovacuum
+  // scale factors (raw SQL in
+  // migrations/20260811100000_tune_autovacuum_high_churn_tables — storage
+  // parameters aren't expressible in the Prisma DSL) address this for new
+  // deployments; DEPLOYMENT.md documents the one-time manual VACUUM an
+  // existing deployment needs to reclaim already-accumulated bloat.
+
+  @@unique([sessionId, questionId])
+  @@index([sessionId])
+  @@index([questionId])
+}
+
+// A student's private "return to this" marker for one question in one exam
+// session. It deliberately stores no answer data and is removed with either
+// side of the exam relationship.
+// Bytes of a FILE_UPLOAD answer. Replaces the MinIO bucket: files now ride
+// the same pg_dump / wal-g backups and point-in-time recovery as the answers
+// that reference them. Kept out of Answer on purpose — that row is rewritten
+// on every autosave tick, while a file is only ever inserted or deleted.
+//
+// `key` is the unchanged object-key shape (lib/answer-file-key.ts,
+// sessions/{sessionId}/{questionId}/{uuid}.{ext}) so Answer.content.fileKey,
+// its validators and ws-backend's mirror of fileKeyBelongsTo need no change.
+//
+// `data` is STORAGE EXTERNAL (no TOAST compression — uploads are already
+// compressed formats); set in raw SQL in
+// migrations/20261005120000_answer_files_in_postgres.
+model AnswerFile {
+  key        String      @id
+  sessionId  String
+  session    ExamSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  questionId String
+  question   Question    @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  sizeBytes  Int
+  data       Bytes
+  createdAt  DateTime    @default(now())
+
+  @@index([sessionId, questionId])
+  @@index([questionId])
+}
+
+model QuestionBookmark {
+  sessionId  String
+  questionId String
+  session    ExamSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  question   Question    @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  createdAt  DateTime    @default(now())
+
+  @@id([sessionId, questionId])
+  @@index([questionId])
+}
+
+// ─── GRADES ──────────────────────────────────────────────────
+
+model Grade {
+  id         String      @id @default(cuid())
+  sessionId  String
+  session    ExamSession @relation(fields: [sessionId], references: [id])
+  questionId String
+
+  points     Float
+  maxPoints  Float
+  feedback   String?
+  autoGraded Boolean @default(false)
+
+  gradedById String?
+  gradedBy   User?    @relation("GradedBy", fields: [gradedById], references: [id])
+  gradedAt   DateTime @default(now())
+
+  // Set only by the bulk "mark auto-graded rows as reviewed" action.
+  // Distinct from gradedBy/gradedAt (which track the last point/feedback
+  // write, manual or bulk-zero): a manual override afterwards does not
+  // clear reviewedAt, since gradedAt already shows the override happened.
+  reviewedAt   DateTime?
+  reviewedById String?
+  reviewedBy   User?     @relation("ReviewedBy", fields: [reviewedById], references: [id])
+
+  @@unique([sessionId, questionId])
+  @@index([sessionId])
+}
+
+// ─── AUDIT LOG ────────────────────────────────────────────────
+
+model AuditLog {
+  id             String   @id @default(cuid())
+  action         String
+  entityType     String
+  entityId       String
+  userId         String?
+  user           User?    @relation(fields: [userId], references: [id])
+  examId         String?
+  exam           Exam?    @relation(fields: [examId], references: [id])
+  metadata       Json?
+  ipAddress      String?
+  userAgent      String?
+  timestamp      DateTime @default(now())
+  // Set only for events that may be re-emitted by a retry (finalization
+  // recovery, submit replay). The unique index turns a retried write into a
+  // no-op instead of a duplicate row; NULL keys never conflict.
+  idempotencyKey String?  @unique
+
+  @@index([entityType, entityId])
+  @@index([examId])
+  @@index([userId])
+  @@index([timestamp])
+}

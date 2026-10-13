@@ -1,0 +1,3 @@
+# Keeps this directory in git. The bind mount in docker-compose.prod.yml needs
+# it to exist; its only real occupant (cap-probe.json) is generated per
+# installation by scripts/setup-monitoring.sh and is gitignored.

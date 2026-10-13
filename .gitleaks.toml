@@ -1,0 +1,34 @@
+# gitleaks configuration
+#
+# Extends the bundled ruleset rather than replacing it — every default rule
+# stays active on every path except the one waived below.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "SEB hash test vectors are hash inputs/outputs, not credentials"
+# testdata/seb-token-vectors.json pins the cross-language contract for
+# `sha256(urlWithoutFragment + key)` that the TS and Go implementations must
+# agree on, so the fixture has to carry literal key material to be worth
+# anything. One vector is a 64-hex Browser Exam Key in the shape SEB
+# Preferences emits, which the entropy-based `generic-api-key` rule reads as
+# a credential.
+#
+# These are not credentials: they are inputs chosen to exercise the hash, and
+# every expected digest beside them is reproducible from the file itself.
+#
+# Note this excludes the file from secret scanning *entirely*, not just from
+# the one rule that fires today — a `paths` entry is matched before any
+# content rule runs, so narrowing it to `generic-api-key` is not possible
+# here. Keep the file to hash vectors only; nothing actually secret belongs
+# in it.
+#
+# testdata/seb-config-key-strings.json is the same kind of fixture for the
+# Config Key: each `configKey` is the SHA-256 of the `canonical` string beside
+# it, pinned against the upstream SEB serializers. The 64-hex digests trip
+# `generic-api-key` the same way. Keep it to hash vectors only as well.
+paths = [
+  '''^testdata/seb-token-vectors\.json$''',
+  '''^testdata/seb-config-key-strings\.json$''',
+]

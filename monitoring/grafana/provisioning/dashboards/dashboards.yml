@@ -1,0 +1,14 @@
+# File-provider: loads every dashboard JSON in monitoring/grafana/dashboards/
+# (bind-mounted at /var/lib/grafana/dashboards) instead of requiring manual
+# import through the UI.
+apiVersion: 1
+
+providers:
+  - name: openexam
+    orgId: 1
+    folder: OpenExam
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 60
+    options:
+      path: /var/lib/grafana/dashboards

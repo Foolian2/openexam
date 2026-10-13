@@ -1,0 +1,1002 @@
+# Production stack (PRD §16.1) — self-contained, NOT an override of the dev
+# docker-compose.yml. Only nginx publishes ports; postgres/redis live on an
+# internal-only network (PRD §12.3).
+#
+# Secrets come from .env.prod (chmod 600, gitignored) via --env-file — a
+# documented deviation from PRD §12.3 "Docker secrets": no component in the
+# stack reads *_FILE variants, and on a single host the security delta is nil.
+#
+# Every image pulled from a registry is pinned by digest (linux/amd64 — the
+# documented deployment target) so a re-pointed or compromised tag upstream can
+# never be pulled silently. Bump deliberately and review: images referenced
+# here are pinned to the digest that `latest`/the named tag resolved to on
+# 2026-09-12; Dependabot (or an explicit `docker compose pull` review) drives
+# updates.
+#
+# When bumping, re-resolving a pin to the same tag's current digest is mostly
+# cosmetic for CVE purposes -- upstream rebuilds the tag without rebasing the
+# vulnerable packages, so the findings track the pinned VERSION. Measured
+# 2026-09-12: refreshing all 16 digests in place cleared 9 HIGH out of 678,
+# while moving five images to a newer version cleared 3 CRITICAL / 131 HIGH.
+# Check for a newer version, not just a newer digest.
+#
+# Three of the locally built images (openexam-web, -migrate, -ws-backend) carry
+# an ${IMAGE_TAG:-latest} tag instead. They are built from this repo, not
+# pulled, so there is no upstream to pin against — the tag exists so a build
+# does not overwrite the one currently deployed, which is what makes
+# scripts/rollback.sh possible.
+#
+# openexam-postgres is also built locally but deliberately stays on a fixed
+# `:latest` tag (see that service below) — it must NOT track the app's
+# per-commit IMAGE_TAG, or every ordinary application deploy would change its
+# image reference and Compose would recreate the database container along
+# with it.
+#
+# Usage: docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
+# (or scripts/deploy.sh, which also reloads nginx so it re-resolves web IPs)
+#
+# Every service gets a `logging:` block (json-file, bounded max-size/max-file)
+# — previously unset anywhere in this file, i.e. unbounded log growth on
+# every container. See DEPLOYMENT.md's disk-sizing note for the worst-case
+# total.
+#
+# The monitoring stack (node/postgres/redis/nginx-exporter, nginx-log-exporter,
+# prometheus, alertmanager, grafana, glitchtip-*, monitoring-db-init) is OPT-IN — it only
+# comes up if you run scripts/setup-monitoring.sh (DEPLOYMENT.md's
+# "Monitoring & Alerting" section). Every one of those services stays on
+# `internal` (+ `edge` only where it is required — alertmanager for outbound
+# SMTP; nginx-exporter and prometheus to reach nginx) and publishes no port
+# beyond 127.0.0.1, matching this file's existing pattern for admin-only surfaces
+# (see cap's comment below): reachable only via `ssh -L`, never the internet.
+
+name: openexam-prod
+
+services:
+  nginx:
+    # 1.30 is nginx's STABLE branch; the pin was previously 1.27, i.e. an
+    # older mainline. Config is unchanged and verified against 1.30 with
+    # `nginx -t` (it already uses the modern `http2 on;` form rather than
+    # the `listen ... http2` spelling deprecated since 1.25.1).
+    image: nginx:1.30-alpine@sha256:dc5069ad14f19660b141b21236140b91656bf89bbc3e2417c70ae650cd66104c
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    # The config is a template: envsubst renders ${OPENEXAM_DOMAIN} into
+    # server_name (and a 444 catch-all rejects every other Host header).
+    environment:
+      OPENEXAM_DOMAIN: ${OPENEXAM_DOMAIN}
+    command: /bin/sh -c "envsubst '\$$OPENEXAM_DOMAIN' < /etc/nginx/nginx.conf.template > /etc/nginx/nginx.conf && nginx -g 'daemon off;'"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf.template:ro
+      - ./certs:/etc/letsencrypt:ro
+      - certbot_www:/var/www/certbot:ro
+    depends_on:
+      - web
+      - ws-backend
+    networks:
+      - edge
+    healthcheck:
+      test: ["CMD-SHELL", "nginx -t"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "5" }
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 256M
+          pids: 512
+
+  web:
+    # Tagged, not left to Compose's implicit <project>-<service>:latest, so a
+    # previous build survives the next one and scripts/rollback.sh has
+    # something to point back at. deploy.sh sets IMAGE_TAG to the deployed
+    # commit's short SHA and also moves :latest, which is what the default
+    # here resolves to for a bare `docker compose up`.
+    image: openexam-web:${IMAGE_TAG:-latest}
+    build:
+      context: .
+      target: runner
+      args:
+        NEXT_PUBLIC_BASE_URL: ${NEXT_PUBLIC_BASE_URL}
+        # Site key + path, baked into the client bundle at build time like
+        # NEXT_PUBLIC_BASE_URL — rebuild the image when it changes. The path
+        # is relative to the app origin; nginx proxies /cap-api/ to Cap in
+        # prod, so the browser only talks same-origin.
+        NEXT_PUBLIC_CAP_WIDGET_ENDPOINT: ${NEXT_PUBLIC_CAP_WIDGET_ENDPOINT}
+        # Internal-network address only — nginx never forwards anything but
+        # site-key-shaped /cap-api/ paths to this service, and the widget
+        # itself never sees this value. Baked into the rewrite at build time.
+        CAP_ORIGIN: http://cap:3000
+        # Baked into the client bundle (instrumentation-client.ts). Empty
+        # (the default) disables browser-side GlitchTip capture — only set
+        # when the monitoring stack is deployed (scripts/setup-monitoring.sh).
+        NEXT_PUBLIC_SENTRY_DSN: ${NEXT_PUBLIC_SENTRY_DSN:-}
+    restart: unless-stopped
+    deploy:
+      # Measured on a 4 vCPU / 8 GB box: one Next.js
+      # replica saturates at ~132% CPU of the 400% available, so 2 replicas
+      # left roughly half the box idle under page-load traffic. 4 replicas
+      # doubled sustained SSR capacity (100 -> 200 renders/s) on identical
+      # hardware, which matters most exactly when it's needed most: the
+      # exam-start burst when every student in a class requests the exam
+      # page within a few seconds of each other.
+      #
+      # Raised 4 -> 6 for this host, which has 8 vCPU rather than the 4 the
+      # sweep was run on. Sizing from the sweep's *passing* rates, not its
+      # saturation ceiling: 1/2/4 replicas drew 71/137/302% total CPU while
+      # serving 50/100/200 renders/s, i.e. ~75% per replica at the highest
+      # rate each configuration survives. Six replicas therefore draw ~450%
+      # of the 800% here — about 56% of the box, where the benchmarked
+      # configuration sat at 75% of its own.
+      #
+      # Deliberately below the ratio that box ran at: it did not carry the
+      # monitoring stack (Prometheus, Grafana, GlitchTip and four exporters)
+      # that this host does, and the exam-start burst is also when postgres
+      # and ws-backend are busiest — students requesting the page are the
+      # same students opening WebSockets and creating sessions moments
+      # later. Starving those to render pages faster trades one queue for
+      # another.
+      #
+      # The 132% single-replica plateau in §9 is a per-process ceiling (one
+      # Node event loop), not a per-replica budget. It bounds what one
+      # replica can absorb, which is why replica count is the only lever
+      # that moves SSR capacity — not what six of them will typically use.
+      replicas: 6
+      resources:
+        limits:
+          cpus: "2"
+          memory: 1G
+          pids: 512
+    # NO env_file: the whole .env.prod (CAP_ADMIN_KEY, SMTP and
+    # Microsoft secrets) would otherwise land in this internet-facing
+    # container's environment. Only what the web tier actually reads is
+    # enumerated below.
+    environment:
+      NODE_ENV: production
+      # Also baked into the client bundle via the build arg above (Next.js
+      # only inlines NEXT_PUBLIC_* statically for client/Edge code) — but
+      # Server Components and Route Handlers (launch-seb page, seb-config
+      # route) run in Node.js and read process.env live at request time, so
+      # the var must be set here too or lib/seb-urls.ts's dev fallback
+      # ("http://localhost:3000") silently wins on every server-side call.
+      NEXT_PUBLIC_BASE_URL: ${NEXT_PUBLIC_BASE_URL}
+      DATABASE_URL: postgresql://openexam:${POSTGRES_PASSWORD}@postgres:5432/openexam
+      # Read by lib/prisma.ts and passed as pg.Pool's `max`. Nothing bounded
+      # this before: @prisma/adapter-pg wraps node-postgres directly, and
+      # node-postgres does not read a connection_limit query param from
+      # DATABASE_URL the way Prisma's classic query engine does — that key
+      # is silently ignored by this adapter, so the pool was unbounded,
+      # capped only by the OS. With no CPU limit set on this container it
+      # sees every host core, so on a 16-core host that's a real risk. At
+      # 6 replicas, 5 each (30) plus ws-backend's 30 stays well under a stock
+      # max_connections of 100 (the measured plateau at load was 31 total).
+      DB_POOL_MAX: "5"
+      REDIS_URL: redis://redis:6379
+      # Exam-start admission queue (lib/exam-admission.ts). Both are optional
+      # — unset means the built-in defaults (25 students/s, 45 s cap), which
+      # are what a class-sized cohort wants. Raise the rate (or set the cap
+      # to 0, disabling the queue) only with a measurement to back it: the
+      # rate is a promise about how many exam-page renders per second this
+      # tier can absorb, and the replica sweep above is where that number
+      # comes from.
+      DEADLINE_SWEEPER_ENABLED: ${DEADLINE_SWEEPER_ENABLED:-true}
+      ANSWER_FILE_RETENTION_ENABLED: ${ANSWER_FILE_RETENTION_ENABLED:-true}
+      EXAM_ADMISSION_RATE_PER_SEC: ${EXAM_ADMISSION_RATE_PER_SEC:-}
+      EXAM_ADMISSION_MAX_WAIT_SEC: ${EXAM_ADMISSION_MAX_WAIT_SEC:-}
+      # Pinned public origin for auth emails/links (host-header poisoning).
+      BETTER_AUTH_URL: ${BETTER_AUTH_URL}
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET}
+      # CSRF/origin allowlist shared with ws-backend (lib/csrf.ts). Falls
+      # back to BETTER_AUTH_URL when empty; passed explicitly so a
+      # deployment listing extra origins in .env.prod keeps working.
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
+      # HMAC key for anonymized matching IDs (lib/exam-session.ts).
+      MATCHING_ID_SECRET: ${MATCHING_ID_SECRET}
+      # Teacher self-registration code.
+      TEACHER_ACCESS_CODE: ${TEACHER_ACCESS_CODE}
+      # AES-256-GCM key for at-rest encryption (OAuth tokens, SEB quit
+      # passwords) — lib/at-rest-encryption.ts.
+      AT_REST_ENC_KEY: ${AT_REST_ENC_KEY}
+      # Microsoft 365 (Entra ID) login.
+      MICROSOFT_CLIENT_ID: ${MICROSOFT_CLIENT_ID}
+      MICROSOFT_CLIENT_SECRET: ${MICROSOFT_CLIENT_SECRET}
+      MICROSOFT_TENANT_ID: ${MICROSOFT_TENANT_ID}
+      SCHOOL_STUDENT_DOMAINS: ${SCHOOL_STUDENT_DOMAINS:-}
+      SCHOOL_TEACHER_DOMAINS: ${SCHOOL_TEACHER_DOMAINS:-}
+      # SMTP (email verification / notifications).
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT}
+      SMTP_SECURE: ${SMTP_SECURE}
+      SMTP_USER: ${SMTP_USER}
+      SMTP_PASSWORD: ${SMTP_PASSWORD}
+      SMTP_FROM: ${SMTP_FROM}
+      # Internal-network address only — the browser never talks to Cap
+      # directly, the server does the siteverify call.
+      CAP_SITEVERIFY_URL: http://cap:3000/siteverify
+      # Server-side Cap verification secret (the site key is public and baked
+      # into the client bundle; this must not be).
+      CAP_SECRET_KEY: ${CAP_SECRET_KEY}
+      # GlitchTip (instrumentation.ts) — internal-network address, empty
+      # disables server-side capture. Not the same value class as
+      # NEXT_PUBLIC_SENTRY_DSN above only in that this one never reaches the
+      # client bundle; both point at the same glitchtip-web instance.
+      SENTRY_DSN: ${SENTRY_DSN:-}
+      # SEB 3.7.1 "Allowed SEB Versions" client-version floor
+      # (lib/seb-config.ts's sebAllowedVersionsFromEnv). Empty/unset means no
+      # restriction, matching SEB's own default. Without this entry, setting
+      # it in .env.prod would never reach the web tier and every downloaded
+      # config would stay unrestricted despite the operator believing the
+      # control was enabled.
+      SEB_ALLOWED_VERSIONS: ${SEB_ALLOWED_VERSIONS:-}
+      # Operator details on /datenschutz and /impressum (lib/legal/config.ts).
+      # The first four are required: lib/env.ts refuses to boot without them.
+      LEGAL_CONTROLLER_NAME: ${LEGAL_CONTROLLER_NAME:-}
+      LEGAL_CONTROLLER_ADDRESS: ${LEGAL_CONTROLLER_ADDRESS:-}
+      LEGAL_CONTACT_EMAIL: ${LEGAL_CONTACT_EMAIL:-}
+      LEGAL_HOSTING_PROVIDER: ${LEGAL_HOSTING_PROVIDER:-}
+      LEGAL_CONTACT_PHONE: ${LEGAL_CONTACT_PHONE:-}
+      LEGAL_DPO_NAME: ${LEGAL_DPO_NAME:-}
+      LEGAL_DPO_EMAIL: ${LEGAL_DPO_EMAIL:-}
+      LEGAL_IMPRESSUM_RESPONSIBLE: ${LEGAL_IMPRESSUM_RESPONSIBLE:-}
+      LEGAL_RETENTION_NOTE: ${LEGAL_RETENTION_NOTE:-}
+      LEGAL_POLICY_VERSION: ${LEGAL_POLICY_VERSION:-}
+      LEGAL_BACKUP_PROVIDER: ${LEGAL_BACKUP_PROVIDER:-}
+      # Only tells /datenschutz whether backups leave the server.
+      WALG_STORAGE_BACKEND: ${WALG_STORAGE_BACKEND:-disabled}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      cap:
+        condition: service_started
+    networks:
+      - edge
+      - internal
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+  migrate:
+    image: openexam-migrate:${IMAGE_TAG:-latest}
+    build:
+      context: .
+      target: migrate
+    restart: "no"
+    environment:
+      DATABASE_URL: postgresql://openexam:${POSTGRES_PASSWORD}@postgres:5432/openexam
+      # `prisma migrate deploy` needs only DATABASE_URL. The rest is for the
+      # one-off data migrations run in this image with `docker compose run`
+      # (scripts/migrate-account-identity.ts reads and rewrites the
+      # at-rest-encrypted Microsoft ID tokens) — NODE_ENV especially:
+      # lib/at-rest-encryption.ts falls back to a fixed development key when
+      # it isn't "production", which would fail to decrypt every prod row.
+      NODE_ENV: production
+      AT_REST_ENC_KEY: ${AT_REST_ENC_KEY}
+      MICROSOFT_CLIENT_ID: ${MICROSOFT_CLIENT_ID}
+      MICROSOFT_TENANT_ID: ${MICROSOFT_TENANT_ID}
+      # Read by scripts/regenerate-seb-config-keys.ts (via `docker compose run`
+      # against this service) so the Config Keys it computes match what the
+      # web tier's SEB_ALLOWED_VERSIONS above actually bakes into the plist —
+      # see that script's header comment for the invocation.
+      SEB_ALLOWED_VERSIONS: ${SEB_ALLOWED_VERSIONS:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - internal
+      # `internal: true` means no route off the host, and the account-identity
+      # migration has to reach login.microsoftonline.com to verify the stored
+      # ID tokens against the tenant's published keys. Without outbound access
+      # it reports every Microsoft row as unverifiable and the documented
+      # migration path cannot complete. Nothing is published from this
+      # service; it is a one-shot job that exits.
+      - edge
+    logging:
+      driver: json-file
+      options: { max-size: "5m", max-file: "2" }
+
+  ws-backend:
+    image: openexam-ws-backend:${IMAGE_TAG:-latest}
+    build:
+      context: ./ws-backend
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 512M
+          pids: 256
+    environment:
+      PORT: 8080
+      # pool_max_conns is pgxpool's own DSN parameter (unlike Prisma's
+      # connection_limit, pgx actually reads this — verified against
+      # pgxpool.ParseConfig's godoc, default is 4 if unset). Found
+      # empirically: with the default of 4, 64 rooms writing integrity
+      # events concurrently (internal/hub/async.go moved these off each
+      # room's own goroutine, so they now genuinely run in parallel across
+      # rooms) serialized on pool checkout badly enough that ~12% of writes
+      # still fell back to offloadDurable's inline path under the capacity
+      # benchmark's integrity-load scenario, leaving a 61s tail even after
+      # that fix. 30 stays under max_connections=100 alongside the web
+      # tier's 6 x 5 = 30 (docker-compose.prod.yml's web service).
+      DATABASE_URL: postgresql://openexam:${POSTGRES_PASSWORD}@postgres:5432/openexam?pool_max_conns=30
+      REDIS_URL: redis://redis:6379
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET}
+      ALLOWED_ORIGINS: ${NEXT_PUBLIC_BASE_URL}
+      # Must equal NEXT_PUBLIC_BASE_URL exactly — used to reconstruct exam
+      # take-page URLs for SEB Config Key verification. Read first by the Go
+      # config; APP_BASE_URL below is kept as a legacy fallback.
+      NEXT_PUBLIC_BASE_URL: ${NEXT_PUBLIC_BASE_URL}
+      # Legacy name, deprecated in favor of NEXT_PUBLIC_BASE_URL above.
+      APP_BASE_URL: ${NEXT_PUBLIC_BASE_URL}
+      # GlitchTip (main.go) — same internal-network address as web's
+      # SENTRY_DSN above. Empty disables panic reporting (recovery.Guard is
+      # still a safe no-op either way).
+      SENTRY_DSN: ${SENTRY_DSN:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - edge
+      - internal
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "5" }
+
+  postgres:
+    # Built (not a bare pinned image) to add the wal-g binary for WAL
+    # archiving/PITR — see infra/postgres/Dockerfile for why this needed a
+    # base-image family switch (Debian glibc, not Alpine/musl) and its own
+    # digest pin. Patched via Dependabot bumping that Dockerfile's FROM line
+    # now, rather than a bare digest bump here.
+    #
+    # Fixed tag, NOT ${IMAGE_TAG} like the app images: IMAGE_TAG is the app
+    # commit SHA and changes on every deploy, even when infra/postgres itself
+    # is untouched and the build cache returns the same image ID. If this
+    # tag tracked IMAGE_TAG, `docker compose up` (deploy.sh's own unscoped
+    # invocation, or the dependency reconciliation `up web ws-backend` in
+    # rollback.sh triggers via depends_on) would see a changed image
+    # reference on every ordinary deploy and recreate the database
+    # container — unwanted downtime this comment used to promise wouldn't
+    # happen. scripts/rollback.sh never re-points this one — rolling the
+    # database engine back under a live data directory is not a thing you do
+    # from a script — and now neither does an ordinary app deploy.
+    image: openexam-postgres:latest
+    build:
+      context: ./infra/postgres
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          # +256M over the pre-PITR 2G: wal-g's streaming compression during
+          # wal-push/backup-push needs headroom beyond Postgres's own usage.
+          memory: 2304M
+    environment:
+      POSTGRES_USER: openexam
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: openexam
+      # MUST stay set explicitly. The official image made PGDATA
+      # version-specific in 18 (/var/lib/postgresql/18/docker) and moved its
+      # declared VOLUME up to /var/lib/postgresql. Without this, the
+      # postgres_data mount below is silently ignored: 18 initializes a
+      # fresh cluster elsewhere in the container, starts cleanly, passes
+      # pg_isready and serves an empty database — the worst possible failure
+      # mode for this service. Pinning PGDATA keeps the data directory where
+      # it has always been, which is also where scripts/pitr-backup.sh,
+      # scripts/pitr-restore.sh and scripts/pg-upgrade.sh expect it (all
+      # three expand $PGDATA inside the container on purpose).
+      PGDATA: /var/lib/postgresql/data
+    # Archiving is disabled unless docker-compose.sftp.yml is selected.
+    command:
+      - postgres
+      - -c
+      - archive_mode=off
+      # Postgres 18's asynchronous I/O subsystem (sequential scans, bitmap
+      # heap scans, VACUUM). `worker` is 18's own default; it is pinned here
+      # so a future default change can't move it silently, and to document
+      # the choice NOT to use io_uring: io_uring is blocked by Docker's
+      # default seccomp profile, and loosening seccomp on the one container
+      # holding every exam answer and password hash is not worth the
+      # remaining throughput. io_workers stays at the default 3 — raise it
+      # only with a k6 baseline showing it helps.
+      - -c
+      - io_method=worker
+      - -c
+      - io_workers=3
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openexam"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+  # Valkey, not Redis: BSD-licensed (Redis 8 moved to AGPLv3) and wire-
+  # compatible, so the service keeps the name `redis` and the redis:// scheme
+  # on 6379 — every REDIS_URL in this file, lib/redis.ts, ws-backend's
+  # go-redis client, `cap` and redis-exporter need no change. The BINARIES
+  # are renamed though (valkey-cli/valkey-server, no redis-* symlinks), so
+  # the healthcheck, command and every `docker exec` call site in scripts/
+  # call valkey-cli.
+  #
+  # NOT volume-compatible with the redis:7 image this replaced: Redis 7.4
+  # writes RDB v12, which Valkey refuses by default ("Can't handle RDB format
+  # version 12") — that crash-looped the whole app tier once. Hence
+  # the separate `valkey_data` volume: scripts/valkey-migrate.sh copies
+  # redis_data into it, loads the copy once with `--rdb-version-check
+  # relaxed` and rewrites it in Valkey's own format. redis_data is left
+  # untouched as the rollback path. scripts/deploy.sh refuses to run while
+  # redis_data exists without valkey_data, so a plain deploy can't silently
+  # start Valkey on an empty volume.
+  redis:
+    image: valkey/valkey:9.1.2-alpine@sha256:48332870af354a799964c0012ae1194a0bf2bf894eb508f945810596dc2d8d11
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+    # AOF persistence per PRD §16.1 — at most ~1s of in-flight answers lost on crash.
+    command: valkey-server --appendonly yes --appendfsync everysec
+    volumes:
+      - valkey_data:/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    logging:
+      driver: json-file
+      options: { max-size: "5m", max-file: "3" }
+
+  # Self-hosted CAPTCHA (trycap.dev) — invisible proof-of-work bot check for
+  # sign-up/sign-in/access-code join. `web` reaches /siteverify over the
+  # internal network; the widget's PoW challenge runs in the student's
+  # browser, so it ALSO needs a public path — nginx proxies only
+  # site-key-shaped paths under /cap-api/ to it (see nginx/nginx.conf)
+  # rather than publishing a port directly, so the admin dashboard stays
+  # unreachable from the internet (SSH-tunnel only).
+  cap:
+    image: tiago2/cap@sha256:c29417b6270d1fddc6a0603c08d972f89a12de81889d09c3f97a0915422fba5e
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+          pids: 256
+    environment:
+      ADMIN_KEY: ${CAP_ADMIN_KEY}
+      REDIS_URL: redis://redis:6379
+      REDIS_PREFIX: "cap:"
+      CORS_ORIGIN: ${NEXT_PUBLIC_BASE_URL}
+      # Not read by cap itself — cap learns its site keys from Redis. It is
+      # here purely so the healthcheck below can derive which key to ask for.
+      # Deliberately the widget endpoint rather than a separate CAP_SITE_KEY:
+      # scripts/create-cap-site-key.sh rewrites this variable when it rotates
+      # the key, so a second copy of the same value would go stale on the next
+      # rotation and the healthcheck would probe a key that no longer exists.
+      # One source of truth, parsed where it is used.
+      NEXT_PUBLIC_CAP_WIDGET_ENDPOINT: ${NEXT_PUBLIC_CAP_WIDGET_ENDPOINT}
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - edge
+      - internal
+    # cap gates sign-up, sign-in and access-code join. When it dies those three
+    # gates answer 404 and the failure is silent — the user sees a captcha that
+    # never solves, and nothing else in the stack notices. Every other service
+    # on the critical path is health-checked (postgres/redis/nginx here,
+    # web and ws-backend via HEALTHCHECK in their own Dockerfiles); this was the
+    # one gap.
+    #
+    # Reaching the app's own runtime rather than assuming curl/wget: this is a
+    # Bun image, so `bun` is the one binary guaranteed to be present. Same shape
+    # as the web tier's HEALTHCHECK in Dockerfile. Cap serves its dashboard at
+    # /, and any HTTP status at all proves the server is listening and
+    # responding — which is the question being asked. A non-answer (connection
+    # refused, hang) is the failure.
+    healthcheck:
+      # Probes the challenge endpoint, NOT `/`. On 2026-08-26 cap's Redis
+      # client entered a permanently-failed state and never retried; cap went
+      # on serving `/` perfectly, so this check passed and Docker reported the
+      # container healthy while every sign-up, sign-in and access-code join
+      # failed for 17 hours. `/` only proves the process is listening. The
+      # challenge endpoint is the call the widget actually makes and the one
+      # that reaches Redis (cap.js -> hget), so a dead backend now shows up as
+      # a 500 and the container is marked unhealthy.
+      #
+      # Marking it unhealthy is ALL this does. Nothing in this stack acts on
+      # health state: `restart: unless-stopped` triggers on process exit, not
+      # on an unhealthy status, and there is no autoheal sidecar (adding one
+      # would mean handing a container the Docker socket). The recovery path
+      # is CapChallengeFailing in monitoring/prometheus/rules/alerts.yml
+      # paging a human, who restarts it. This check exists so that `docker ps`
+      # tells the truth and so the alert has a second corroborating signal —
+      # not because anything restarts cap automatically. The web tier CAN
+      # self-heal because we control that image and it exits on a confirmed
+      # permanent fault (app/api/health/route.ts); cap is a third-party image
+      # and has no equivalent hook.
+      #
+      # Reaching the app's own runtime rather than assuming curl/wget: this is
+      # a Bun image, so `bun` is the one binary guaranteed to be present. Same
+      # shape as the web tier's HEALTHCHECK in Dockerfile.
+      test:
+        [
+          "CMD",
+          "bun",
+          "-e",
+          "const k=(process.env.NEXT_PUBLIC_CAP_WIDGET_ENDPOINT||'').split('/').filter(Boolean).pop();fetch('http://127.0.0.1:3000/'+k+'/challenge',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}).then(r=>process.exit(r.status===200?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options: { max-size: "5m", max-file: "3" }
+
+  # TLS issuance/renewal — profile-gated, run explicitly:
+  #   docker compose -f docker-compose.prod.yml --profile certbot run --rm certbot \
+  #     certonly --webroot -w /var/www/certbot --cert-name openexam -d $DOMAIN
+  certbot:
+    image: certbot/certbot@sha256:f70ad0adbb7e117f0fe42a63c553f28ea451edabc0148757b6efcd9735acaa20
+    profiles: [certbot]
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+    volumes:
+      - ./certs:/etc/letsencrypt
+      - certbot_www:/var/www/certbot
+    networks:
+      - edge
+    logging:
+      driver: json-file
+      options: { max-size: "5m", max-file: "2" }
+
+  # ── Monitoring stack (opt-in: scripts/setup-monitoring.sh) ────────────────
+  # Nothing below publishes a host port beyond 127.0.0.1 — every dashboard is
+  # reachable only via `ssh -L`, matching the existing cap admin-dashboard
+  # pattern. See DEPLOYMENT.md's "Monitoring & Alerting" section.
+
+  node-exporter:
+    # Every monitoring service is behind the `monitoring` profile: the stack is
+    # opt-in (scripts/setup-monitoring.sh), and without the profile a plain
+    # `up -d` (scripts/deploy.sh) started these too — on a fresh host that
+    # failed outright, because alertmanager's bind-mounted config is only
+    # rendered by setup-monitoring.sh (Docker created a directory in its
+    # place). deploy.sh adds --profile monitoring once that config exists.
+    profiles: [monitoring]
+    image: prom/node-exporter:v1.12.1@sha256:1b4e4438faca4dd7e001dd445d161a4a2091b0fededa84093b3a8dfeae1f1be0
+    restart: unless-stopped
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --path.rootfs=/rootfs
+      - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/docker/.+)($$|/)
+      # scripts/pitr-backup.sh, scripts/backup.sh, and the cert-expiry cron
+      # one-liner (scripts/setup-monitoring.sh) write .prom files here —
+      # host bind mount so both this container and those host-run scripts
+      # see the same files.
+      - --collector.textfile.directory=/textfile-collector
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+      - ./monitoring-data/textfile-collector:/textfile-collector:ro
+    networks:
+      - internal
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 64M
+    logging:
+      driver: json-file
+      options: { max-size: "5m", max-file: "2" }
+
+  postgres-exporter:
+    profiles: [monitoring]
+    image: prometheuscommunity/postgres-exporter:v0.20.1@sha256:ac5ec343104fae0e2d84a27bb8d69b38430a11910c5382cad85d478d2bab713e
+    restart: unless-stopped
+    environment:
+      # Least-privilege `monitoring` role (pg_monitor grant, no write access)
+      # — created by monitoring-db-init below, not the app's own credentials.
+      DATA_SOURCE_NAME: postgresql://monitoring:${MONITORING_DB_PASSWORD}@postgres:5432/openexam?sslmode=disable
+    depends_on:
+      monitoring-db-init:
+        condition: service_completed_successfully
+    networks:
+      - internal
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 64M
+    logging:
+      driver: json-file
+      options: { max-size: "5m", max-file: "2" }
+
+  redis-exporter:
+    profiles: [monitoring]
+    image: oliver006/redis_exporter:v1.91.1-alpine@sha256:30e56152988ca4bb3784e10debaac8905b78f6a7ff2bbd362a40b8c2a78eb1d6
+    restart: unless-stopped
+    environment:
+      REDIS_ADDR: redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - internal
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 64M
+    logging:
+      driver: json-file
+      options: { max-size: "5m", max-file: "2" }
+
+  nginx-exporter:
+    profiles: [monitoring]
+    image: nginx/nginx-prometheus-exporter:1.5.3@sha256:85666e7fde7e253f1c6d978f9a961245df4c9cdb7677e1866d9bb28e8f9ee41d
+    restart: unless-stopped
+    command:
+      # Port 8082, not the loopback-only 8081 sampler endpoint — see
+      # nginx/nginx.conf's comment on that second stub_status server block.
+      - --nginx.scrape-uri=http://nginx:8082/nginx_status
+    depends_on:
+      - nginx
+    # Needs `edge` to reach nginx (which is edge-only) as well as `internal`
+    # to be scraped by prometheus — the one exporter that's multi-homed for
+    # that reason, mirroring alertmanager's dual membership below.
+    networks:
+      - edge
+      - internal
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 64M
+    logging:
+      driver: json-file
+      options: { max-size: "5m", max-file: "2" }
+
+  # The other half of nginx observability. nginx-exporter above reads
+  # stub_status, which counts connections and requests but cannot see a status
+  # code or a response time — so it can answer "how busy" and never "how many
+  # are failing" or "how slow". This one receives nginx's access log over UDP
+  # syslog and turns it into per-route latency histograms and status-code
+  # counters, which is what the p95 REST / page-load / error-rate SLO alerts in
+  # monitoring/prometheus/rules/alerts.yml are built on.
+  #
+  # ghcr.io rather than the project's quay.io registry: same image, and this
+  # keeps every pull on a registry the CI runners already reach.
+  #
+  # Runs as a SIDECAR in nginx's network namespace rather than as a peer on
+  # `edge`, and that is not a stylistic choice. nginx resolves a syslog
+  # `server=` hostname at config-parse time and treats a failure as fatal, so
+  # addressing this container by name would make the site's edge proxy refuse
+  # to start — or fail `nginx -t` and `nginx -s reload` — whenever this
+  # monitoring container was absent. This file's header promises the monitoring
+  # stack is opt-in and removable; a name here would quietly break that promise
+  # in the worst possible direction. Sharing the namespace lets nginx log to a
+  # literal 127.0.0.1, which parses whether or not this container exists.
+  #
+  # The cost is that this container's netns disappears when nginx is recreated.
+  # It exits and `restart: unless-stopped` reattaches it to the new nginx; a
+  # failure to recover shows up as ContainerDown on the nginx-log scrape job.
+  #
+  # Ports 9514/udp (syslog in) and 4040 (metrics out) are bound inside nginx's
+  # namespace, so prometheus scrapes them at nginx:4040 — see prometheus.yml.
+  #
+  # Vector, not prometheus-nginxlog-exporter, which this replaced: that
+  # project's last published image was built in 2021 against Go 1.13 and
+  # carried 69 unfixable stdlib CVEs (5 critical), with v1 and latest both
+  # pointing at that same 2021 build and no newer image published anywhere.
+  # monitoring/vector/vector.yaml reproduces its metric names, labels and
+  # bucket boundaries exactly, so prometheus.yml, alerts.yml, the Grafana
+  # dashboards and nginx.conf are all unchanged by the swap.
+  #
+  # The service keeps its old name so that the nginx-log scrape job, the
+  # ContainerDown alert that watches it and the recreate note in DEPLOYMENT.md
+  # all keep referring to the same thing.
+  nginx-log-exporter:
+    profiles: [monitoring]
+    image: timberio/vector:0.58.0-alpine@sha256:5dcf67db0ee378caa87f3395cb9484ebe3e97bb0334d119f2ac33116e00c5773
+    restart: unless-stopped
+    # No `command:`: vector reads /etc/vector/vector.yaml by default.
+    volumes:
+      - ./monitoring/vector/vector.yaml:/etc/vector/vector.yaml:ro
+    # Implies the dependency on nginx; no `networks:` may be set alongside it.
+    network_mode: "service:nginx"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          # Vector idles around 10M on this log volume. The ceiling is set well
+          # above that because it buffers in memory during a Prometheus scrape
+          # gap, and an OOM kill here silently stops every SLO alert.
+          memory: 192M
+    logging:
+      driver: json-file
+      options: { max-size: "5m", max-file: "2" }
+
+  # Probes endpoints that expose no metrics of their own. Today that means
+  # cap: it serves no /metrics, so it can never appear as a Prometheus target
+  # on its own and `up == 0` (ContainerDown) cannot cover it. See
+  # monitoring/blackbox/blackbox.yml for why a liveness check was not enough.
+  #
+  # `internal` only: it needs to reach cap, and nothing outside the monitoring
+  # network needs to reach it.
+  blackbox-exporter:
+    profiles: [monitoring]
+    image: prom/blackbox-exporter:v0.28.0@sha256:e753ff9f3fc458d02cca5eddab5a77e1c175eee484a8925ac7d524f04366c2fc
+    restart: unless-stopped
+    command: ["--config.file=/etc/blackbox/blackbox.yml"]
+    volumes:
+      - ./monitoring/blackbox/blackbox.yml:/etc/blackbox/blackbox.yml:ro
+    networks:
+      - internal
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 64M
+    logging:
+      driver: json-file
+      options: { max-size: "5m", max-file: "2" }
+
+  prometheus:
+    profiles: [monitoring]
+    image: prom/prometheus:v3.14.0@sha256:5ce7540c3c00ef4ab0c9d2c995c6a5b9c421f44b4a115d97a2c7af3b1c21cbb0
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/rules:/etc/prometheus/rules:ro
+      # Generated by scripts/setup-monitoring.sh, not committed: it carries the
+      # deployed Cap site key, which differs per installation and is rotated by
+      # scripts/create-cap-site-key.sh. Mounted as a DIRECTORY on purpose —
+      # Docker binds a single file by inode, so a regenerated file would be
+      # invisible to the running container (see DEPLOYMENT.md, "Recreating
+      # single containers by hand"), whereas a directory mount shows the new
+      # file immediately and Prometheus's file_sd picks it up without a reload.
+      - ./monitoring/prometheus/targets:/etc/prometheus/targets:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    # `edge` in addition to `internal`, for the same reason nginx-exporter is
+    # multi-homed: one scrape target lives on nginx. nginx-log-exporter shares
+    # nginx's network namespace (see its comment above), so its metrics
+    # endpoint is reachable only where nginx is. Publishes nothing beyond
+    # 127.0.0.1 either way.
+    networks:
+      - edge
+      - internal
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  alertmanager:
+    profiles: [monitoring]
+    image: prom/alertmanager:v0.34.0@sha256:690c7b525f4367aa91f73e2f91c632206d32e97c6384bdbf2fb7a861b420340d
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+    volumes:
+      # Rendered from alertmanager.yml.tmpl by scripts/setup-monitoring.sh —
+      # gitignored (contains SMTP_PASSWORD), unlike the template.
+      - ./monitoring/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    ports:
+      - "127.0.0.1:9093:9093"
+    # `edge`, not just `internal`: an `internal: true` network has no
+    # outbound route, and Alertmanager needs to reach the SMTP smarthost.
+    networks:
+      - edge
+      - internal
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+    logging:
+      driver: json-file
+      options: { max-size: "5m", max-file: "3" }
+
+  grafana:
+    profiles: [monitoring]
+    image: grafana/grafana-oss:13.0.2@sha256:5dad0df181cb644a14e13617b913b261a54f7d4fd4510721dba420929f35bea2
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_SERVER_ROOT_URL: http://localhost:3001
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # No phone-home to Grafana Labs from a self-hosted, internet-unreachable instance.
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3001:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - internal
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # One-shot: creates the least-privilege `monitoring` role (postgres-exporter)
+  # and the `glitchtip` role+database (GlitchTip below), using the same
+  # "safe to re-run" pattern for the app's own bucket setup.
+  monitoring-db-init:
+    profiles: [monitoring]
+    build:
+      context: ./infra/postgres
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        psql "postgresql://openexam:$$POSTGRES_PASSWORD@postgres:5432/openexam" \
+          -v monitoring_password="$$MONITORING_DB_PASSWORD" \
+          -v glitchtip_db_password="$$GLITCHTIP_DB_PASSWORD" \
+          -f /init-monitoring-roles.sql
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      MONITORING_DB_PASSWORD: ${MONITORING_DB_PASSWORD}
+      GLITCHTIP_DB_PASSWORD: ${GLITCHTIP_DB_PASSWORD}
+    volumes:
+      - ./monitoring/postgres/init-monitoring-roles.sql:/init-monitoring-roles.sql:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - internal
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 256M
+    logging:
+      driver: json-file
+      options: { max-size: "5m", max-file: "2" }
+
+  # GlitchTip (self-hosted, Sentry-protocol-compatible error tracker).
+  # Shares the app's own postgres/redis instances (dedicated database/role
+  # and dedicated Redis DB index) rather than bringing its own — see
+  # monitoring-db-init above and REDIS_URL's /1 suffix below.
+  glitchtip-migrate:
+    profiles: [monitoring]
+    image: glitchtip/glitchtip:6.2.6@sha256:a3d8eb1b36c1e1603d55ab32711ea3dd8115874742a781a57391a62a16e0dff6
+    restart: "no"
+    command: ["./manage.py", "migrate"]
+    environment: &glitchtip-env
+      DATABASE_URL: postgres://glitchtip:${GLITCHTIP_DB_PASSWORD}@postgres:5432/glitchtip
+      REDIS_URL: redis://redis:6379/1
+      SECRET_KEY: ${GLITCHTIP_SECRET_KEY}
+      # This instance is never internet-reachable (SSH-tunnel only, see
+      # docker-compose.prod.yml's header comment) — GLITCHTIP_DOMAIN is
+      # tunnel-relative, so links inside GlitchTip's own UI only resolve for
+      # someone already tunneled in. That's fine: nothing public depends on
+      # this value; browser error capture goes through app/api/monitoring/tunnel
+      # instead, over the internal network.
+      GLITCHTIP_DOMAIN: http://localhost:8001
+      ENABLE_OPEN_USER_REGISTRATION: "false"
+      # Single alerting path: infra alerts come from Alertmanager (above),
+      # not GlitchTip's own per-issue emails, so no EMAIL_URL/DEFAULT_FROM_EMAIL
+      # is configured here — see DEPLOYMENT.md's "Monitoring & Alerting"
+      # section for how to check GlitchTip's dashboard instead.
+    depends_on:
+      monitoring-db-init:
+        condition: service_completed_successfully
+    networks:
+      - internal
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  glitchtip-web:
+    profiles: [monitoring]
+    image: glitchtip/glitchtip:6.2.6@sha256:a3d8eb1b36c1e1603d55ab32711ea3dd8115874742a781a57391a62a16e0dff6
+    restart: unless-stopped
+    environment: *glitchtip-env
+    ports:
+      - "127.0.0.1:8001:8000"
+    depends_on:
+      glitchtip-migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    # `internal` only: web/ws-backend reach it over the internal network for
+    # error ingest (SENTRY_DSN in their own environment blocks above); the
+    # dashboard itself is reached only via the 127.0.0.1 tunnel above.
+    networks:
+      - internal
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+  glitchtip-worker:
+    profiles: [monitoring]
+    image: glitchtip/glitchtip:6.2.6@sha256:a3d8eb1b36c1e1603d55ab32711ea3dd8115874742a781a57391a62a16e0dff6
+    restart: unless-stopped
+    environment:
+      <<: *glitchtip-env
+      SERVER_ROLE: worker_with_beat
+    depends_on:
+      glitchtip-migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    networks:
+      - internal
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+networks:
+  edge:
+  internal:
+    internal: true
+
+volumes:
+  postgres_data:
+  # Redis 7's volume — no longer mounted; kept as the rollback path for the
+  # Valkey migration (scripts/valkey-migrate.sh). Remove once that is settled.
+  redis_data:
+  valkey_data:
+  certbot_www:
+  prometheus_data:
+  grafana_data:

@@ -1,0 +1,180 @@
+{
+  "title": "OpenExam Overview",
+  "uid": "openexam-overview",
+  "editable": true,
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "tags": ["openexam"],
+  "panels": [
+    {
+      "id": 9,
+      "title": "HTTP requests by status class (rate/5m)",
+      "description": "From the nginx access log (nginx-log-exporter). The 5xx series is what HighHttpErrorRate alerts on, at 1% of total.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum(rate(nginx_http_response_count_total{status=~\"2..\"}[5m]))", "legendFormat": "2xx", "refId": "A" },
+        { "expr": "sum(rate(nginx_http_response_count_total{status=~\"4..\"}[5m]))", "legendFormat": "4xx", "refId": "B" },
+        { "expr": "sum(rate(nginx_http_response_count_total{status=~\"5..\"}[5m]))", "legendFormat": "5xx", "refId": "C" }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "p95 HTTP latency by route",
+      "description": "SLO: 0.2s for api_* routes, 2s for page_*. Route labels come from the map block in nginx/nginx.conf.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": {}, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 0.2 }] } },
+        "overrides": []
+      },
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum by (le, route) (rate(nginx_http_response_time_seconds_hist_bucket[10m])))", "legendFormat": "{{route}}", "refId": "A" }
+      ]
+    },
+    {
+      "id": 11,
+      "title": "WebSocket answer-ack latency",
+      "description": "SLO: p95 < 0.1s (README.md). Only successful saves — rejections are cheap and would flatter the percentile.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": {}, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 0.1 }] } },
+        "overrides": []
+      },
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(openexam_ws_answer_ack_seconds_bucket{outcome=\"ok\"}[10m])))", "legendFormat": "p95", "refId": "A" },
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(openexam_ws_answer_ack_seconds_bucket{outcome=\"ok\"}[10m])))", "legendFormat": "p99", "refId": "B" }
+      ]
+    },
+    {
+      "id": 12,
+      "title": "WebSocket inbound queue wait (p99)",
+      "description": "How long frames wait for the room goroutine. Rising here with flat CPU is the queueing signature that leads the ack latency above.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": {}, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] } },
+        "overrides": []
+      },
+      "targets": [
+        { "expr": "histogram_quantile(0.99, sum by (le, type) (rate(openexam_ws_inbound_queue_seconds_bucket[5m])))", "legendFormat": "{{type}}", "refId": "A" }
+      ]
+    },
+    {
+      "id": 1,
+      "title": "Active exam rooms / connections",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "openexam_ws_active_rooms", "legendFormat": "rooms", "refId": "A" },
+        { "expr": "openexam_ws_active_connections", "legendFormat": "{{kind}}", "refId": "B" }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "ws-backend async queue full (per policy)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "rate(openexam_ws_async_queue_full_total[5m])",
+          "legendFormat": "{{policy}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "App error signals (rate/5m)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "rate(openexam_grading_retry_failures_total[5m])",
+          "legendFormat": "grading retry failures",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(openexam_rate_limit_rejections_total[5m])",
+          "legendFormat": "rate-limit rejections ({{reason}})",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(openexam_audit_log_write_failures_total[5m])",
+          "legendFormat": "audit log write failures",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Postgres connections used / max",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum(pg_stat_activity_count)", "legendFormat": "active", "refId": "A" },
+        { "expr": "pg_settings_max_connections", "legendFormat": "max", "refId": "B" }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Redis memory / connected clients",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "redis_memory_used_bytes", "legendFormat": "memory used", "refId": "A" },
+        { "expr": "redis_connected_clients", "legendFormat": "connected clients", "refId": "B" }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "nginx active connections",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "nginx_connections_active", "legendFormat": "active", "refId": "A" }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Host memory available (%)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "100 * node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Host disk free (%)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "100 * node_filesystem_avail_bytes{fstype!~\"tmpfs|overlay\"} / node_filesystem_size_bytes{fstype!~\"tmpfs|overlay\"}",
+          "legendFormat": "{{mountpoint}}",
+          "refId": "A"
+        }
+      ]
+    }
+  ]
+}

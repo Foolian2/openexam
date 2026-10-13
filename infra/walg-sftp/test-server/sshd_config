@@ -1,0 +1,14 @@
+Port 22
+HostKey /etc/ssh/ssh_host_ed25519_key
+PasswordAuthentication no
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+Subsystem sftp internal-sftp
+AllowUsers walg
+Match User walg
+    ChrootDirectory /srv/backups
+    ForceCommand internal-sftp -d /archive
+    AllowTcpForwarding local
+    PermitOpen 127.0.0.1:22
+    PermitTTY no
+    X11Forwarding no

@@ -1,0 +1,303 @@
+groups:
+  - name: openexam-infra
+    rules:
+      - alert: ContainerDown
+        expr: up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.job }} is down"
+          description: "Prometheus has failed to scrape {{ $labels.job }} ({{ $labels.instance }}) for at least 2 minutes."
+
+      # cap gates sign-up, sign-in and access-code join. ContainerDown cannot
+      # cover it: cap exposes no /metrics, so it is not a scrape target and has
+      # no `up` series. This watches the blackbox probe instead, which POSTs
+      # cap's challenge endpoint end to end (process + Redis + site key).
+      #
+      # On 2026-08-26 exactly this failed for 17 hours with nothing firing:
+      # cap's Redis client died permanently, cap kept answering `/`, so its
+      # healthcheck passed and Docker called the container healthy. `for: 2m`
+      # matches ContainerDown — two consecutive failed probes, so a single
+      # blip during a deploy stays quiet.
+      - alert: CapChallengeFailing
+        expr: probe_success{job="cap-probe"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "cap cannot issue a captcha challenge"
+          description: >
+            cap has failed to return a challenge for at least 2 minutes, so sign-up,
+            sign-in and access-code join are all blocked for every user. The container
+            may still report healthy — check `docker logs openexam-prod-cap-1` for
+            ERR_REDIS_CONNECTION_CLOSED, which means its Redis client died and will not
+            reconnect on its own; restarting the container clears that.
+
+      - alert: DiskSpaceLow
+        expr: |
+          node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes{fstype!~"tmpfs|overlay"} < 0.15
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Disk space low on {{ $labels.instance }} ({{ $labels.mountpoint }})"
+          description: "Less than 15% free on {{ $labels.mountpoint }} for 10 minutes."
+
+      - alert: PostgresConnectionsSaturated
+        expr: |
+          sum(pg_stat_activity_count) / pg_settings_max_connections > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Postgres connections above 80% of max_connections"
+          description: >
+            Current connection usage has been above 80% of max_connections for 5 minutes.
+            See docker-compose.prod.yml's DB_POOL_MAX / pool_max_conns comments for the
+            budget this is meant to stay under.
+
+      # Written by scripts/pitr-backup.sh on success only (node-exporter
+      # textfile collector) — staleness, not a failure exit code, is what's
+      # observable here: a hung/killed backup run never gets to write the
+      # metric at all, so "too old" is the only reliable signal.
+      - alert: WalGBackupStale
+        expr: |
+          (time() - openexam_backup_last_success_timestamp_seconds{job="wal_g"} > 90000)
+          and on() (openexam_pitr_enabled == 1)
+        labels:
+          severity: critical
+        annotations:
+          summary: "wal-g base backup hasn't succeeded in >25h"
+          description: "scripts/pitr-backup.sh's last recorded success is more than 25 hours old — check its cron log."
+
+      # Written by scripts/backup.sh itself on success (only when the
+      # monitoring stack's textfile-collector directory exists — see that
+      # script) — same staleness reasoning as above.
+      - alert: PgDumpBackupStale
+        expr: |
+          time() - openexam_backup_last_success_timestamp_seconds{job="pg_dump"} > 90000
+        labels:
+          severity: critical
+        annotations:
+          summary: "Daily pg_dump backup hasn't succeeded in >25h"
+          description: "scripts/backup.sh's last recorded success is more than 25 hours old — check /var/log/openexam-backup.log."
+
+      # Written by a cron one-liner installed by scripts/setup-monitoring.sh
+      # (openssl x509 -enddate against certs/live/openexam/fullchain.pem).
+      - alert: CertExpiringSoon
+        expr: openexam_cert_expiry_days < 14
+        labels:
+          severity: warning
+        annotations:
+          summary: "TLS certificate expires in under 14 days"
+          description: >
+            certs/live/openexam/fullchain.pem expires in {{ $value }} days. The cron-installed
+            certbot renewal (DEPLOYMENT.md) should have already renewed it — investigate why
+            it hasn't.
+
+      # nginx's stub_status module (what nginx-exporter scrapes) has no
+      # per-status-code breakdown — it cannot see 5xx vs 2xx, only
+      # connection/request counts. What it CAN measure is proximity to
+      # nginx's connection ceiling, a leading indicator that fires while
+      # requests are still succeeding.
+      # The error rate and latency it cannot see are covered by the
+      # openexam-slo group below, off the access-log exporter.
+      - alert: NginxConnectionsNearCapacity
+        expr: nginx_connections_active > 1600
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "nginx active connections approaching the documented capacity ceiling"
+          description: >
+            nginx_connections_active has been above 1600 for 5 minutes, close to the
+            connection ceiling. Consider whether this is expected exam-start load or a problem.
+
+  # Service-level objectives, not infrastructure health. Every threshold here
+  # is a target the load tests were run against: p95 WS ack < 100 ms, p95
+  # REST < 200 ms, error rate < 1% and a < 2 s exam-page-load target.
+  #
+  # The `for:` durations are deliberately long. Exam start is a thundering herd
+  # by design (a class of students joining within seconds of each other), and a
+  # brief latency spike there is expected behaviour, not an incident. What
+  # matters is a breach that persists.
+  - name: openexam-slo
+    rules:
+      - alert: HighHttpErrorRate
+        expr: |
+          sum(rate(nginx_http_response_count_total{status=~"5.."}[5m]))
+            /
+          sum(rate(nginx_http_response_count_total[5m]))
+            > 0.01
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Over 1% of HTTP requests are failing"
+          description: >
+            {{ $value | humanizePercentage }} of requests returned 5xx over the last 5 minutes,
+            against a 1% target. Break it down by route with
+            sum by (route) (rate(nginx_http_response_count_total{status=~"5.."}[5m])).
+
+      # HighHttpErrorRate above is a GLOBAL ratio, which is exactly why the
+      # 2026-08-26 cap outage could not have tripped it: /cap-api/ is a small
+      # slice of total traffic, so even at a 100% failure rate it never moved
+      # the all-routes denominator past 1%. This asks the same question per
+      # route, so a low-volume but critical path cannot hide behind healthy
+      # bulk traffic.
+      #
+      # The 10% threshold is deliberately looser than the global 1%: a single
+      # route's ratio is far noisier at low request counts. The `> 0.2` rate
+      # floor is what keeps that noise out — below roughly one failure every
+      # five seconds a route is not generating enough traffic for the ratio to
+      # mean anything, and a lone 500 on an idle route should not page anyone.
+      - alert: RouteErrorRateHigh
+        expr: |
+          (
+            sum by (route) (rate(nginx_http_response_count_total{status=~"5.."}[5m]))
+              /
+            sum by (route) (rate(nginx_http_response_count_total[5m]))
+          ) > 0.1
+          and
+          sum by (route) (rate(nginx_http_response_count_total{status=~"5.."}[5m])) > 0.2
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Route {{ $labels.route }} is failing {{ $value | humanizePercentage }} of requests"
+          description: >
+            {{ $labels.route }} returned 5xx for {{ $value | humanizePercentage }} of its
+            requests over the last 5 minutes. This fires per route, so it catches a single
+            broken dependency that the global HighHttpErrorRate ratio would average away.
+            Route labels are assigned by the `map $uri $route` block in nginx/nginx.conf.
+
+      - alert: RestLatencySLOBreach
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(nginx_http_response_time_seconds_hist_bucket{route=~"api_.*"}[10m]))
+          ) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 REST latency above the 200ms target"
+          description: >
+            p95 is {{ $value }}s, roughly the load level at which the box stops keeping up.
+            Check whether it is real growth
+            before assuming a regression.
+
+      - alert: PageLoadSLOBreach
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(nginx_http_response_time_seconds_hist_bucket{route=~"page_.*"}[10m]))
+          ) > 2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 page render above the 2s target"
+          description: >
+            p95 is {{ $value }}s. SSR does not degrade gracefully under load. Treat this as
+            approaching a cliff edge, not as a gentle slope.
+
+      - alert: WsAckLatencySLOBreach
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(openexam_ws_answer_ack_seconds_bucket{outcome="ok"}[10m]))
+          ) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 WebSocket answer-ack above the 100ms target"
+          description: >
+            p95 is {{ $value }}s against the 100ms target. Students' answers are still being
+            saved — this is the autosave feeling sluggish, not data loss. If
+            WsInboundQueueBacklog is firing too, the room goroutines are the bottleneck.
+
+      # Deliberately critical where the latency alerts are warnings. Queue wait
+      # is not "slower than we would like": it means the room goroutine is
+      # falling behind its own inbound stream. It compounds, and it does so
+      # while CPU still looks fine.
+      - alert: WsInboundQueueBacklog
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(openexam_ws_inbound_queue_seconds_bucket[5m]))
+          ) > 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "WebSocket frames are queueing behind the room goroutine"
+          description: >
+            p99 queue wait is {{ $value }}s. Frames are waiting on the single per-room
+            goroutine rather than being processed. Check openexam_ws_async_queue_full_total
+            for the I/O that is blocking it; adding CPU will not help.
+
+  # Application signals that were already exported and had nothing watching
+  # them. Each of these counters has existed since the metric was added; none
+  # of them could page anyone until now.
+  - name: openexam-app
+    rules:
+      # The worst-case bug this platform has: the exam is submitted, the
+      # student is gone, and the grades were never written.
+      # lib/grading/grade-with-retry.ts tries three times and then deliberately
+      # gives up rather than failing the request — it logs, increments this,
+      # and returns. Recovery needs a human, so this has to reach one.
+      - alert: GradingRetriesExhausted
+        expr: increase(openexam_grading_retry_failures_total[15m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Auto-grading gave up on a submitted session"
+          description: >
+            {{ $value }} session(s) exhausted every grading retry in the last 15 minutes and
+            are now submitted but ungraded. Find them in the web container logs
+            ("grading failed after retries", with sessionId). autoGradeSession is idempotent
+            and never clobbers manual grades, so re-running it is safe.
+
+      # An audit log with holes in it is worse than no audit log, because
+      # nothing about it looks wrong afterwards.
+      - alert: AuditLogWriteFailures
+        expr: increase(openexam_audit_log_write_failures_total[15m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Audit log writes are failing"
+          description: >
+            {{ $value }} audit write(s) failed to reach Postgres in the last 15 minutes
+            (lib/audit.ts). The individual events are in GlitchTip. The record is silently
+            incomplete for that window.
+
+      # lib/rate-limit.ts fails OPEN by default; the "redis_unavailable" label
+      # is emitted whenever a limiter can't reach Redis to make a decision,
+      # which includes limiters guarding an authentication step that refuse
+      # rather than allow. So this does not mean abuse — it means legitimate
+      # users are being locked out of signing in.
+      - alert: RateLimiterFailClosed
+        expr: rate(openexam_rate_limit_rejections_total{reason="redis_unavailable"}[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Rate limiter is refusing auth requests, likely a Redis outage"
+          description: >
+            Fail-closed rejections have been sustained for 5 minutes. These limiters guard
+            access-code and sign-in brute force, so they refuse rather than allow when Redis
+            is unreachable — check Redis before looking for an attacker.
+
+      # The fallback-to-inline path in internal/hub/async.go: a room's async
+      # queue is full, so blocking I/O runs on the room goroutine instead. This
+      # is the mechanism behind WsInboundQueueBacklog above, caught earlier.
+      - alert: WsAsyncQueueSaturated
+        expr: rate(openexam_ws_async_queue_full_total{policy="durable_inline"}[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Exam rooms are falling behind their background I/O"
+          description: >
+            Durable async jobs are hitting a full per-room queue and falling back to the
+            inline path, putting Postgres/Redis I/O back on the room goroutine. Expect ack
+            latency to follow.

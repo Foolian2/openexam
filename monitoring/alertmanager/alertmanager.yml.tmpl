@@ -1,0 +1,38 @@
+# Template, not the live config: Alertmanager has no env-var interpolation,
+# so scripts/setup-monitoring.sh renders this into
+# monitoring/alertmanager/alertmanager.yml (gitignored — it contains
+# SMTP_PASSWORD) via a small sed-based substitution (no envsubst dependency,
+# no eval). Values come from .env.prod's existing SMTP_* vars (lib/email.ts
+# uses the same ones for auth emails) plus ALERT_EMAIL_TO — no separate
+# secrets file for the monitoring stack.
+#
+# Single alerting path by design: GlitchTip's own built-in email
+# notifications are disabled (see DEPLOYMENT.md's "Monitoring & Alerting"
+# section) so every proactive alert email comes from here, not two places.
+
+global:
+  smtp_smarthost: "${SMTP_HOST}:${SMTP_PORT}"
+  smtp_from: "${SMTP_FROM}"
+  smtp_auth_username: "${SMTP_USER}"
+  smtp_auth_password: "${SMTP_PASSWORD}"
+  # Always require STARTTLS: Alertmanager has no implicit-TLS (465) mode, and
+  # nodemailer's SMTP_SECURE=false (port 587) means STARTTLS, not plaintext —
+  # mapping it straight across would send credentials unencrypted.
+  smtp_require_tls: true
+
+route:
+  receiver: email-default
+  group_by: ["alertname"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - matchers:
+        - severity = "critical"
+      repeat_interval: 1h
+
+receivers:
+  - name: email-default
+    email_configs:
+      - to: "${ALERT_EMAIL_TO}"
+        send_resolved: true

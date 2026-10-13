@@ -1,0 +1,415 @@
+name: Security
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  schedule:
+    # Weekly, independent of any PR activity — catches newly disclosed CVEs
+    # against code that hasn't changed.
+    - cron: "0 6 * * 1"
+  workflow_dispatch: {}
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+  security-events: write
+
+env:
+  # Same rationale as ci.yml: next build/prisma generate evaluate module-level
+  # env guards at import time even though nothing here talks to a real DB.
+  DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
+  REDIS_URL: redis://localhost:6379
+  S3_ACCESS_KEY: ci-placeholder
+  S3_SECRET_KEY: ci-placeholder
+  S3_BUCKET: ci-placeholder
+  S3_ENDPOINT: http://localhost:9000
+  S3_REGION: us-east-1
+  MATCHING_ID_SECRET: ci-placeholder-secret
+  BETTER_AUTH_SECRET: ci-placeholder-secret-value-32-chars-min
+  BETTER_AUTH_URL: http://localhost:3000
+
+jobs:
+  # --- S3: secret scanning -------------------------------------------------
+  secrets:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      # Pinned by SHA; bump deliberately after reviewing the diff.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # v3 crashes trying to upload a SARIF artifact even on a clean scan
+          # (no report file exists yet, so the upload call throws on an
+          # undefined rootDirectory). Disable the upload; findings still show
+          # in the job log and PR comments.
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+
+  # --- S1: dependency review (PR-only, GitHub-native advisory gate) -------
+  dependency-review:
+    name: Dependency review
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    # This repository does not currently have the GitHub security features
+    # required by dependency-review-action. Keep the check informative until
+    # they are enabled instead of blocking every pull request.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Dependency Review
+        # Requires GitHub Dependency Graph + Advanced Security to be enabled.
+        # Skip gracefully until those features are turned on for this repo.
+        continue-on-error: true
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5
+        with:
+          fail-on-severity: high
+
+  # --- S1: npm dependency audit --------------------------------------------
+  pnpm-audit:
+    name: pnpm audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        # v6.1.0 is the floor for pnpm 12: every earlier release bootstraps
+        # with pnpm 11, whose self-installer expects the target version to
+        # expose `bin/pnpm.mjs`. pnpm 12 replaced that with a native launcher
+        # (`pnpm`) backed by platform-specific `@pnpm/exe.*` packages, so
+        # bootstrapping 12.3.4 from 11 installed a pnpm it could not run and
+        # aborted with ERR_PNPM_BROKEN_PNPM_INSTALL. v6.1.0 adds a native
+        # pnpm 12 bootstrap and picks it based on the resolved version.
+        #
+        # No `version:` input on purpose — the action reads the pnpm version
+        # from package.json's `packageManager` field. Pinning it in both places
+        # let them drift (the pnpm 12.3.4 bump left this at 11.21.0), and
+        # action-setup hard-fails on a mismatch with "Multiple versions of pnpm
+        # specified" before a single step runs.
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: pnpm audit (prod, high+critical)
+        run: pnpm audit --prod --audit-level=high
+
+  # --- S1: Go vulnerability scan (also first CI coverage for ws-backend) --
+  # Fail-closed: baseline verified clean on the pinned 1.26.9 toolchain,
+  # which carries the go1.26.9 stdlib fixes (crypto/tls, net/http and
+  # net/textproto: GO-2026-6603 to GO-2026-6617) on top of the go1.26.6
+  # ones (GO-2026-6218, GO-2026-6090, GO-2026-6089, GO-2026-6088,
+  # GO-2026-5972, GO-2026-5026). See SECURITY.md.
+  go-vulncheck:
+    name: Go build, test, vulncheck (ws-backend)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ws-backend
+    steps:
+      # Pinned by SHA; bump deliberately after reviewing the diff.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: "1.26.9"
+          cache-dependency-path: ws-backend/go.sum
+
+      - name: go build
+        run: go build ./...
+
+      # -race: the hub deliberately keeps each room's client maps and session
+      # state lock-free by confining them to one goroutine, so a stray call
+      # from another goroutine is a data race rather than a compile error.
+      # Nothing but the race detector catches that — a concurrent map
+      # read/write can escalate into an unrecoverable fatal error and take
+      # down every exam on the instance.
+      - name: go test
+        run: go test -race ./...
+
+      - name: govulncheck
+        # Pinned by release tag, not @latest: a re-pointed mutable ref would
+        # make the scan's result (and its exit status) depend on whatever
+        # upstream pushed most recently.
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          govulncheck ./...
+
+  # --- S2: container image scanning ----------------------------------------
+  # Fail-closed: both base images scan 0 CRITICAL/HIGH, so a
+  # scan finding blocks the merge. See SECURITY.md.
+  container-scan:
+    name: Container image scan (trivy)
+    runs-on: ubuntu-latest
+    # Job-level override of the workflow-level permissions (job-level replaces,
+    # not merges): actions: write is required for the type=gha buildx cache
+    # (docker/build-push-action's cache-to uploads through the Actions cache
+    # API via GITHUB_TOKEN).
+    permissions:
+      contents: read
+      security-events: write
+      actions: write
+    strategy:
+      # A failed scan in one leg must not cancel the others: with the default
+      # fail-fast a broken mirror on `web` silently skipped the ws-backend
+      # scan, which is exactly what a security gate should never do.
+      fail-fast: false
+      matrix:
+        include:
+          - name: web
+            dockerfile: Dockerfile
+            context: .
+            target: runner
+          - name: ws-backend
+            dockerfile: ws-backend/Dockerfile
+            context: ws-backend
+            target: ""
+    steps:
+      # Pinned by SHA; bump deliberately after reviewing the diff.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # The default `docker` driver cannot export the type=gha cache below;
+      # a docker-container builder can.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.target }}
+          push: false
+          load: true
+          tags: openexam-${{ matrix.name }}:scan
+          build-args: |
+            NEXT_PUBLIC_BASE_URL=http://localhost:3000
+          # type=gha buildx cache: repeat runs restore every unchanged layer,
+          # so the multi-stage Next.js build only re-executes the steps whose
+          # inputs changed.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Trivy scan
+        # v0.35.0 is the first known-safe immutable release after the 2026
+        # supply-chain compromise affecting older trivy-action tags. Pinned
+        # by SHA; exit-code 1 makes CRITICAL/HIGH findings block the merge.
+        #
+        # TRIVY_DB_REPOSITORY: trivy's default vuln-DB mirror
+        # (mirror.gcr.io/aquasec/trivy-db) has been returning 404s, which
+        # killed every scan before it started. Pin the DB to the upstream
+        # GHCR registry instead.
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-db:2
+        with:
+          image-ref: openexam-${{ matrix.name }}:scan
+          severity: "CRITICAL,HIGH"
+          format: "sarif"
+          # Without this, trivy-action unsets TRIVY_SEVERITY whenever the
+          # format is sarif ("Building SARIF report with all severities"), so
+          # exit-code 1 fired on ANY finding — e.g. an UNKNOWN-severity tzdata
+          # DLA in the distroless base failed the ws-backend gate.
+          limit-severities-for-sarif: true
+          output: "trivy-${{ matrix.name }}.sarif"
+          exit-code: "1"
+
+      - name: Upload SARIF
+        # Requires GitHub Advanced Security — skip gracefully when not enabled.
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@24c7eb380a2dc368f2d129e4c65e51d172983a1e # v4
+        with:
+          sarif_file: "trivy-${{ matrix.name }}.sarif"
+          category: "trivy-${{ matrix.name }}"
+
+  # --- S3: third-party image scanning --------------------------------------
+  # container-scan only sees images this repo builds; this covers every
+  # image the stack pulls.
+  #
+  # Advisory, unlike container-scan: findings accumulate against a digest pin
+  # purely through time passing, so failing closed would block every unrelated
+  # PR on the age of the pins. The CVE load tracks the pinned version, not the
+  # digest, so treat a rising count as a prompt to check for a newer version.
+  third-party-image-scan:
+    name: Third-party image scan (trivy)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+      # Pinned by SHA; bump deliberately after reviewing the diff.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # Digest-pinned entries only, which is exactly the set that is pulled:
+      # the locally built openexam-* images carry a mutable ${IMAGE_TAG} tag
+      # instead and are covered by container-scan above.
+      - name: Collect pulled images
+        id: collect
+        run: |
+          grep -oP '^\s*image:\s*\K\S+' docker-compose.prod.yml \
+            | grep '@sha256:' | sort -u > images.txt
+          echo "Scanning $(wc -l < images.txt) images:"
+          cat images.txt
+
+      - name: Trivy scan
+        env:
+          # Same 404-ing default mirror as container-scan; see its comment.
+          TRIVY_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-db:2
+        run: |
+          # Pinned by digest like everything else this workflow runs.
+          TRIVY="ghcr.io/aquasecurity/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969"
+          docker pull -q "$TRIVY"
+          status=0
+          printf '%-8s %-8s %s\n' CRITICAL HIGH IMAGE
+          while read -r img; do
+            # Don't let one unpullable image end the step: under `bash -e` a
+            # failed pull aborted the loop, so the images sorting after it
+            # were never reported and the log showed a docker error instead of
+            # the scan table (this is how the MinIO repos going 401-only on
+            # Docker Hub hid every image after `minio/mc`). Record it and
+            # carry on — status=1 still fails the job.
+            if ! docker pull -q "$img" >/dev/null; then
+              printf '%-8s %-8s %s\n' PULL FAIL "${img%%@*}"
+              status=1
+              continue
+            fi
+            # Same reasoning for the scan itself: a trivy failure truncates
+            # out.json, which then crashes the parser below and takes the
+            # remaining images with it.
+            if ! docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -e TRIVY_DB_REPOSITORY \
+              "$TRIVY" image --quiet --scanners vuln \
+              --severity CRITICAL,HIGH --format json "$img" > out.json; then
+              printf '%-8s %-8s %s\n' SCAN FAIL "${img%%@*}"
+              status=1
+              continue
+            fi
+            python3 - "$img" <<'EOF'
+          import json, sys, collections
+          counts = collections.Counter()
+          with open('out.json') as fh:
+              data = json.load(fh)
+          for result in data.get('Results') or []:
+              for vuln in result.get('Vulnerabilities') or []:
+                  counts[vuln['Severity']] += 1
+          print('%-8d %-8d %s' % (counts['CRITICAL'], counts['HIGH'], sys.argv[1].split('@')[0]))
+          EOF
+          done < images.txt
+          exit $status
+
+  # --- S4: SAST (rule packs + audit-derived custom rules) -----------------
+  # Results surface in the job log and the SARIF upload (see SECURITY.md).
+  #
+  # Advisory (continue-on-error). PR and push scans are baselined, so only
+  # findings a change introduces are reported as blocking.
+  semgrep:
+    name: Semgrep SAST
+    # container: jobs are only supported on Linux runners.
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    container:
+      # Pinned by version + digest so a re-published `latest` tag can never
+      # change what runs in CI.
+      image: semgrep/semgrep:1.172.0@sha256:65dcd4408adda7c183a6b4550cb1e9b19f7f627a6fbb7e0559bd466bedc44d7b
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # --baseline-commit below needs the baseline in local history, and
+          # the default shallow clone fetches only the tip.
+          fetch-depth: 0
+
+      # The custom rules in .github/semgrep.yml are YAML patterns with no
+      # coverage in the Vitest or Playwright suites, and they fail silently: an
+      # edit that stops a pattern matching still "scans clean". This asserts the
+      # origin rule still fires on unchecked handlers and stays quiet on a
+      # checked one, against throwaway fixtures in a temp tree, using the exact
+      # semgrep this container pins (on PATH as `semgrep`, so the test needs no
+      # SEMGREP override). Advisory for now, like the rest of this job.
+      - name: Custom rule regression test (origin check)
+        run: python3 .github/tests/test_semgrep_origin.py
+
+      # `semgrep ci` exits 1 on ANY blocking finding, and this repo currently
+      # carries a backlog of them, so without a baseline the job is red no
+      # matter what a given change does — which is why it has been advisory.
+      # Baselining makes it answer the useful question instead: did THIS
+      # change introduce something new?
+      #
+      # No baseline on schedule/workflow_dispatch on purpose: a weekly run is
+      # exactly where the whole standing backlog should still be reported.
+      - name: Resolve baseline commit
+        id: baseline
+        run: |
+          case "${{ github.event_name }}" in
+            pull_request) candidate="${{ github.event.pull_request.base.sha }}" ;;
+            push)         candidate="${{ github.event.before }}" ;;
+            *)            candidate="" ;;
+          esac
+          # actions/checkout marks the workspace safe only in a TEMPORARY git
+          # global config that it restores when it finishes, so by this step
+          # git refuses the repo for dubious ownership and every command here
+          # fails. Without this line the lookup below always falls through to
+          # "no baseline" — which is silent, because the fallback is a
+          # legitimate branch.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
+
+          # A branch's first push reports an all-zero `before`, and a
+          # force-push can name a commit that no longer exists — either would
+          # abort the scan rather than skip the baseline. stderr is kept, not
+          # discarded: hiding it is what made the ownership failure above look
+          # like an ordinary missing commit.
+          if [ -n "$candidate" ] && git cat-file -e "${candidate}^{commit}"; then
+            echo "commit=$candidate" >> "$GITHUB_OUTPUT"
+            echo "Baseline resolved: $candidate"
+          else
+            echo "commit=" >> "$GITHUB_OUTPUT"
+            echo "No usable baseline for ${{ github.event_name }}; scanning in full."
+          fi
+
+      # Fixture-based regression test for the custom admin rule: it
+      # materializes known-vulnerable and known-guarded admin routes in a
+      # temporary tree and asserts the rule fires on exactly the vulnerable
+      # ones. Catches rule edits that silently stop matching, which the
+      # diff-based scan below cannot see. Runs inside the pinned semgrep
+      # container, so `semgrep` on PATH is the CI-pinned version.
+      - name: Custom-rule regression tests
+        run: python3 .github/tests/test_semgrep_admin.py
+        env:
+          SEMGREP: semgrep
+
+      - name: Semgrep
+        run: |
+          set -- --config p/ci --config p/typescript --config p/golang \
+                 --config p/rust --config .github/semgrep.yml \
+                 --sarif --output semgrep.sarif
+          if [ -n "$BASELINE" ]; then
+            echo "Baselining against $BASELINE — only new findings block."
+            set -- "$@" --baseline-commit "$BASELINE"
+          fi
+          semgrep ci "$@"
+        env:
+          SEMGREP_RULES: ""
+          BASELINE: ${{ steps.baseline.outputs.commit }}
+
+      - name: Upload SARIF
+        if: always()
+        # Requires GitHub Advanced Security — skip gracefully when not enabled.
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@24c7eb380a2dc368f2d129e4c65e51d172983a1e # v4
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep

@@ -1,0 +1,61 @@
+# Opt-in overlay. Use only after keys, host-key verification, and recovery
+# acknowledgement. Selecting this overlay enables WAL archiving.
+services:
+  postgres:
+    environment:
+      WALG_SSH_PREFIX: ssh://walg-sftp${WALG_SSH_PATH:?Set WALG_SSH_PATH}
+      SSH_PORT: "2222"
+      SSH_USERNAME: ${WALG_SSH_USER:?Set WALG_SSH_USER}
+      SSH_PRIVATE_KEY_PATH: /run/secrets/walg_ssh_key
+      WALG_LIBSODIUM_KEY_PATH: /run/secrets/walg_libsodium_key
+      WALG_LIBSODIUM_KEY_TRANSFORM: hex
+    command: [postgres, -c, archive_mode=on, -c, "archive_command=wal-g wal-push %p", -c, archive_timeout=60, -c, io_method=worker, -c, io_workers=3]
+    secrets:
+      - walg_ssh_key
+      - walg_libsodium_key
+    # Started alongside postgres, but never waited on: an unreachable backup
+    # host must not keep the database down. archive_command fails and
+    # Postgres retries, keeping WAL in pg_wal until the tunnel recovers.
+    depends_on:
+      walg-sftp:
+        condition: service_started
+  walg-sftp:
+    build: ./infra/walg-sftp
+    restart: unless-stopped
+    environment:
+      WALG_SSH_HOST: ${WALG_SSH_HOST:?Set WALG_SSH_HOST}
+      WALG_SSH_USER: ${WALG_SSH_USER:?Set WALG_SSH_USER}
+      WALG_SSH_PORT: ${WALG_SSH_PORT:-22}
+    secrets:
+      - walg_ssh_key
+      - walg_known_hosts
+    networks:
+      - internal
+      - backup-egress
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      # End to end: the remote sshd must answer through the forward.
+      test: ["CMD", "/usr/local/bin/tunnel-healthcheck"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+      start_interval: 3s
+    logging:
+      driver: json-file
+      options: {max-size: "5m", max-file: "3"}
+networks:
+  backup-egress:
+secrets:
+  walg_ssh_key:
+    file: ./secrets/walg_ssh_key
+  walg_libsodium_key:
+    file: ./secrets/walg_libsodium_key
+  walg_known_hosts:
+    file: ./secrets/walg_known_hosts

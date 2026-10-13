@@ -1,0 +1,1 @@
+ALTER TABLE "ExamSession" ADD COLUMN "lockedAt" TIMESTAMP(3);
