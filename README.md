@@ -36,7 +36,10 @@ under the AGPL-3.0.
 [Get started](#get-started) · [Documentation](#table-of-contents) ·
 [Contributing](#contributing)**
 
-https://github.com/user-attachments/assets/ad5af5bd-2ebd-4381-8c80-f1b291df67c9
+
+
+https://github.com/user-attachments/assets/2bc8a349-ad9e-4867-bd3a-4efe0b22710c
+
 
 ---
 
