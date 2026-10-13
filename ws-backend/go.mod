@@ -5,7 +5,7 @@ go 1.25.0
 toolchain go1.26.9
 
 require (
-	github.com/alicebob/miniredis/v2 v2.39.0
+	github.com/alicebob/miniredis/v2 v2.40.0
 	github.com/coder/websocket v1.8.15
 	github.com/getsentry/sentry-go v0.49.0
 	github.com/jackc/pgx/v5 v5.11.0
