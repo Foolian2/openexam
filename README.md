@@ -620,7 +620,7 @@ refused in production.
 Valkey, Go lint + tests, and a production build.
 **Security** (`.github/workflows/security.yml`, push, PR, weekly): dependency review, `pnpm
 audit`, govulncheck, Trivy image scans, Semgrep (with custom rules for missing auth, role and
-`Origin` checks). `pr-agent.yml` adds an AI review comment on each PR.
+`Origin` checks).
 
 ---
 
