@@ -75,12 +75,16 @@ export interface MonitorSession {
   // reason the student was blocked — see lib/seb-guard.ts.
   sebIntegrityFlagged?: boolean
   sebIntegrityReason?: string | null
+  // How often another login or browser tab took this session over (lib/exam-device.ts).
+  // Advisory: an SEB relaunch after a crash is a new login too.
+  deviceReplacedCount?: number
 }
 
 /**
  * The only shape a monitor:update patch may take. The known keys mirror the
  * keys ws-backend publishes (room.go's broadcastMonitorUpdate call sites and
- * main.go's BEK attestation notify); `lastIntegrityEvent` is patch-only and
+ * main.go's BEK attestation notify), plus `deviceReplacedCount` from the
+ * takeover patch lib/exam-device.ts publishes; `lastIntegrityEvent` is patch-only and
  * never appears on MonitorSession itself.
  */
 export type MonitorSessionPatch = Partial<
@@ -94,6 +98,7 @@ export type MonitorSessionPatch = Partial<
     | "namApplied"
     | "sebIntegrityFlagged"
     | "sebIntegrityReason"
+    | "deviceReplacedCount"
   >
 > & { lastIntegrityEvent?: LastIntegrityEvent }
 
@@ -107,6 +112,7 @@ const MONITOR_PATCH_KEYS_LIST = [
   "namApplied",
   "sebIntegrityFlagged",
   "sebIntegrityReason",
+  "deviceReplacedCount",
 ] as const satisfies readonly (keyof MonitorSessionPatch)[]
 
 /** Keys the live monitor may merge from a WS patch; anything else is dropped. */
@@ -136,4 +142,23 @@ export function mergeKnownPatchKeys(
     if (MONITOR_PATCH_KEYS.has(key) && value !== undefined) known[key] = value
   }
   return known as MonitorSessionPatch
+}
+
+/**
+ * Shallow-merges a known patch into a session (or into a pending patch).
+ * `deviceReplacedCount` only ever grows server-side, so a patch delayed in
+ * transit must not lower the count already shown.
+ */
+export function applyMonitorPatch<
+  S extends { deviceReplacedCount?: number | null },
+>(target: S, patch: MonitorSessionPatch): S {
+  const merged = { ...target, ...patch }
+  if (
+    typeof target.deviceReplacedCount === "number" &&
+    typeof patch.deviceReplacedCount === "number" &&
+    patch.deviceReplacedCount < target.deviceReplacedCount
+  ) {
+    merged.deviceReplacedCount = target.deviceReplacedCount
+  }
+  return merged
 }

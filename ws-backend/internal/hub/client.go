@@ -51,9 +51,15 @@ type Client struct {
 	kind      ClientKind
 	userID    string
 	sessionID string // student only
-	send      chan outboundItem
-	closed    chan struct{}
-	closeOnce sync.Once
+	// authSessionID is the Better Auth session row id this student socket
+	// authenticated with, compared on SESSION_REPLACED (lib/exam-device.ts).
+	authSessionID string
+	// deviceID is the public per-tab identifier supplied at the handshake.
+	claimVersion int // monotonic takeover count read during authorization
+	deviceID     string
+	send         chan outboundItem
+	closed       chan struct{}
+	closeOnce    sync.Once
 	// wg tracks the write pump goroutine so a connection's handler can wait
 	// for its close frame to be flushed before returning.
 	wg  sync.WaitGroup
@@ -74,9 +80,16 @@ func newClient(conn *websocket.Conn, kind ClientKind, userID, sessionID string, 
 
 // NewStudentClient wraps an accepted WebSocket connection for a student's
 // exam-taking session.
-func NewStudentClient(conn *websocket.Conn, userID, sessionID string, log *slog.Logger) *Client {
-	return newClient(conn, KindStudent, userID, sessionID, log)
+func NewStudentClient(conn *websocket.Conn, userID, sessionID, authSessionID string, log *slog.Logger) *Client {
+	c := newClient(conn, KindStudent, userID, sessionID, log)
+	c.authSessionID = authSessionID
+	return c
 }
+
+// SetDeviceID records the validated deviceId query parameter before the
+// client is registered with a room. Existing callers without a claimed tab
+// continue to use the empty value.
+func (c *Client) SetDeviceID(deviceID string) { c.deviceID = deviceID }
 
 // NewMonitorClient wraps an accepted WebSocket connection for a teacher's
 // live monitor view of one exam.

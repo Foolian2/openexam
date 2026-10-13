@@ -40,6 +40,7 @@ export async function GET(request: NextRequest, { params }: Params) {
       lastSeenAt: true,
       sebIntegrityFlaggedAt: true,
       sebIntegrityReason: true,
+      deviceReplacedCount: true,
       user: { select: { id: true, name: true, email: true } },
       _count: { select: { answers: true, integrityEvents: true } },
     },
@@ -71,6 +72,7 @@ export async function GET(request: NextRequest, { params }: Params) {
       // the flag identically whether it arrived by REST, snapshot, or patch.
       sebIntegrityFlagged: s.sebIntegrityFlaggedAt !== null,
       sebIntegrityReason: s.sebIntegrityReason,
+      deviceReplacedCount: s.deviceReplacedCount,
     })),
     serverNow: new Date().toISOString(),
   })

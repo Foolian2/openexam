@@ -412,6 +412,18 @@ model ExamSession {
   sebIntegrityFlaggedAt DateTime?
   sebIntegrityReason    String?
 
+  // Better Auth session id of the login currently allowed to work on this
+  // exam session; the newest login to claim it wins (lib/exam-device.ts).
+  // Null means nothing claimed yet and allows any login of the owner.
+  // The takeover count is also a monotonic claim version for WS events.
+  // A takeover is advisory for the teacher, not proof of a second person:
+  // every SEB launch mints a fresh login, so a relaunch also counts.
+  activeAuthSessionId String?
+  // Browser tab identity, independent of the shared authentication cookie.
+  activeDeviceId      String?
+  deviceReplacedCount Int       @default(0)
+  deviceReplacedAt    DateTime?
+
   answers         Answer[]
   bookmarks       QuestionBookmark[]
   answerFiles     AnswerFile[]

@@ -65,7 +65,10 @@ beforeEach(() => {
   vi.clearAllMocks()
   vi.useFakeTimers({ toFake: ["Date"] })
   vi.setSystemTime(NOW)
-  m.requireSession.mockResolvedValue({ user: { id: "student" } })
+  m.requireSession.mockResolvedValue({
+    user: { id: "student" },
+    session: { id: "auth-1" },
+  })
   m.requireStudent.mockResolvedValue({ user: { id: "student" } })
   m.limit.mockResolvedValue({ allowed: true })
   m.guard.mockResolvedValue({ ok: true })

@@ -65,6 +65,14 @@ func (f *fakeRoomStore) GetAnswerSaveState(ctx context.Context, examID, sessionI
 	return &store.AnswerSaveState{SessionStatus: "IN_PROGRESS", ExamStatus: "ACTIVE"}, nil
 }
 
+func (f *fakeRoomStore) WithAnswerSaveState(ctx context.Context, examID, sessionID string, receivedAt time.Time, use func(*store.AnswerSaveState) error) error {
+	state, err := f.GetAnswerSaveState(ctx, examID, sessionID, receivedAt)
+	if err != nil {
+		return err
+	}
+	return use(state)
+}
+
 func (f *fakeRoomStore) SaveIntegrityEvent(ctx context.Context, sessionID, kind, detail string, clientTime time.Time) error {
 	f.mu.Lock()
 	if f.err != nil {
@@ -158,7 +166,8 @@ type testServer struct {
 	integritySeed atomic.Int64
 	// status overrides the ExamSession status the register handler presents;
 	// defaults to IN_PROGRESS.
-	status string
+	status       string
+	claimVersion atomic.Int64
 }
 
 func newTestServer(t *testing.T, room *Room) *testServer {
@@ -171,13 +180,14 @@ func newTestServer(t *testing.T, room *Room) *testServer {
 		if err != nil {
 			return
 		}
-		c := NewStudentClient(conn, "user-"+sessionID, sessionID, nil)
+		c := NewStudentClient(conn, "user-"+sessionID, sessionID, "auth-"+sessionID, nil)
+		c.SetDeviceID("tab-" + sessionID)
 		status := ts.status
 		if status == "" {
 			status = "IN_PROGRESS"
 		}
 		room.RegisterStudent(c, &store.ExamSessionAuth{
-			ID: sessionID, Status: status,
+			ID: sessionID, Status: status, DeviceReplacedCount: int(ts.claimVersion.Load()),
 			IntegrityEventCount: int(ts.integritySeed.Load()),
 			Questions:           []store.QuestionAuth{{ID: "q-1", Type: "FREE_TEXT"}},
 		})
@@ -436,11 +446,73 @@ func TestRoom_SecondConnectionEvictsFirst(t *testing.T) {
 	if env.Type != protocol.TypeExamControl {
 		t.Fatalf("got type %q, want exam:control (SESSION_REPLACED)", env.Type)
 	}
+	var ctrl protocol.ControlEventData
+	_ = json.Unmarshal(env.Data, &ctrl)
+	if ctrl.Action != protocol.ActionSessionReplaced {
+		t.Fatalf("got action %q, want %q", ctrl.Action, protocol.ActionSessionReplaced)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if _, _, err := first.Read(ctx); err == nil {
 		t.Fatal("expected the evicted connection to be closed")
+	}
+}
+
+func TestRoom_ControlSessionReplaced_ClosesOtherLogin(t *testing.T) {
+	room, _ := newTestRoom(t, newFakeRoomStore(), &fakeBuffer{}, &fakeFlusher{}, time.Minute)
+	ts := newTestServer(t, room)
+
+	student := dial(t, wsURL(ts.srv.URL, "/ws/exam/x?session=sess-1"))
+	readEnvelope(t, student) // timer:sync
+
+	// Another login claimed the session (lib/exam-device.ts); this socket
+	// authenticated as auth-sess-1, so it is the replaced one.
+	room.control <- redisControlMessage{Type: protocol.ActionSessionReplaced, SessionID: "sess-1", ActiveAuthSessionID: "auth-other", ActiveDeviceID: "tab-other", DeviceReplacedCount: 1}
+
+	env := readEnvelope(t, student)
+	if env.Type != protocol.TypeExamControl {
+		t.Fatalf("got type %q, want exam:control", env.Type)
+	}
+	var ctrl protocol.ControlEventData
+	_ = json.Unmarshal(env.Data, &ctrl)
+	if ctrl.Action != protocol.ActionSessionReplaced {
+		t.Fatalf("got action %q, want %q", ctrl.Action, protocol.ActionSessionReplaced)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, _, err := student.Read(ctx); err == nil {
+		t.Fatal("expected the replaced connection to be closed")
+	}
+}
+
+func TestRoom_ControlSessionReplaced_KeepsClaimingLogin(t *testing.T) {
+	room, _ := newTestRoom(t, newFakeRoomStore(), &fakeBuffer{}, &fakeFlusher{}, time.Minute)
+	ts := newTestServer(t, room)
+
+	student := dial(t, wsURL(ts.srv.URL, "/ws/exam/x?session=sess-1"))
+	readEnvelope(t, student) // timer:sync
+
+	// The claiming login connected before its own takeover event arrived.
+	room.control <- redisControlMessage{Type: protocol.ActionSessionReplaced, SessionID: "sess-1", ActiveAuthSessionID: "auth-sess-1", ActiveDeviceID: "tab-sess-1", DeviceReplacedCount: 1}
+	// Same channel, so it is handled after the event above: the first thing
+	// this socket sees must be the lock, not a SESSION_REPLACED.
+	room.control <- redisControlMessage{Type: protocol.ActionSessionLocked, SessionID: "sess-1"}
+
+	env := readEnvelope(t, student)
+	var ctrl protocol.ControlEventData
+	_ = json.Unmarshal(env.Data, &ctrl)
+	if ctrl.Action != protocol.ActionSessionLocked {
+		t.Fatalf("got action %q, want %q", ctrl.Action, protocol.ActionSessionLocked)
+	}
+
+	ping, _ := protocol.Encode(protocol.TypePing, "", nil)
+	if err := student.Write(context.Background(), ws.MessageText, ping); err != nil {
+		t.Fatalf("write ping: %v", err)
+	}
+	if env := readEnvelope(t, student); env.Type != protocol.TypePong {
+		t.Fatalf("got type %q, want pong on a still-open connection", env.Type)
 	}
 }
 
@@ -1276,7 +1348,7 @@ func TestClient_CloseNow_ConcurrentSafe(t *testing.T) {
 		if err != nil {
 			return
 		}
-		c := NewStudentClient(conn, "user-1", "sess-1", nil)
+		c := NewStudentClient(conn, "user-1", "sess-1", "auth-1", nil)
 		clientCh <- c
 		<-c.Closed() // hold the handler open until closeNow fires
 	}))
@@ -1393,5 +1465,115 @@ func TestRoom_AnswerSave_KeepsPerSessionOrder(t *testing.T) {
 		if env := readEnvelope(t, student); env.ID != want {
 			t.Fatalf("got ack %q, want %q", env.ID, want)
 		}
+	}
+}
+
+func TestRoom_ControlSessionReplaced_IgnoresDelayedOlderClaim(t *testing.T) {
+	room, _ := newTestRoom(t, newFakeRoomStore(), &fakeBuffer{}, &fakeFlusher{}, time.Minute)
+	ts := newTestServer(t, room)
+	ts.claimVersion.Store(3)
+	student := dial(t, wsURL(ts.srv.URL, "/ws/exam/x?session=sess-1"))
+	readEnvelope(t, student)
+	// This event was published by a claim that preceded this socket's owner.
+	room.control <- redisControlMessage{Type: protocol.ActionSessionReplaced, SessionID: "sess-1", ActiveAuthSessionID: "old-owner", ActiveDeviceID: "old-tab", DeviceReplacedCount: 2}
+	room.control <- redisControlMessage{Type: protocol.ActionSessionLocked, SessionID: "sess-1"}
+	env := readEnvelope(t, student)
+	var ctrl protocol.ControlEventData
+	_ = json.Unmarshal(env.Data, &ctrl)
+	if ctrl.Action != protocol.ActionSessionLocked {
+		t.Fatalf("stale takeover closed the newest owner: %s", ctrl.Action)
+	}
+}
+
+func TestRoom_AnswerSave_RejectsReplacedOwnerWithoutControl(t *testing.T) {
+	for _, tc := range []struct{ name, auth, tab string }{
+		{"another login", "auth-other", "tab-other"},
+		{"another tab", "auth-sess-1", "tab-other"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rs := newFakeRoomStore()
+			buf := &fakeBuffer{}
+			room, _ := newTestRoom(t, rs, buf, &fakeFlusher{}, time.Minute)
+			ts := newTestServer(t, room)
+			a := dial(t, wsURL(ts.srv.URL, "/ws/exam/x?session=sess-1"))
+			readEnvelope(t, a)
+			rs.mu.Lock()
+			rs.answerState = &store.AnswerSaveState{SessionStatus: "IN_PROGRESS", ExamStatus: "ACTIVE", ActiveAuthSessionID: &tc.auth, ActiveDeviceID: &tc.tab}
+			rs.mu.Unlock()
+			msg, _ := protocol.Encode(protocol.TypeAnswerSave, "old-save", protocol.AnswerSaveData{QuestionID: "q-1", Content: json.RawMessage(`{"type":"FREE_TEXT","text":"after takeover"}`)})
+			if err := a.Write(context.Background(), ws.MessageText, msg); err != nil {
+				t.Fatal(err)
+			}
+			env := readEnvelope(t, a)
+			var answerErr protocol.AnswerErrorData
+			_ = json.Unmarshal(env.Data, &answerErr)
+			if env.Type != protocol.TypeAnswerError || answerErr.Code != "SESSION_REPLACED" {
+				t.Fatalf("got %s %s, want SESSION_REPLACED", env.Type, env.Data)
+			}
+			// A denied save closes the socket even when the advisory Redis
+			// event never arrived, so it stops writing integrity events.
+			env = readEnvelope(t, a)
+			var ctrl protocol.ControlEventData
+			_ = json.Unmarshal(env.Data, &ctrl)
+			if env.Type != protocol.TypeExamControl || ctrl.Action != protocol.ActionSessionReplaced {
+				t.Fatalf("got %s %s, want takeover notice", env.Type, env.Data)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if _, _, err := a.Read(ctx); err == nil {
+				t.Fatal("expected the replaced connection to be closed")
+			}
+			buf.mu.Lock()
+			defer buf.mu.Unlock()
+			if len(buf.saved) != 0 {
+				t.Fatal("replaced answer reached Redis")
+			}
+		})
+	}
+}
+
+func TestRoom_ControlSessionReplaced_ClosesAnotherTabOfSameLogin(t *testing.T) {
+	room, _ := newTestRoom(t, newFakeRoomStore(), &fakeBuffer{}, &fakeFlusher{}, time.Minute)
+	ts := newTestServer(t, room)
+	student := dial(t, wsURL(ts.srv.URL, "/ws/exam/x?session=sess-1"))
+	readEnvelope(t, student)
+	room.control <- redisControlMessage{Type: protocol.ActionSessionReplaced, SessionID: "sess-1", ActiveAuthSessionID: "auth-sess-1", ActiveDeviceID: "other-tab", DeviceReplacedCount: 1}
+	env := readEnvelope(t, student)
+	var ctrl protocol.ControlEventData
+	_ = json.Unmarshal(env.Data, &ctrl)
+	if env.Type != protocol.TypeExamControl || ctrl.Action != protocol.ActionSessionReplaced {
+		t.Fatalf("got %s %s, want takeover notice", env.Type, env.Data)
+	}
+}
+
+func TestRoom_OlderClaimDoesNotEvictNewerOwner(t *testing.T) {
+	room, _ := newTestRoom(t, newFakeRoomStore(), &fakeBuffer{}, &fakeFlusher{}, time.Minute)
+	ts := newTestServer(t, room)
+	ts.claimVersion.Store(2)
+	owner := dial(t, wsURL(ts.srv.URL, "/ws/exam/x?session=sess-1"))
+	readEnvelope(t, owner) // timer:sync
+
+	// A socket authorized before the owner's claim registers late, e.g.
+	// after a slow SEB handshake. It must be refused, not evict the owner.
+	ts.claimVersion.Store(1)
+	stale := dial(t, wsURL(ts.srv.URL, "/ws/exam/x?session=sess-1"))
+	env := readEnvelope(t, stale)
+	var ctrl protocol.ControlEventData
+	_ = json.Unmarshal(env.Data, &ctrl)
+	if env.Type != protocol.TypeExamControl || ctrl.Action != protocol.ActionSessionReplaced {
+		t.Fatalf("got %s %s, want takeover notice for the stale socket", env.Type, env.Data)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, _, err := stale.Read(ctx); err == nil {
+		t.Fatal("expected the stale connection to be closed")
+	}
+
+	ping, _ := protocol.Encode(protocol.TypePing, "", nil)
+	if err := owner.Write(context.Background(), ws.MessageText, ping); err != nil {
+		t.Fatalf("write ping: %v", err)
+	}
+	if env := readEnvelope(t, owner); env.Type != protocol.TypePong {
+		t.Fatalf("got type %q, want pong on the owner's still-open connection", env.Type)
 	}
 }

@@ -31,6 +31,7 @@ export type ApiErrorCode =
   | "EXAM_ENDED"
   | "EMAIL_TAKEN"
   | "CAPTCHA_INVALID"
+  | "SESSION_REPLACED"
 
 export function apiError(
   code: ApiErrorCode,
@@ -67,6 +68,18 @@ export function validationError(message: string): NextResponse {
 /** 409 — the resource's current state forbids the transition. */
 export function conflict(message: string): NextResponse {
   return apiError("CONFLICT", message, 409)
+}
+
+/**
+ * 409 — a newer login has taken over this exam session (lib/exam-device.ts).
+ * The exam runner branches on the code to show its takeover screen.
+ */
+export function sessionReplaced(): NextResponse {
+  return apiError(
+    "SESSION_REPLACED",
+    "Diese Prüfung wurde auf einem anderen Gerät geöffnet.",
+    409
+  )
 }
 
 /**

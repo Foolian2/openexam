@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"runtime"
 	"strings"
 	"syscall"
@@ -27,6 +28,7 @@ import (
 	"openexam/ws-backend/internal/config"
 	"openexam/ws-backend/internal/hub"
 	"openexam/ws-backend/internal/metrics"
+	"openexam/ws-backend/internal/protocol"
 	"openexam/ws-backend/internal/ratelimit"
 	"openexam/ws-backend/internal/seb"
 	"openexam/ws-backend/internal/store"
@@ -245,6 +247,11 @@ func staffRoleAllowed(role string) bool { return role == "TEACHER" || role == "A
 func studentHandler(cfg *config.Config, log *slog.Logger, st *store.Store, h *hub.Hub, rdb *redis.Client) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		sessionID := r.PathValue("sessionId")
+		deviceID, validDeviceID := requestedDeviceID(r)
+		if !validDeviceID {
+			http.Error(w, "invalid deviceId", http.StatusBadRequest)
+			return
+		}
 
 		sess, err := auth.ValidateRequest(r.Context(), r, cfg.BetterAuthSecret, st)
 		if err != nil || !studentRoleAllowed(sess.Role) {
@@ -288,6 +295,15 @@ func studentHandler(cfg *config.Config, log *slog.Logger, st *store.Store, h *hu
 			return
 		}
 
+		// Another login owns this session (lib/exam-device.ts). Refused
+		// after Accept rather than with an HTTP status, which a browser
+		// WebSocket never exposes: the client needs the control event to
+		// stop reconnecting and show its takeover screen.
+		if !activeDeviceAllowed(examSession.ActiveAuthSessionID, examSession.ActiveDeviceID, sess.ID, deviceID) {
+			sessionReplacedClose(r.Context(), conn, sessionID)
+			return
+		}
+
 		if examSession.SebRequired {
 			// Browsers cannot set custom headers on a WebSocket handshake, so
 			// the SEB tokens travel as the connection's first message instead
@@ -299,9 +315,24 @@ func studentHandler(cfg *config.Config, log *slog.Logger, st *store.Store, h *hu
 			if !sebHandshake(r.Context(), cfg, log, st, h, conn, r, examSession, sess.UserID, ua, ip) {
 				return
 			}
+			// The handshake can take up to sebAuthTimeout, and a takeover
+			// committed meanwhile publishes its control event before this
+			// socket is in the room to receive it. Re-read ownership so
+			// the room registers this socket with a current claim version.
+			fresh, err := st.GetExamSessionAuth(r.Context(), sessionID)
+			if err != nil || !studentJoinAllowed(fresh.Status, fresh.ExamStatus) {
+				_ = conn.Close(websocket.StatusPolicyViolation, "session not active")
+				return
+			}
+			if !activeDeviceAllowed(fresh.ActiveAuthSessionID, fresh.ActiveDeviceID, sess.ID, deviceID) {
+				sessionReplacedClose(r.Context(), conn, sessionID)
+				return
+			}
+			examSession = fresh
 		}
 
-		client := hub.NewStudentClient(conn, sess.UserID, sessionID, log)
+		client := hub.NewStudentClient(conn, sess.UserID, sessionID, sess.ID, log)
+		client.SetDeviceID(deviceID)
 		room := h.JoinRoom(examSession.ExamID, client, examSession)
 		if room == nil {
 			// e.g. hub shutdown raced the join; nothing can serve this
@@ -564,6 +595,39 @@ func sebHandshake(ctx context.Context, cfg *config.Config, log *slog.Logger, st 
 	return true
 }
 
+var deviceIDPattern = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+// The tab identifier is public but must have the UUID shape the client sends.
+func requestedDeviceID(r *http.Request) (string, bool) {
+	values, present := r.URL.Query()["deviceId"]
+	if !present {
+		return "", true
+	}
+	if len(values) != 1 || !deviceIDPattern.MatchString(values[0]) {
+		return "", false
+	}
+	return values[0], true
+}
+
+// A missing claim dimension is allowed for legacy rows. Once a claim exists,
+// both the authenticated login and browser tab must match it.
+func activeDeviceAllowed(activeAuth, activeDevice *string, authSessionID, deviceID string) bool {
+	return (activeAuth == nil || *activeAuth == "" || *activeAuth == authSessionID) &&
+		(activeDevice == nil || *activeDevice == "" || *activeDevice == deviceID)
+}
+
+// sessionReplacedClose tells a connection whose login no longer owns the
+// session that it was replaced, then closes it.
+func sessionReplacedClose(ctx context.Context, conn *websocket.Conn, sessionID string) {
+	writeCtx, cancel := context.WithTimeout(ctx, sebWriteTimeout)
+	defer cancel()
+	msg, err := protocol.Encode(protocol.TypeExamControl, "", protocol.ControlEventData{Action: protocol.ActionSessionReplaced, SessionID: sessionID})
+	if err == nil {
+		_ = conn.Write(writeCtx, websocket.MessageText, msg)
+	}
+	_ = conn.Close(websocket.StatusNormalClosure, "replaced by another login")
+}
+
 // sebHandshakeFailed writes the rejection envelope and closes the socket.
 // Write errors are ignored: the close below tears the connection down
 // either way, and a stalled peer is exactly the case the write timeout
@@ -727,7 +791,7 @@ const (
 )
 
 type sessionLookup interface {
-	LookupSession(ctx context.Context, token string) (userID, role string, expiresAt time.Time, err error)
+	LookupSession(ctx context.Context, token string) (sessionID, userID, role string, expiresAt time.Time, err error)
 }
 
 const (
@@ -808,7 +872,7 @@ func watchSessionAuthorization(ctx context.Context, conn *websocket.Conn, sessio
 		}
 		checkCtx, cancel := context.WithTimeout(ctx, sessionLookupTimeout)
 		defer cancel()
-		userID, role, expiresAt, err := sessions.LookupSession(checkCtx, sess.Token)
+		_, userID, role, expiresAt, err := sessions.LookupSession(checkCtx, sess.Token)
 		if err != nil {
 			return time.Time{}, false, !errors.Is(err, store.ErrNotFound)
 		}

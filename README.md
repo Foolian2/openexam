@@ -433,9 +433,20 @@ sessions still open 5 minutes after their deadline, so no exam is left `IN_PROGR
 (`DEADLINE_SWEEPER_ENABLED`).
 
 **Save authorization:** before ws-backend acknowledges an answer, it checks the session's state in
-Postgres. Saves made while the teacher had the session locked, after submission, or after the exam
-closed are rejected, not buffered. The check runs off the room goroutine, so one slow query
-doesn't hold up a whole class.
+Postgres, including the active login and browser tab. Saves from a replaced tab, while the teacher
+had the session locked, after submission, or after the exam closed are rejected before buffering.
+The session row remains locked through the Redis write, so a takeover cannot race past the check.
+This runs off the room goroutine, so one slow query doesn't hold up a whole class.
+
+**Device takeover:** opening an exam in another login or tab claims that session. The previous
+tab shows a takeover screen with **Hier weiterarbeiten** to reclaim it, and the teacher sees a
+replacement counter. A tab keeps its identity across reloads and navigations; a duplicated tab
+that inherits it through copied sessionStorage gets a new one, because a Web Lock shows the identity
+is still held by a live tab. Unsaved answers are buffered per tab, so a replaced tab's late edits
+never overwrite the owner's. REST writes check ownership inside their transaction, and every
+WebSocket save checks it in Postgres, so a missed Redis notification cannot authorize old saves.
+A locked session can establish ownership while remaining read-only. The counter is advisory:
+relaunching SEB after a crash can also replace a login.
 
 | Failure | Effect |
 |---------|--------|
