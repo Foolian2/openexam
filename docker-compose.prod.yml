@@ -87,8 +87,12 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "1"
-          memory: 256M
+          cpus: "2"
+          # 256M was exhausted at ~3200 concurrent students: nginx workers were
+          # OOM-killed and their WebSockets dropped (benchmark 2026-10-13,
+          # nginx.conf worker_processes). 1G leaves headroom to find the
+          # application's own ceiling instead of this container's.
+          memory: 1G
           pids: 512
 
   web:
@@ -175,6 +179,13 @@ services:
       # sees every host core, so on a 16-core host that's a real risk. At
       # 6 replicas, 5 each (30) plus ws-backend's 30 stays well under a stock
       # max_connections of 100 (the measured plateau at load was 31 total).
+      #
+      # Re-measured 2026-10-13 under the combined benchmark (answer saves +
+      # integrity events + 100 SSR renders/s): the six web replicas held 4-7
+      # connections each right after load (36 total, more than DB_POOL_MAX
+      # alone accounts for), and Postgres peaked at 86-93 of
+      # max_connections=100 with ws-backend at pool_max_conns=30. Budget for
+      # ~40 web connections, not 30.
       DB_POOL_MAX: "5"
       REDIS_URL: redis://redis:6379
       # Exam-start admission queue (lib/exam-admission.ts). Both are optional
@@ -306,11 +317,18 @@ services:
     build:
       context: ./ws-backend
     restart: unless-stopped
+    # ws-backend's SIGTERM path (main.go) allows 15 s for the HTTP server plus
+    # 20 s for the hub to drain in-flight saves and flush buffered answers.
+    # Docker's default 10 s would SIGKILL it mid-flush on every recreate.
+    stop_grace_period: 40s
     deploy:
       resources:
         limits:
           cpus: "2"
-          memory: 512M
+          # 512M was OOM-killed at 4000 concurrent students (benchmark
+          # 2026-10-13); resident memory grew 295 -> 383 MiB between 2400 and
+          # 3200 students.
+          memory: 1536M
           pids: 256
     environment:
       PORT: 8080
@@ -324,7 +342,11 @@ services:
       # still fell back to offloadDurable's inline path under the capacity
       # benchmark's integrity-load scenario, leaving a 61s tail even after
       # that fix. 30 stays under max_connections=100 alongside the web
-      # tier's 6 x 5 = 30 (docker-compose.prod.yml's web service).
+      # tier's 6 x 5 = 30 (docker-compose.prod.yml's web service) — in
+      # practice ~36-40, see the web service's DB_POOL_MAX comment. Do NOT
+      # raise this without raising max_connections: at 50 the 2026-10-13
+      # benchmark reached 98/100 and the web tier started failing with "too
+      # many clients"; it also did not improve answer-ack latency.
       DATABASE_URL: postgresql://openexam:${POSTGRES_PASSWORD}@postgres:5432/openexam?pool_max_conns=30
       REDIS_URL: redis://redis:6379
       BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET}
@@ -412,6 +434,16 @@ services:
       - io_method=worker
       - -c
       - io_workers=3
+      # Default is 100. The 2026-10-13 benchmark reached 86-93 of 100 with the
+      # web tier (~36-40) + ws-backend (30) + exporters/GlitchTip under a
+      # combined answer-save + integrity + SSR load, and 98/100 with a 50-conn
+      # ws-backend pool, at which point the web tier failed with "too many
+      # clients". 150 keeps ~50 slots free. Changing this needs a Postgres
+      # restart (the container is recreated on the next `docker compose up`);
+      # each backend adds a few MB, well inside the 2304M limit (1.2 GB seen
+      # at load).
+      - -c
+      - max_connections=150
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
