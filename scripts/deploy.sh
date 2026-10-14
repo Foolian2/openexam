@@ -53,6 +53,20 @@ if [ "${#bad_legal[@]}" -gt 0 ]; then
   exit 1
 fi
 
+# Same reasoning for the school email domains: lib/env.ts refuses to boot on
+# a malformed domain or one listed as both student and teacher. The check is
+# shared with the install wizard (oe_school_domains_issue in common.sh).
+# shellcheck source=scripts/lib/env-file.sh
+source scripts/lib/env-file.sh
+# shellcheck source=scripts/cli/common.sh
+source scripts/cli/common.sh
+if ! domain_issue=$(oe_school_domains_issue \
+  "$(env_get SCHOOL_STUDENT_DOMAINS .env.prod)" "$(env_get SCHOOL_TEACHER_DOMAINS .env.prod)"); then
+  echo "ERROR: fix SCHOOL_STUDENT_DOMAINS / SCHOOL_TEACHER_DOMAINS in .env.prod first:"
+  echo "         $domain_issue"
+  exit 1
+fi
+
 # The redis service now mounts valkey_data, not redis_data (see its comment in
 # docker-compose.prod.yml). Deploying before scripts/valkey-migrate.sh has run
 # would start Valkey on a fresh, empty volume — dropping the Cap site key

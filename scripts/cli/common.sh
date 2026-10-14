@@ -97,6 +97,42 @@ oe_valid_tenant() {
   return 1
 }
 
+# Mirrors parseDomainList in lib/school-domains.ts: split on commas, trim,
+# lowercase, drop one leading @, skip empty entries. One domain per line.
+oe_parse_domain_list() {
+  printf '%s\n' "$1" | tr ',' '\n' | tr 'A-Z' 'a-z' |
+    sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^@//' -e '/^$/d'
+}
+
+# Mirrors schoolDomainsIssue in lib/school-domains.ts, which stops the web
+# tier from booting: every entry must be a domain, and none may be both a
+# student and a teacher domain. Prints the same message and returns 1.
+oe_school_domains_issue() {
+  local student teacher d
+  student=$(oe_parse_domain_list "$1")
+  teacher=$(oe_parse_domain_list "$2")
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    if ! printf '%s\n' "$d" | grep -Eq '^[a-z0-9-]+(\.[a-z0-9-]+)+$'; then
+      echo "\"$d\" is not a valid domain"
+      return 1
+    fi
+  done <<EOF
+$student
+$teacher
+EOF
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    if printf '%s\n' "$teacher" | grep -Fxq -- "$d"; then
+      echo "\"$d\" is listed in both SCHOOL_STUDENT_DOMAINS and SCHOOL_TEACHER_DOMAINS"
+      return 1
+    fi
+  done <<EOF
+$student
+EOF
+  return 0
+}
+
 oe_valid_name() {
   [ "${#1}" -ge 2 ] && return 0
   echo "At least 2 characters."
