@@ -66,6 +66,7 @@ export default async function AdminSettingsPage({ searchParams }: Props) {
         name={session.user.name}
         email={session.user.email}
         callbackURL="/dashboard/admin/settings"
+        emailChange={(await searchParams).emailChange}
         takesExams={false}
       />
       <SettingsSection
