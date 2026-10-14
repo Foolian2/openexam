@@ -579,6 +579,10 @@ cmd_install() {
   ui_kv "School" "$LEGAL_CONTROLLER_NAME"
   ui_kv "Email (SMTP)" "$( [ "$SMTP_ENABLED" -eq 1 ] && echo "$SMTP_HOST:$SMTP_PORT" || echo "off")"
   ui_kv "Microsoft login" "$( [ "$MS_ENABLED" -eq 1 ] && echo "on (tenant $MICROSOFT_TENANT_ID)" || echo "off")"
+  if [ "$MS_ENABLED" -eq 1 ]; then
+    ui_kv "  Student domains" "${SCHOOL_STUDENT_DOMAINS:-none}"
+    ui_kv "  Teacher domains" "${SCHOOL_TEACHER_DOMAINS:-none}"
+  fi
   ui_kv "Monitoring" "$MONITORING"
   ui_kv "Offsite backups" "$( [ "$offsite" = yes ] && echo "$OFF_TYPE, encrypted" || echo "off")"
   ui_kv "First admin" "$( [ "$teacher" = yes ] && echo "$TEACHER_EMAIL ($TEACHER_ROLE)" || echo "none")"
