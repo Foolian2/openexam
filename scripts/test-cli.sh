@@ -79,6 +79,18 @@ check "email ok" oe_valid_email a.b@example-school.ch
 if oe_valid_email nope >/dev/null; then fail "email rejects 'nope'"; else pass "email rejects 'nope'"; fi
 check "tenant GUID ok" oe_valid_tenant 0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b
 if oe_valid_tenant common >/dev/null; then fail "tenant rejects common"; else pass "tenant rejects common"; fi
+# Mirrors __tests__/school-domains.test.ts (schoolDomainsIssue).
+check "school domains ok" oe_school_domains_issue stud.example-school.ch " Example-School.ch , @staff.example.org"
+check "school domains: one list empty" oe_school_domains_issue "" example-school.ch
+check "school domains: empty entries skipped" oe_school_domains_issue "a.ch,,b.ch," c.ch
+for pair in "not a domain|" "x|" "https://a.ch|" "a.ch|a.ch" "A.ch|@a.CH" "a.ch,b.ch|c.ch, b.ch"; do
+  if oe_school_domains_issue "${pair%%|*}" "${pair#*|}" >/dev/null; then
+    fail "school domains reject '$pair'"
+  else
+    pass "school domains reject '$pair'"
+  fi
+done
+check "school domains message" [ "$(oe_school_domains_issue a.ch A.CH || true)" = '"a.ch" is listed in both SCHOOL_STUDENT_DOMAINS and SCHOOL_TEACHER_DOMAINS' ]
 check "port ok" oe_valid_port 587
 if oe_valid_port 70000 >/dev/null; then fail "port rejects 70000"; else pass "port rejects 70000"; fi
 

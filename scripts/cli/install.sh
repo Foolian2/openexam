@@ -126,12 +126,22 @@ oe_ask_microsoft() {
   fi
   ui_ask MICROSOFT_TENANT_ID "Tenant ID (GUID)" "${MICROSOFT_TENANT_ID:-}" oe_valid_tenant "MICROSOFT_TENANT_ID"
   ui_dim "Microsoft logins are only accepted for these email domains (comma-separated)."
+  local domain_issue
   while :; do
     ui_ask_optional SCHOOL_STUDENT_DOMAINS "Student email domains" "${SCHOOL_STUDENT_DOMAINS:-}"
     ui_ask_optional SCHOOL_TEACHER_DOMAINS "Teacher email domains" "${SCHOOL_TEACHER_DOMAINS:-}"
-    [ -n "$SCHOOL_STUDENT_DOMAINS$SCHOOL_TEACHER_DOMAINS" ] && break
-    ui_interactive || ui_die "Microsoft login needs SCHOOL_STUDENT_DOMAINS and/or SCHOOL_TEACHER_DOMAINS"
-    ui_warn "Set at least one domain, or every Microsoft login is rejected."
+    if [ -z "$SCHOOL_STUDENT_DOMAINS$SCHOOL_TEACHER_DOMAINS" ]; then
+      ui_interactive || ui_die "Microsoft login needs SCHOOL_STUDENT_DOMAINS and/or SCHOOL_TEACHER_DOMAINS"
+      ui_warn "Set at least one domain, or every Microsoft login is rejected."
+      continue
+    fi
+    # The web tier refuses to boot on these (lib/env.ts), so catch them here.
+    domain_issue=$(oe_school_domains_issue "$SCHOOL_STUDENT_DOMAINS" "$SCHOOL_TEACHER_DOMAINS") && break
+    ui_interactive || ui_die "School email domains: $domain_issue"
+    ui_warn "$domain_issue — enter both lists again."
+    # Cleared so the re-ask doesn't offer the rejected value as its default,
+    # which an empty answer could not otherwise remove.
+    SCHOOL_STUDENT_DOMAINS="" SCHOOL_TEACHER_DOMAINS=""
   done
 }
 
