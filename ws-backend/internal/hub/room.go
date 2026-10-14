@@ -21,7 +21,9 @@ import (
 // debounces per question (~2 saves/s), so a 60-token burst (a reconnect
 // replay of a long exam) plus a 10/s refill is generous headroom; an abusive
 // client that floods the socket is throttled to 10/s instead of stalling the
-// room behind its Redis round trips on every keystroke.
+// room behind its Redis round trips on every keystroke. The bucket lives in
+// sessionLimits, so reconnecting does not refill it; a real client never
+// drains it, and any gap over 6 s refills it anyway.
 const (
 	answerSaveBurst         = 60.0
 	answerSaveRefillRate    = 10.0 // tokens per second
@@ -38,23 +40,31 @@ type sessionState struct {
 	effectiveEndTime *time.Time
 	questionTypes    map[string]string
 
+	// Shared with every connection of this session for the room's lifetime;
+	// see Room.limits.
+	*sessionLimits
+}
+
+// sessionLimits is the per-session state that must survive reconnects:
+// handleUnregister drops sessionState, and if the rate limits went with it,
+// a client could refill its budget by reconnecting. Single-goroutine owned
+// like sessionState.
+type sessionLimits struct {
 	// Integrity-event bookkeeping. lastIntegrityAt rate-limits per kind so a
 	// buggy/hostile client can't flood the room or Postgres; integrityCount
 	// keeps growing past maxStoredIntegrityEvents even once we stop
 	// persisting individual rows, so the teacher-visible counter stays
-	// accurate. Both are seeded/carried over in handleRegister so a
-	// reconnect doesn't reset them.
+	// accurate.
 	lastIntegrityAt map[string]time.Time
 	integrityCount  int
 
-	// Answer-save token bucket (single-goroutine owned like the rest of
-	// sessionState).
+	// Answer-save token bucket.
 	saveTokens     float64
 	lastSaveRefill time.Time
 }
 
 // allowAnswerSave is a token bucket; call it only from the room goroutine.
-func (st *sessionState) allowAnswerSave(now time.Time) bool {
+func (st *sessionLimits) allowAnswerSave(now time.Time) bool {
 	if st.saveTokens < answerSaveBurst {
 		elapsed := now.Sub(st.lastSaveRefill).Seconds()
 		if elapsed > 0 {
@@ -137,6 +147,9 @@ type Room struct {
 	students map[string]*Client // keyed by ExamSession.id
 	monitors map[*Client]struct{}
 	state    map[string]*sessionState // keyed by ExamSession.id
+	// limits outlives state: it is kept across disconnects so a reconnect
+	// can't reset rate limits, and freed with the room (idle teardown).
+	limits map[string]*sessionLimits // keyed by ExamSession.id
 
 	register   chan registration
 	unregister chan *Client
@@ -189,6 +202,7 @@ func newRoom(examID string, st RoomStore, buf AnswerBuffer, fl ExamFlusher, publ
 		students:     make(map[string]*Client),
 		monitors:     make(map[*Client]struct{}),
 		state:        make(map[string]*sessionState),
+		limits:       make(map[string]*sessionLimits),
 		register:     make(chan registration),
 		unregister:   make(chan *Client),
 		inbound:      make(chan inboundMsg, 256),
@@ -381,19 +395,21 @@ func (r *Room) handleRegister(ctx context.Context, reg registration) {
 	st := &sessionState{
 		submitted: reg.sessionAuth.Status == "SUBMITTED" || reg.sessionAuth.Status == "AUTO_SUBMITTED",
 	}
-	// Integrity bookkeeping has to survive reconnects (an expected event
-	// mid-exam) and room restarts, otherwise the teacher-visible counter
-	// jumps back to 1, the per-session row cap resets, and the per-kind
-	// rate limit is bypassed once per reconnect. The DB count is the
-	// durable floor; a live count already past maxStoredIntegrityEvents is
-	// higher than the DB's and wins.
-	st.integrityCount = reg.sessionAuth.IntegrityEventCount
-	if prev, ok := r.state[c.sessionID]; ok && prev != nil {
-		if prev.integrityCount > st.integrityCount {
-			st.integrityCount = prev.integrityCount
-		}
-		st.lastIntegrityAt = prev.lastIntegrityAt
+	// Rate limits and integrity bookkeeping have to survive reconnects (an
+	// expected event mid-exam) and room restarts, otherwise the
+	// teacher-visible counter jumps back, the per-session row cap resets, and
+	// the answer-save and per-kind integrity limits are refilled once per
+	// reconnect. r.limits keeps them for the room's lifetime, whether the old
+	// connection was replaced or had already disconnected. The DB count is
+	// the durable floor; a live count already past maxStoredIntegrityEvents
+	// (or ahead of a write still in flight) is higher than the DB's and wins.
+	lim := r.limits[c.sessionID]
+	if lim == nil {
+		lim = &sessionLimits{}
+		r.limits[c.sessionID] = lim
 	}
+	lim.integrityCount = max(lim.integrityCount, reg.sessionAuth.IntegrityEventCount)
+	st.sessionLimits = lim
 	st.questionTypes = make(map[string]string, len(reg.sessionAuth.Questions))
 	for _, question := range reg.sessionAuth.Questions {
 		st.questionTypes[question.ID] = question.Type

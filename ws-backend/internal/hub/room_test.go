@@ -159,11 +159,16 @@ type testServer struct {
 	// status overrides the ExamSession status the register handler presents;
 	// defaults to IN_PROGRESS.
 	status string
+	// studentGone receives once per student connection after its handler
+	// returns. Register/unregister are unbuffered sends to the room, so by
+	// then the room has processed the unregister and a redial takes the
+	// fresh-register path, not the replace path.
+	studentGone chan struct{}
 }
 
 func newTestServer(t *testing.T, room *Room) *testServer {
 	t.Helper()
-	ts := &testServer{room: room}
+	ts := &testServer{room: room, studentGone: make(chan struct{}, 16)}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws/exam/", func(w http.ResponseWriter, r *http.Request) {
 		sessionID := r.URL.Query().Get("session")
@@ -182,6 +187,10 @@ func newTestServer(t *testing.T, room *Room) *testServer {
 			Questions:           []store.QuestionAuth{{ID: "q-1", Type: "FREE_TEXT"}},
 		})
 		runConn(room, c)
+		select {
+		case ts.studentGone <- struct{}{}:
+		default:
+		}
 	})
 	mux.HandleFunc("/ws/monitor/", func(w http.ResponseWriter, r *http.Request) {
 		conn, err := ws.Accept(w, r, &ws.AcceptOptions{InsecureSkipVerify: true})
@@ -1266,6 +1275,134 @@ func TestRoom_AnswerSave_RateLimited(t *testing.T) {
 	defer buf.mu.Unlock()
 	if len(buf.saved) != acks {
 		t.Fatalf("got %d buffered saves, want %d", len(buf.saved), acks)
+	}
+}
+
+// reconnectStudent closes conn, waits until the room has unregistered it,
+// and dials the same session again.
+func reconnectStudent(t *testing.T, ts *testServer, conn *ws.Conn, sessionID string) *ws.Conn {
+	t.Helper()
+	if err := conn.Close(ws.StatusNormalClosure, ""); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	select {
+	case <-ts.studentGone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("student connection was never unregistered")
+	}
+	next := dial(t, wsURL(ts.srv.URL, "/ws/exam/x?session="+sessionID))
+	readEnvelope(t, next) // timer:sync
+	return next
+}
+
+// saveRoundTrips sends n answer saves one at a time and counts the replies.
+func saveRoundTrips(t *testing.T, conn *ws.Conn, n int) (acks, rateLimited int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		msg, _ := protocol.Encode(protocol.TypeAnswerSave, "", protocol.AnswerSaveData{QuestionID: "q-1", Content: json.RawMessage(`{"type":"FREE_TEXT","text":"hi"}`)})
+		if err := conn.Write(context.Background(), ws.MessageText, msg); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+		env := readEnvelope(t, conn)
+		switch env.Type {
+		case protocol.TypeAnswerAck:
+			acks++
+		case protocol.TypeAnswerError:
+			var data protocol.AnswerErrorData
+			_ = json.Unmarshal(env.Data, &data)
+			if data.Code == "RATE_LIMITED" {
+				rateLimited++
+			}
+		}
+	}
+	return acks, rateLimited
+}
+
+func TestRoom_AnswerSave_RateLimitSurvivesReconnect(t *testing.T) {
+	room, _ := newTestRoom(t, newFakeRoomStore(), &fakeBuffer{}, &fakeFlusher{}, time.Minute)
+	ts := newTestServer(t, room)
+
+	student := dial(t, wsURL(ts.srv.URL, "/ws/exam/x?session=sess-1"))
+	readEnvelope(t, student) // timer:sync
+	if _, rateLimited := saveRoundTrips(t, student, 70); rateLimited == 0 {
+		t.Fatal("bucket was never drained")
+	}
+
+	// A fresh bucket would accept all 20 (burst 60); a preserved one only
+	// what the 10/s refill adds during the round trips.
+	student = reconnectStudent(t, ts, student, "sess-1")
+	acks, rateLimited := saveRoundTrips(t, student, 20)
+	if rateLimited == 0 {
+		t.Fatalf("reconnect refilled the save budget: %d/20 acked, none rate-limited", acks)
+	}
+}
+
+func TestRoom_IntegrityEvent_RateLimitSurvivesReconnect(t *testing.T) {
+	rs := newFakeRoomStore()
+	rs.snapshot = []store.MonitorSession{{ID: "sess-1"}}
+	room, _ := newTestRoom(t, rs, &fakeBuffer{}, &fakeFlusher{}, time.Minute)
+	ts := newTestServer(t, room)
+
+	send := func(conn *ws.Conn) {
+		msg, _ := protocol.Encode(protocol.TypeIntegrityEvent, "", protocol.IntegrityEventData{
+			Kind: "WINDOW_BLUR", ClientTime: time.Now().UTC().Format(time.RFC3339Nano),
+		})
+		if err := conn.Write(context.Background(), ws.MessageText, msg); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+
+	student := dial(t, wsURL(ts.srv.URL, "/ws/exam/x?session=sess-1"))
+	readEnvelope(t, student) // timer:sync
+	send(student)
+	rs.waitForSaves(t, 1)
+
+	// Same kind again, well inside integrityEventRateLimit, on a new
+	// connection after a clean disconnect: still rate-limited.
+	student = reconnectStudent(t, ts, student, "sess-1")
+	send(student)
+	rs.expectNoSave(t, 150*time.Millisecond)
+	if events := rs.events(); len(events) != 1 {
+		t.Fatalf("got %d saved integrity events, want 1 (reconnect must not reset the per-kind limit)", len(events))
+	}
+}
+
+func TestRoom_IntegrityEvent_CountSurvivesReconnect(t *testing.T) {
+	rs := newFakeRoomStore()
+	rs.snapshot = []store.MonitorSession{{ID: "sess-1"}}
+	room, _ := newTestRoom(t, rs, &fakeBuffer{}, &fakeFlusher{}, time.Minute)
+	ts := newTestServer(t, room)
+	// The DB count stops at maxStoredIntegrityEvents; the live count past it
+	// must not step back to the DB's after a reconnect.
+	ts.integritySeed.Store(maxStoredIntegrityEvents)
+
+	monitor := dial(t, wsURL(ts.srv.URL, "/ws/monitor/exam-1"))
+	readEnvelope(t, monitor) // monitor:snapshot
+
+	count := func(conn *ws.Conn, kind string) float64 {
+		t.Helper()
+		msg, _ := protocol.Encode(protocol.TypeIntegrityEvent, "", protocol.IntegrityEventData{
+			Kind: kind, ClientTime: time.Now().UTC().Format(time.RFC3339Nano),
+		})
+		if err := conn.Write(context.Background(), ws.MessageText, msg); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		update := readEnvelope(t, monitor)
+		var data protocol.MonitorUpdateData
+		_ = json.Unmarshal(update.Data, &data)
+		n, _ := data.Patch["integrityEventCount"].(float64)
+		return n
+	}
+
+	student := dial(t, wsURL(ts.srv.URL, "/ws/exam/x?session=sess-1"))
+	readEnvelope(t, student) // timer:sync
+	if got := count(student, "WINDOW_BLUR"); got != maxStoredIntegrityEvents+1 {
+		t.Fatalf("got integrityEventCount %v, want %d", got, maxStoredIntegrityEvents+1)
+	}
+
+	student = reconnectStudent(t, ts, student, "sess-1")
+	if got := count(student, "TAB_HIDDEN"); got != maxStoredIntegrityEvents+2 {
+		t.Fatalf("got integrityEventCount %v after reconnect, want %d", got, maxStoredIntegrityEvents+2)
 	}
 }
 
