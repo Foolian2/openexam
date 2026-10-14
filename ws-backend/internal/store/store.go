@@ -160,30 +160,34 @@ type AnswerSaveState struct {
 // same order as close and lock transitions. A concurrent lifecycle update
 // therefore serializes with this check; the receive timestamp is also tested
 // against durable intervals so a delayed check sees completed lock cycles.
+//
+// The whole transaction goes to Postgres as one pgx batch (one round trip
+// instead of five: BEGIN, two locks, the read, COMMIT) and commits with
+// synchronous_commit off. The transaction writes nothing durable — FOR SHARE
+// only stamps row locks, which do not outlive a crash — so waiting for the WAL
+// flush at COMMIT bought no durability and capped the answer-ack rate under
+// load (2026-10-13 benchmark: ~2.8k acks/s plateau, ack latency dominated by
+// this check). Statement order and lock order are unchanged.
 func (s *Store) GetAnswerSaveState(ctx context.Context, examID, sessionID string, receivedAt time.Time) (*AnswerSaveState, error) {
-	tx, err := s.pool.Begin(ctx)
+	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = tx.Rollback(context.Background()) }()
+	// A batch that fails midway leaves the transaction aborted; pgxpool
+	// destroys a connection released with a non-idle transaction status, so
+	// no explicit ROLLBACK is needed.
+	defer conn.Release()
+
+	receivedAtValue := pgTimestamp(&receivedAt)
+	batch := &pgx.Batch{}
+	batch.Queue("BEGIN")
+	batch.Queue("SET LOCAL synchronous_commit = off")
 	// Row-lock waits can see newer row versions without refreshing a
 	// statement's snapshot of SessionLockInterval. Acquire both locks first,
 	// then read lifecycle and intervals in a new READ COMMITTED statement.
-	var lockedID string
-	if err := tx.QueryRow(ctx, `SELECT id FROM "Exam" WHERE id=$1 FOR SHARE`, examID).Scan(&lockedID); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, ErrNotFound
-		}
-		return nil, err
-	}
-	if err := tx.QueryRow(ctx, `SELECT id FROM "ExamSession" WHERE id=$1 AND "examId"=$2 FOR SHARE`, sessionID, examID).Scan(&lockedID); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, ErrNotFound
-		}
-		return nil, err
-	}
-	receivedAtValue := pgTimestamp(&receivedAt)
-	row := tx.QueryRow(ctx, `
+	batch.Queue(`SELECT id FROM "Exam" WHERE id=$1 FOR SHARE`, examID)
+	batch.Queue(`SELECT id FROM "ExamSession" WHERE id=$1 AND "examId"=$2 FOR SHARE`, sessionID, examID)
+	batch.Queue(`
 		SELECT es.status, e.status, es."lockedAt", es."submittedAt",
 		       es."effectiveEndTime", e."closedAt",
 		       EXISTS (
@@ -198,18 +202,40 @@ func (s *Store) GetAnswerSaveState(ctx context.Context, examID, sessionID string
 		JOIN "ExamSession" es ON es."examId" = e.id
 		WHERE e.id = $1 AND es.id = $2
 	`, examID, sessionID, receivedAtValue)
+	batch.Queue("COMMIT")
 
-	var out AnswerSaveState
-	if err := row.Scan(&out.SessionStatus, &out.ExamStatus, &out.LockedAt,
-		&out.SubmittedAt, &out.EffectiveEndTime, &out.ExamClosedAt,
-		&out.ReceivedWhileLocked); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, ErrNotFound
+	br := conn.SendBatch(ctx, batch)
+	defer func() { _ = br.Close() }()
+
+	for i := 0; i < 2; i++ { // BEGIN, SET LOCAL
+		if _, err := br.Exec(); err != nil {
+			return nil, err
 		}
+	}
+	var lockedID string
+	var missing bool
+	for i := 0; i < 2; i++ { // Exam lock, ExamSession lock
+		err := br.QueryRow().Scan(&lockedID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			missing = true
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	var out AnswerSaveState
+	scanErr := br.QueryRow().Scan(&out.SessionStatus, &out.ExamStatus, &out.LockedAt,
+		&out.SubmittedAt, &out.EffectiveEndTime, &out.ExamClosedAt,
+		&out.ReceivedWhileLocked)
+	if _, err := br.Exec(); err != nil { // COMMIT
 		return nil, err
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
+	if missing || errors.Is(scanErr, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if scanErr != nil {
+		return nil, scanErr
 	}
 	return &out, nil
 }
