@@ -55,6 +55,11 @@ export async function PUT(request: NextRequest, { params }: Params) {
   if (pastDeadline(examSession.effectiveEndTime)) {
     return conflict("Bearbeitungszeit ist abgelaufen")
   }
+  // An SEB session reserved at join has no clock until its first verified
+  // data load (GET /api/sessions/[id]); nothing may be saved before it.
+  if (!examSession.startedAt) {
+    return conflict("Prüfung wurde noch nicht gestartet")
+  }
 
   const body = await readBoundedJson(request, BODY_LIMITS.LARGE)
   if (body instanceof NextResponse) return body

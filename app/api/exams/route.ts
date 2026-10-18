@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server"
 import { readBoundedJson, BODY_LIMITS } from "@/lib/body-size"
 import { formatZodError } from "@/lib/utils"
+import { verifyOrigin } from "@/lib/csrf"
 import { requireStaff } from "@/lib/api-auth"
 import { prisma } from "@/lib/prisma"
 import { getClientIp } from "@/lib/client-ip"
@@ -40,6 +41,9 @@ export async function GET(request: NextRequest) {
 }
 
 export async function POST(request: NextRequest) {
+  const originError = verifyOrigin(request)
+  if (originError) return originError
+
   const authed = await requireStaff(request)
   if (authed instanceof NextResponse) return authed
   const session = authed

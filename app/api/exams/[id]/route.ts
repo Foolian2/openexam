@@ -339,12 +339,16 @@ export async function DELETE(request: NextRequest, { params }: Params) {
     return conflict("Nur Entwürfe können gelöscht werden")
   }
 
-  await prisma.exam.delete({ where: { id } })
+  const { count } = await prisma.exam.deleteMany({
+    where: { id, creatorId: session.user.id, status: "DRAFT" },
+  })
+  if (count === 0) return conflict("Nur Entwürfe können gelöscht werden")
 
   await createAuditLog({
     action: "EXAM_DELETED",
     entityType: "Exam",
     entityId: id,
+    examId: id,
     userId: session.user.id,
     ipAddress: getClientIp(request) ?? undefined,
   })

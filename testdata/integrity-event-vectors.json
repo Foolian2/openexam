@@ -7,10 +7,12 @@
     "PASTE_BLOCKED",
     "CONTEXT_MENU_BLOCKED",
     "DEVTOOLS_SUSPECTED",
-    "SHORTCUT_BLOCKED"
+    "SHORTCUT_BLOCKED",
+    "PAGE_FOCUS_LOST"
   ],
   "patchKeys": [
     "integrityEventCount",
+    "focusLossEventCount",
     "lastIntegrityEvent",
     "lastSeenAt",
     "status",

@@ -99,6 +99,25 @@ describe("PUT /api/sessions/[id]/grades", () => {
     expect(written()).toEqual([])
   })
 
+  it("writes the row when stored feedback 0 is cleared to empty", async () => {
+    // "" is a meaningful clear value and "0" is a legitimate string; both
+    // must survive the changed-row comparison.
+    prismaMock.examSession.findUnique.mockResolvedValue(
+      submittedSession([
+        { questionId: Q_MC, points: 0, feedback: "0", autoGraded: true },
+      ])
+    )
+    await call([{ questionId: Q_MC, points: 0, feedback: "" }])
+    expect(written()).toEqual([Q_MC])
+    expect(prismaMock.grade.upsert.mock.calls[0][0].update.feedback).toBe("")
+  })
+
+  it("writes the row when feedback is set to the string 0 on an empty row", async () => {
+    await call([{ questionId: Q_MC, points: 0, feedback: "0" }])
+    expect(written()).toEqual([Q_MC])
+    expect(prismaMock.grade.upsert.mock.calls[0][0].update.feedback).toBe("0")
+  })
+
   it("rewrites an existing manual grade even when unchanged", async () => {
     prismaMock.examSession.findUnique.mockResolvedValue(
       submittedSession([

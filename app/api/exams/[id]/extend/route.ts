@@ -73,13 +73,16 @@ export async function POST(request: NextRequest, { params }: Params) {
       // old per-row conditional update used, still re-evaluated by Postgres
       // at write time, so a session that submits or gets locked out
       // mid-flight is skipped rather than reopened.
+      //
+      // An SEB session reserved at join has no deadline until its first
+      // verified load. It still gets the grant: NULL + interval stays NULL,
+      // and the clock start folds timeExtensionMin into the new deadline.
       return await tx.$queryRaw<ExtendedSession[]>(Prisma.sql`
         UPDATE "ExamSession"
         SET "timeExtensionMin" = "timeExtensionMin" + ${parsed.data.minutes},
             "effectiveEndTime" = "effectiveEndTime" + (${parsed.data.minutes} * interval '1 minute')
         WHERE "examId" = ${examId}
           AND "status"::text IN (${Prisma.join(ACTIVE_STATUSES)})
-          AND "effectiveEndTime" IS NOT NULL
         RETURNING "id", "effectiveEndTime", "timeExtensionMin", "namApplied"
       `)
     })

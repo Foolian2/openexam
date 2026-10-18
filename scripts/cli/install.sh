@@ -35,7 +35,8 @@ LEGAL_CONTROLLER_NAME, LEGAL_CONTROLLER_ADDRESS, LEGAL_CONTACT_EMAIL and
 LEGAL_HOSTING_PROVIDER exported in the environment (the school's details on
 /datenschutz and /impressum — see .env.example); SMTP_* and
 MICROSOFT_* exported in the environment are written to .env.prod; the first
-admin is created when TEACHER_PASSWORD (+ TEACHER_NAME) is exported; offsite
+admin is created when TEACHER_PASSWORD (+ TEACHER_NAME) is exported; email
+is skipped unless SMTP_HOST is exported; offsite
 backups are set up when OFF_TYPE and its OFF_* values are exported (see
 ./openexam backup-offsite --help).
 
@@ -93,7 +94,7 @@ oe_ask_smtp() {
   SMTP_ENABLED=0
   if [ -n "${SMTP_HOST:-}" ]; then
     SMTP_ENABLED=1
-  elif ui_confirm "Set up email (SMTP) for verification mails and password resets?" y; then
+  elif ui_interactive && ui_confirm "Set up email (SMTP) for verification mails and password resets?" y; then
     SMTP_ENABLED=1
   fi
   if [ "$SMTP_ENABLED" -eq 0 ]; then

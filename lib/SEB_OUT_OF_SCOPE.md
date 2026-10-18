@@ -131,6 +131,29 @@ handler, from switching to another application. It was one of two sources of the
 `WINDOW_BLUR` ("Fenster verlassen") false positives; `lib/blur-watch.ts` handles
 the residue that hiding the bars cannot (SEB's own modal dialogs).
 
+The bars can move focus out of the document while the exam stays visible.
+On macOS, the covered/blurred native top bar can still take focus despite these
+settings. The page's focus APIs cannot distinguish that from application
+switching. After the usual 1.5-second confirmation, macOS SEB therefore reports
+`PAGE_FOCUS_LOST` ("Prüfungsseite hat Fokus verloren (Hinweis)"). The monitor
+keeps it in the event history and shows a neutral "Hinweise" count, separate
+from `integrityEventCount`; it does not put the session in the attention queue.
+A hidden document still reports `TAB_HIDDEN`. Other clients retain `WINDOW_BLUR`.
+ws-backend persists at most 50 `PAGE_FOCUS_LOST` rows per session, separate
+from the 200-row cap for the other kinds, so repeated top-bar clicks cannot
+crowd out events that need review. Past either cap the live count keeps
+growing, but the extra rows are not stored.
+This trades the strength of visible app-switch detection on macOS SEB for an
+accurate description of the observable signal. Existing events are unchanged.
+
+On Windows, `enableAltTab: false` disables SEB's own task-view activator, which
+otherwise takes focus even when `showTaskBar` is false. This is separate from
+the native Windows Alt+Tab shortcut, which SEB's keyboard interceptor blocks.
+See upstream [ShellOperation](https://github.com/SafeExamBrowser/seb-win-refactoring/blob/master/SafeExamBrowser.Client/Operations/ShellOperation.cs)
+and [KeyboardInterceptor](https://github.com/SafeExamBrowser/seb-win-refactoring/blob/master/SafeExamBrowser.Monitoring/Keyboard/KeyboardInterceptor.cs).
+Windows focus-loss detection stays enabled; the config prevents this particular
+native control from taking focus in the first place.
+
 Nothing load-bearing was removed. Reload keeps its hotkey, and quitting never
 went through the task bar: the exit is `quitURL`, linked from the complete page,
 which is what makes handing in the only way out.
@@ -156,6 +179,20 @@ the manual toggle button went with the bar.
 **Any change here re-freezes the Config Key.** These keys are part of the
 settings dict, so every `.seb` file issued before the change stops matching —
 run `pnpm seb:regenerate-keys` and have students download their config again.
+Deploy the additive `PAGE_FOCUS_LOST` enum migration before the updated web and
+WebSocket services. The Windows Alt+Tab setting changes the Config Key: schedule
+the rollout between exams, regenerate keys, and have students relaunch with fresh
+configs. Already-open SEB clients keep the settings they launched with; changing
+the server cannot disable their task view mid-session.
+Deploy ws-backend no later than the web app: an older ws-backend drops the
+unknown `PAGE_FOCUS_LOST` kind, so macOS SEB focus loss reported in between is
+lost rather than recorded.
+
+On a real Windows device, check that a window opened from the exam (a file
+download from an upload question uses `window.open`) can still be closed to
+return to the exam: with the task bar hidden and Alt+Tab disabled, closing it
+is the only way back.
+
 Neither production image can run that command as written — see the header of
 `scripts/regenerate-seb-config-keys.ts` for the invocation that works there.
 

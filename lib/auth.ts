@@ -22,7 +22,9 @@ import {
   capSessionRefresh,
   sessionCreatedAtFromHookContext,
 } from "@/lib/session-cap"
-import { accountRateLimitMessage } from "@/lib/account-rate-limit"
+import { accountKey, accountRateLimitMessage } from "@/lib/account-rate-limit"
+import { rateLimit } from "@/lib/rate-limit"
+import { withEmailChangeState } from "@/lib/email-change-state"
 import { SESSION_MAX_AGE_SECONDS } from "@/lib/storage-keys"
 import { getClientIp } from "@/lib/client-ip"
 import {
@@ -121,6 +123,25 @@ function privacyAcceptanceFields(context: HookContext | undefined) {
     privacyAcceptedAt: new Date(),
     privacyPolicyVersion: getPrivacyPolicyVersion(),
   }
+}
+
+// Aggregate cap on the account mails one user can trigger (verification and
+// email-change confirmations together). The per-address cooldown in
+// emailVerification below lets each new address through, so without this
+// one account could mail any number of distinct addresses. Fails open
+// without Redis, like the cooldown.
+const ACCOUNT_MAIL_LIMIT = 10
+const ACCOUNT_MAIL_WINDOW_SECONDS = 60 * 60
+
+async function withinAccountMailBudget(userId: string): Promise<boolean> {
+  const { allowed } = await rateLimit(
+    `account-mail:${userId}`,
+    ACCOUNT_MAIL_LIMIT,
+    ACCOUNT_MAIL_WINDOW_SECONDS,
+    "open"
+  )
+  if (!allowed) logWarn("Account mail limit reached", { userId })
+  return allowed
 }
 
 export const auth = betterAuth({
@@ -239,10 +260,16 @@ export const auth = betterAuth({
     // asks the teacher to verify within the day.
     expiresIn: 24 * 60 * 60,
     sendVerificationEmail: async ({ user, url }) => {
-      // At most one mail per user per 5 minutes; fails open without Redis.
+      // At most one mail per user and address per 5 minutes; fails open
+      // without Redis. The address is part of the key because this hook also
+      // sends the second step of an email change (to the NEW address, see
+      // user.changeEmail below): keyed on the user alone, that mail was
+      // silently dropped whenever another verification mail had gone out
+      // within the window. Hashed like lib/account-rate-limit.ts's keys, so
+      // Redis carries no address.
       try {
         const acquired = await redis.set(
-          `verify-email:cooldown:${user.id}`,
+          `verify-email:cooldown:${user.id}:${accountKey(user.email)}`,
           "1",
           "EX",
           5 * 60,
@@ -252,6 +279,7 @@ export const auth = betterAuth({
       } catch {
         // Redis unreachable — send anyway.
       }
+      if (!(await withinAccountMailBudget(user.id))) return
       if (process.env.NODE_ENV === "development" || emailVerificationDisabled) {
         logDebug("Verify email link", { email: user.email, url })
         return
@@ -267,10 +295,20 @@ export const auth = betterAuth({
   user: {
     changeEmail: {
       enabled: true,
-      // Confirmation goes to the OLD address (per better-auth's contract):
-      // clicking the link proves control of the current mailbox before the
-      // change to newEmail takes effect.
-      sendChangeEmailConfirmation: async ({ user, newEmail, url }) => {
+      // Two steps (better-auth's contract): this confirmation goes to the OLD
+      // address. Clicking it does NOT change the email yet — better-auth then
+      // calls emailVerification.sendVerificationEmail with the NEW address,
+      // and only that second link switches the account over. Both links
+      // redirect to the callbackURL the settings form sets, extended below
+      // by the signed requested address, so the settings page
+      // (components/settings/email-form.tsx) can tell the user which step
+      // they are on.
+      sendChangeEmailConfirmation: async ({ user, newEmail, url: link }) => {
+        if (!(await withinAccountMailBudget(user.id))) return
+        // The callbackURL carries the requested address, signed, so the
+        // settings page can trust it (lib/email-change-state.ts); better-auth
+        // copies it into the second link.
+        const url = withEmailChangeState(link, user.id, newEmail)
         if (
           process.env.NODE_ENV === "development" ||
           emailVerificationDisabled
@@ -282,7 +320,7 @@ export const auth = betterAuth({
         await sendEmail({
           to: user.email,
           subject: "OpenExam — E-Mail-Adresse ändern bestätigen",
-          text: `Hallo ${user.name},\n\ndu hast angefordert, deine E-Mail-Adresse zu ${newEmail} zu ändern. Bitte bestätige die Änderung:\n${url}\n\nFalls du diese Änderung nicht angefordert hast, ignoriere diese E-Mail.`,
+          text: `Hallo ${user.name},\n\ndu hast angefordert, deine E-Mail-Adresse zu ${newEmail} zu ändern. Bitte bestätige die Änderung:\n${url}\n\nDanach erhältst du an ${newEmail} einen zweiten Link. Erst wenn du auch diesen öffnest, wird die neue Adresse wirksam.\n\nFalls du diese Änderung nicht angefordert hast, ignoriere diese E-Mail.`,
         })
       },
     },

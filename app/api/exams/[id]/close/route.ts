@@ -44,6 +44,13 @@ export async function POST(request: NextRequest, { params }: Params) {
       // submit or deadline sweep can win the row first; the status predicate
       // is rechecked after any row-lock wait, so close never overwrites that
       // terminal submission or finalizes the same session twice.
+      //
+      // Order is load-bearing: this claim must stay AFTER the exam-status
+      // UPDATE above. joinActiveExam (lib/join-active-exam.ts) holds the exam
+      // row FOR SHARE through its INSERT, so the UPDATE serializes behind an
+      // admitted join; claiming first would run on a snapshot where that
+      // session is not committed yet and silently miss it. Do not reorder.
+      //
       // The pending marker commits with the claim: if this process dies
       // before finalization finishes, the deadline sweeper picks the rows up.
       const forcedSessions = await tx.$queryRaw<{ id: string }[]>(Prisma.sql`

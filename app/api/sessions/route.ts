@@ -22,6 +22,7 @@ import {
   OPEN_STATUSES,
 } from "@/lib/session-state"
 import { reserveAdmission } from "@/lib/exam-admission"
+import { joinActiveExam } from "@/lib/join-active-exam"
 import {
   ApiError,
   apiError,
@@ -86,7 +87,8 @@ export async function GET(request: NextRequest) {
 
 /**
  * Join an exam via access code. Creates (or resumes) the caller's ExamSession
- * and starts the clock on first entry.
+ * and starts the clock on first entry, except SEB exams whose clock starts
+ * on the first verified session-data request inside SEB.
  *
  * A shared-start exam (`waitingRoom`) that is still PUBLISHED instead puts the
  * student in its waiting room: a WAITING session without a clock, answered
@@ -226,108 +228,48 @@ export async function POST(request: NextRequest) {
   }
 
   let examSession
-  try {
-    examSession = await prisma.$transaction(async (tx) => {
-      if (existing && isWaiting(existing.status)) {
-        // Still WAITING under an ACTIVE exam: Start converts every waiting
-        // session in its own transaction, so this only happens if a waiting
-        // join raced it. Treat it as a late join rather than refusing it.
-        await tx.examSession.updateMany({
-          where: { id: existing.id, status: "WAITING" },
-          data: {
-            status: "IN_PROGRESS",
-            startedAt: now,
-            effectiveEndTime: clampToSchedule(
-              computeEffectiveEndTime(
-                now,
-                exam.timeLimitMin,
-                existing.timeExtensionMin
-              ),
-              scheduledEndCap(exam)
-            ),
-            lastSeenAt: now,
-          },
-        })
-        return tx.examSession.findUniqueOrThrow({ where: { id: existing.id } })
-      }
-      if (existing) {
-        // Gate the update on the live status: closes the window between the
-        // read above and this write — e.g. a teacher lock, or a submit
-        // landing in between. A negative match on LOCKED alone also matched
-        // SUBMITTED/AUTO_SUBMITTED, letting a resume racing a concurrent
-        // submit flip the session back to IN_PROGRESS and reopen answer
-        // mutation after grading; the positive allowlist (matching the
-        // submit/autosave routes' own gates) makes submitted terminal.
-        const gate = await tx.examSession.updateMany({
-          where: { id: existing.id, status: { in: OPEN_STATUSES } },
-          data: {
-            status: "IN_PROGRESS",
-            startedAt: existing.startedAt ?? now,
-            lastSeenAt: now,
-            ...(isOpen(existing.status)
-              ? { reconnectCount: { increment: 1 } }
-              : {}),
-          },
-        })
-        if (gate.count === 0) {
-          throw new ApiError(
-            403,
-            "FORBIDDEN",
-            "Sitzung wurde von der Lehrperson gesperrt"
-          )
-        }
-        // The persisted deadline includes explicit teacher grants and is the
-        // authority on resume. Recomputing/clamping here discarded those
-        // grants, and writing a pre-read deadline could undo a concurrent
-        // extension. The update above holds the row lock before this read.
-        const resumed = await tx.examSession.findUniqueOrThrow({
-          where: { id: existing.id },
-        })
-        if (resumed.effectiveEndTime) return resumed
-        // Backfill only legacy/pre-start rows without a deadline, using the
-        // settled extension count while holding the same transaction lock.
-        return tx.examSession.update({
-          where: { id: resumed.id },
-          data: {
-            effectiveEndTime: clampToSchedule(
-              computeEffectiveEndTime(
-                resumed.startedAt ?? now,
-                exam.timeLimitMin,
-                resumed.timeExtensionMin
-              ),
-              scheduledEndCap(exam)
-            ),
-          },
-        })
-      }
-      // upsert (not create): guards against two simultaneous first-time joins
-      // racing on the unique (examId, userId) constraint. A session can't be
-      // LOCKED before it exists, so a no-op update on conflict is safe here.
-      return tx.examSession.upsert({
-        where: { examId_userId: { examId: exam.id, userId: session.user.id } },
-        create: {
-          examId: exam.id,
-          userId: session.user.id,
-          status: "IN_PROGRESS",
-          startedAt: now,
-          effectiveEndTime: clampToSchedule(
+  if (!existing) {
+    // Keep the first join to one statement: an interactive transaction here
+    // exhausted pool acquisition time during the 2026-10-14 join burst.
+    // The CTE holds the exam FOR SHARE through insertion, so close either
+    // sees this session or commits first and prevents its creation.
+    examSession = await joinActiveExam({
+      examId: exam.id,
+      userId: session.user.id,
+      status: "IN_PROGRESS",
+      startedAt: exam.sebRequired ? null : now,
+      effectiveEndTime: exam.sebRequired
+        ? null
+        : clampToSchedule(
             computeEffectiveEndTime(now, exam.timeLimitMin, 0),
             scheduledEndCap(exam)
           ),
-          lastSeenAt: now,
-        },
-        update: {},
-      })
+      lastSeenAt: now,
     })
-  } catch (e) {
-    if (e instanceof ApiError) {
-      return e.toResponse()
+    if (!examSession) {
+      return conflict(
+        "Prüfung oder Sitzung ist nicht mehr aktiv. Bitte erneut laden."
+      )
     }
-    throw e
+  } else {
+    try {
+      examSession = await resumeSession(existing, exam, now)
+    } catch (e) {
+      if (e instanceof ApiError) {
+        return e.toResponse()
+      }
+      throw e
+    }
   }
 
   await createAuditLog({
-    action: existing ? "SESSION_RESUMED" : "SESSION_STARTED",
+    // An SEB session's clock starts on its first verified data load, which
+    // logs SESSION_STARTED (app/api/sessions/[id]/route.ts).
+    action: existing
+      ? "SESSION_RESUMED"
+      : examSession.startedAt
+        ? "SESSION_STARTED"
+        : "SESSION_RESERVED",
     entityType: "ExamSession",
     entityId: examSession.id,
     examId: exam.id,
@@ -354,6 +296,111 @@ type JoinableExam = NonNullable<
   Awaited<ReturnType<typeof prisma.exam.findUnique>>
 >
 type ExistingSession = Awaited<ReturnType<typeof prisma.examSession.findUnique>>
+
+/**
+ * Resume (or late-start a still-WAITING) existing session. Runs in an
+ * interactive transaction because the gated update and the read-back must see
+ * the same row lock; see the comments inline.
+ */
+async function resumeSession(
+  existing: NonNullable<ExistingSession>,
+  exam: JoinableExam,
+  now: Date
+) {
+  return prisma.$transaction(async (tx) => {
+    if (
+      exam.sebRequired &&
+      existing.status === "IN_PROGRESS" &&
+      !existing.startedAt
+    ) {
+      // Repeated joins from the launch page must not start the SEB clock.
+      // The status gate can lose to a teacher lock or a close that landed
+      // after the read above; reject like the resume gate below.
+      const gate = await tx.examSession.updateMany({
+        where: { id: existing.id, status: "IN_PROGRESS" },
+        data: { lastSeenAt: now },
+      })
+      if (gate.count === 0) {
+        throw new ApiError(
+          403,
+          "FORBIDDEN",
+          "Sitzung wurde von der Lehrperson gesperrt"
+        )
+      }
+      return tx.examSession.findUniqueOrThrow({ where: { id: existing.id } })
+    }
+    if (isWaiting(existing.status)) {
+      // Still WAITING under an ACTIVE exam: Start converts every waiting
+      // session in its own transaction, so this only happens if a waiting
+      // join raced it. Treat it as a late join rather than refusing it.
+      await tx.examSession.updateMany({
+        where: { id: existing.id, status: "WAITING" },
+        data: {
+          status: "IN_PROGRESS",
+          startedAt: now,
+          effectiveEndTime: clampToSchedule(
+            computeEffectiveEndTime(
+              now,
+              exam.timeLimitMin,
+              existing.timeExtensionMin
+            ),
+            scheduledEndCap(exam)
+          ),
+          lastSeenAt: now,
+        },
+      })
+      return tx.examSession.findUniqueOrThrow({ where: { id: existing.id } })
+    }
+    // Gate the update on the live status: closes the window between the
+    // read above and this write — e.g. a teacher lock, or a submit
+    // landing in between. A negative match on LOCKED alone also matched
+    // SUBMITTED/AUTO_SUBMITTED, letting a resume racing a concurrent
+    // submit flip the session back to IN_PROGRESS and reopen answer
+    // mutation after grading; the positive allowlist (matching the
+    // submit/autosave routes' own gates) makes submitted terminal.
+    const gate = await tx.examSession.updateMany({
+      where: { id: existing.id, status: { in: OPEN_STATUSES } },
+      data: {
+        status: "IN_PROGRESS",
+        startedAt: existing.startedAt ?? now,
+        lastSeenAt: now,
+        ...(isOpen(existing.status)
+          ? { reconnectCount: { increment: 1 } }
+          : {}),
+      },
+    })
+    if (gate.count === 0) {
+      throw new ApiError(
+        403,
+        "FORBIDDEN",
+        "Sitzung wurde von der Lehrperson gesperrt"
+      )
+    }
+    // The persisted deadline includes explicit teacher grants and is the
+    // authority on resume. Recomputing/clamping here discarded those
+    // grants, and writing a pre-read deadline could undo a concurrent
+    // extension. The update above holds the row lock before this read.
+    const resumed = await tx.examSession.findUniqueOrThrow({
+      where: { id: existing.id },
+    })
+    if (resumed.effectiveEndTime) return resumed
+    // Backfill only legacy/pre-start rows without a deadline, using the
+    // settled extension count while holding the same transaction lock.
+    return tx.examSession.update({
+      where: { id: resumed.id },
+      data: {
+        effectiveEndTime: clampToSchedule(
+          computeEffectiveEndTime(
+            resumed.startedAt ?? now,
+            exam.timeLimitMin,
+            resumed.timeExtensionMin
+          ),
+          scheduledEndCap(exam)
+        ),
+      },
+    })
+  })
+}
 
 /**
  * Enter (or re-enter) the waiting room of a shared-start exam. The exam row
@@ -407,15 +454,15 @@ async function joinWaitingRoom(
             examId: exam.id,
             userId,
             status: "IN_PROGRESS",
-            startedAt: now,
-            effectiveEndTime: computeEffectiveEndTime(
-              now,
-              exam.timeLimitMin,
-              0
-            ),
+            startedAt: exam.sebRequired ? null : now,
+            effectiveEndTime: exam.sebRequired
+              ? null
+              : computeEffectiveEndTime(now, exam.timeLimitMin, 0),
             lastSeenAt: now,
           },
-          update: {},
+          // Non-empty so Prisma emits one native INSERT ... ON CONFLICT
+          // rather than an emulated upsert (see the first-join path above).
+          update: { lastSeenAt: now },
         })
         return { session, waiting: false }
       }
@@ -447,7 +494,11 @@ async function joinWaitingRoom(
 
   if (!existing) {
     await createAuditLog({
-      action: result.waiting ? "SESSION_WAITING" : "SESSION_STARTED",
+      action: result.waiting
+        ? "SESSION_WAITING"
+        : result.session.startedAt
+          ? "SESSION_STARTED"
+          : "SESSION_RESERVED",
       entityType: "ExamSession",
       entityId: result.session.id,
       examId: exam.id,

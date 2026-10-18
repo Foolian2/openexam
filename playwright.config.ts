@@ -6,8 +6,9 @@ import { defineConfig, devices } from "@playwright/test"
 // Test files build their Origin header from the same variable.
 // CI runs the suite against a real production build (selected via
 // E2E_PROD_SERVER in ci.yml): more realistic than dev mode, and a fraction
-// of the memory: the turbopack dev server can grow past 11G RSS, while a
-// prod server for this app sits in the low hundreds of MB. The e2e job builds with
+// of the memory — the turbopack dev server grew past 11G RSS on 2026-08-20
+// and thrash-swapped the dedicated runner offline, while a prod server for
+// this app sits in the low hundreds of MB. The e2e job builds with
 // E2E_NONSTANDALONE=true (next.config.mjs) so the plain `next start` works
 // (standalone output + `next start` are mutually exclusive). Local runs keep
 // `pnpm dev` for iteration speed.

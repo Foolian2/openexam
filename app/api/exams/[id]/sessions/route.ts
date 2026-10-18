@@ -41,10 +41,24 @@ export async function GET(request: NextRequest, { params }: Params) {
       sebIntegrityFlaggedAt: true,
       sebIntegrityReason: true,
       user: { select: { id: true, name: true, email: true } },
-      _count: { select: { answers: true, integrityEvents: true } },
+      _count: {
+        select: {
+          answers: true,
+          integrityEvents: { where: { kind: { not: "PAGE_FOCUS_LOST" } } },
+        },
+      },
     },
     orderBy: { startedAt: "asc" },
   })
+
+  const focusLossCounts = await prisma.integrityEvent.groupBy({
+    by: ["sessionId"],
+    where: { session: { examId: id }, kind: "PAGE_FOCUS_LOST" },
+    _count: true,
+  })
+  const focusLossBySession = new Map(
+    focusLossCounts.map((row) => [row.sessionId, row._count])
+  )
 
   return NextResponse.json({
     exam: {
@@ -67,6 +81,7 @@ export async function GET(request: NextRequest, { params }: Params) {
       lastSeenAt: s.lastSeenAt,
       answerCount: s._count.answers,
       integrityEventCount: s._count.integrityEvents,
+      focusLossEventCount: focusLossBySession.get(s.id) ?? 0,
       // Same keys the WS snapshot and live delta use, so the monitor renders
       // the flag identically whether it arrived by REST, snapshot, or patch.
       sebIntegrityFlagged: s.sebIntegrityFlaggedAt !== null,

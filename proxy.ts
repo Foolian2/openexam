@@ -58,8 +58,18 @@ export async function proxy(req: NextRequest) {
     return forbidden("Ungültiger Origin")
   }
 
+  // Anonymous browser error reports are bounded and pinned by this route.
+  // Keep the exception exact: nested paths still require authentication.
+  if (pathname === "/api/monitoring/tunnel") return NextResponse.next()
+
   if (
-    PUBLIC_ROUTES.some((r) => pathname === r || pathname.startsWith(r + "/"))
+    PUBLIC_ROUTES.some(
+      // The root entry is exact-match only: as a prefix it would admit any
+      // "//"-prefixed path. Next's router 308-normalizes repeated slashes
+      // before the proxy (server/lib/router-utils/resolve-routes.js), but the
+      // admission check must not rely on that.
+      (r) => pathname === r || (r !== "/" && pathname.startsWith(r + "/"))
+    )
   ) {
     return NextResponse.next()
   }

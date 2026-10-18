@@ -14,6 +14,7 @@ import {
   TimerReset,
   StopCircle,
   ShieldAlert,
+  Info,
   Presentation,
   RefreshCw,
   Wifi,
@@ -62,6 +63,7 @@ import { AccessCodeChip } from "@/components/exams/access-code-chip"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { isActive, isSubmitted, isWaiting } from "@/lib/session-state"
 
+import { IntegrityEventsButton } from "@/components/monitor/integrity-events-button"
 import { useMonitorSocket } from "@/hooks/use-monitor-socket"
 import { useClock } from "@/hooks/use-clock"
 import { formatTime } from "@/lib/format-date"
@@ -109,6 +111,8 @@ function getSessionChangeSignature(
     session.status,
     session.sebIntegrityFlagged ? "1" : "0",
     session.timeExtensionMin,
+    // focusLossEventCount is left out on purpose: informational focus loss
+    // should not make the row flash like an event that needs review.
     session.integrityEventCount,
     getMonitorAttentionReasons(session, nowMs, questionCount).join(","),
   ].join("|")
@@ -660,7 +664,7 @@ export function LiveMonitor({ examId }: { examId: string }) {
               <TableHead>Fortschritt</TableHead>
               <TableHead>Restzeit</TableHead>
               <TableHead>Zuletzt aktiv</TableHead>
-              <TableHead>Auffälligkeiten</TableHead>
+              <TableHead>Ereignisse</TableHead>
               <TableHead className="text-right">Aktionen</TableHead>
             </TableRow>
           </TableHeader>
@@ -949,14 +953,20 @@ export function LiveMonitor({ examId }: { examId: string }) {
         <DialogContent>
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
-              <ShieldAlert className="h-4 w-4 text-destructive" />
-              Auffälligkeiten — {integrityTarget?.student.name}
+              {integrityTarget && integrityTarget.integrityEventCount > 0 ? (
+                <ShieldAlert className="h-4 w-4 text-destructive" />
+              ) : (
+                <Info className="h-4 w-4 text-muted-foreground" />
+              )}
+              Ereignisse — {integrityTarget?.student.name}
             </DialogTitle>
             <DialogDescription>
               Client-seitig erkannte Signale (Tab-Wechsel, Fenster verlassen,
               blockierte Kopier-/Einfügeversuche u. ä.), mit der Empfangszeit
               des Servers. Kein Beweis für Täuschung, aber ein Hinweis für
-              Rückfragen.
+              Rückfragen. Fokusverlust in macOS SEB ist nur ein Hinweis: Auch
+              SEB-Bedienelemente können den Fokus übernehmen, während die
+              Prüfungsseite sichtbar bleibt.
             </DialogDescription>
           </DialogHeader>
           {integrityLoading ? (
@@ -982,7 +992,15 @@ export function LiveMonitor({ examId }: { examId: string }) {
                   key={e.id}
                   className="flex items-center justify-between gap-3 rounded-md border px-3 py-2"
                 >
-                  <span>{INTEGRITY_KIND_LABELS[e.kind] ?? e.kind}</span>
+                  <span
+                    className={
+                      e.kind === "PAGE_FOCUS_LOST"
+                        ? "text-muted-foreground"
+                        : undefined
+                    }
+                  >
+                    {INTEGRITY_KIND_LABELS[e.kind] ?? e.kind}
+                  </span>
                   <span className="text-xs text-muted-foreground">
                     {formatTime(e.createdAt)}
                   </span>
@@ -1343,21 +1361,11 @@ function MobileSessionGroup({
             </div>
           </dl>
           <div className="flex items-center justify-between border-t pt-2">
-            {session.integrityEventCount > 0 ? (
-              <Button
-                variant="ghost"
-                size="sm"
-                className="text-destructive hover:text-destructive"
-                onClick={() => void onOpenIntegrity(session)}
-              >
-                <ShieldAlert className="h-3.5 w-3.5" />
-                {session.integrityEventCount} Auffälligkeiten
-              </Button>
-            ) : (
-              <span className="text-xs text-muted-foreground">
-                Keine Auffälligkeiten
-              </span>
-            )}
+            <IntegrityEventsButton
+              integrityEventCount={session.integrityEventCount}
+              focusLossEventCount={session.focusLossEventCount}
+              onClick={() => void onOpenIntegrity(session)}
+            />
             <SessionActions
               session={session}
               pendingAction={pendingActions[session.id]}
@@ -1428,19 +1436,12 @@ const SessionRow = memo(function SessionRow({
           : "—"}
       </TableCell>
       <TableCell>
-        {session.integrityEventCount > 0 ? (
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-7 gap-1.5 px-2 text-destructive hover:text-destructive"
-            onClick={() => void onOpenIntegrity(session)}
-          >
-            <ShieldAlert className="h-3.5 w-3.5" />
-            {session.integrityEventCount}
-          </Button>
-        ) : (
-          <span className="text-muted-foreground">—</span>
-        )}
+        <IntegrityEventsButton
+          integrityEventCount={session.integrityEventCount}
+          focusLossEventCount={session.focusLossEventCount}
+          compact
+          onClick={() => void onOpenIntegrity(session)}
+        />
       </TableCell>
       <TableCell className="text-right">
         <SessionActions

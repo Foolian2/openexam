@@ -52,11 +52,13 @@ type sessionState struct {
 type sessionLimits struct {
 	// Integrity-event bookkeeping. lastIntegrityAt rate-limits per kind so a
 	// buggy/hostile client can't flood the room or Postgres; integrityCount
-	// keeps growing past maxStoredIntegrityEvents even once we stop
-	// persisting individual rows, so the teacher-visible counter stays
+	// and focusLossCount keep growing past their stored-row caps
+	// (maxStoredIntegrityEvents, maxStoredFocusLossEvents) once we stop
+	// persisting individual rows, so the teacher-visible counters stay
 	// accurate.
 	lastIntegrityAt map[string]time.Time
 	integrityCount  int
+	focusLossCount  int
 
 	// Answer-save token bucket.
 	saveTokens     float64
@@ -385,12 +387,15 @@ func (r *Room) handleRegister(ctx context.Context, reg registration) {
 		return
 	}
 
-	if old, ok := r.students[c.sessionID]; ok && old != c {
+	old, replacing := r.students[c.sessionID]
+	if replacing && old != c {
 		old.enqueue(mustEncode(protocol.TypeExamControl, "", protocol.ControlEventData{Action: "SESSION_REPLACED"}))
 		old.requestClose(websocket.StatusNormalClosure, "replaced by new connection")
 	}
 	r.students[c.sessionID] = c
-	metrics.ActiveConnections.WithLabelValues("student").Inc()
+	if !replacing {
+		metrics.ActiveConnections.WithLabelValues("student").Inc()
+	}
 
 	st := &sessionState{
 		submitted: reg.sessionAuth.Status == "SUBMITTED" || reg.sessionAuth.Status == "AUTO_SUBMITTED",
@@ -409,6 +414,7 @@ func (r *Room) handleRegister(ctx context.Context, reg registration) {
 		r.limits[c.sessionID] = lim
 	}
 	lim.integrityCount = max(lim.integrityCount, reg.sessionAuth.IntegrityEventCount)
+	lim.focusLossCount = max(lim.focusLossCount, reg.sessionAuth.FocusLossEventCount)
 	st.sessionLimits = lim
 	st.questionTypes = make(map[string]string, len(reg.sessionAuth.Questions))
 	for _, question := range reg.sessionAuth.Questions {
@@ -484,6 +490,13 @@ const integrityEventRateLimit = 2 * time.Second
 // individual events stop being written.
 const maxStoredIntegrityEvents = 200
 
+// maxStoredFocusLossEvents is the separate row cap for informational
+// PAGE_FOCUS_LOST. A separate budget keeps repeated clicks on macOS SEB's
+// top bar from using up the rows meant for events that need review: once
+// those stop being persisted they vanish from the history dialog, and the
+// count drops back to the DB floor after a room restart.
+const maxStoredFocusLossEvents = 50
+
 // maxIntegrityDetailLen bounds the free-form detail field. The real client
 // only ever sends short tokens ("cut", "F12", ...), but the payload is
 // student-controlled and otherwise only bounded by the 64 KB WS read limit.
@@ -514,7 +527,12 @@ func (r *Room) handleIntegrityEvent(ctx context.Context, c *Client, env protocol
 		detail = detail[:maxIntegrityDetailLen]
 	}
 
-	if st.integrityCount < maxStoredIntegrityEvents {
+	focusLoss := data.Kind == "PAGE_FOCUS_LOST"
+	underCap := st.integrityCount < maxStoredIntegrityEvents
+	if focusLoss {
+		underCap = st.focusLossCount < maxStoredFocusLossEvents
+	}
+	if underCap {
 		clientTime := now
 		if t, err := time.Parse(time.RFC3339Nano, data.ClientTime); err == nil {
 			clientTime = t
@@ -531,7 +549,7 @@ func (r *Room) handleIntegrityEvent(ctx context.Context, c *Client, env protocol
 		// the two only visibly diverge if that failure is followed by a room
 		// teardown (60s idle) whose fresh room re-seeds integrityCount from the
 		// DB, at which point the badge steps back. Rate limiting, the stored
-		// cap and truncation all still happen on the room goroutine above, so
+		// caps and truncation all still happen on the room goroutine above, so
 		// the volume reaching Postgres is unchanged.
 		sessionID, kind := c.sessionID, data.Kind
 		r.offloadDurable("integrity-write", func(ctx context.Context) {
@@ -540,10 +558,15 @@ func (r *Room) handleIntegrityEvent(ctx context.Context, c *Client, env protocol
 			}
 		})
 	}
-	st.integrityCount++
+	if focusLoss {
+		st.focusLossCount++
+	} else {
+		st.integrityCount++
+	}
 
 	r.broadcastMonitorUpdate(c.sessionID, map[string]any{
 		"integrityEventCount": st.integrityCount,
+		"focusLossEventCount": st.focusLossCount,
 		"lastIntegrityEvent":  map[string]any{"kind": data.Kind, "detail": detail, "at": nowRFC3339()},
 	})
 }
@@ -654,6 +677,13 @@ func answerSaveRejection(state *store.AnswerSaveState, receivedAt time.Time, gra
 	}
 	if state.SubmittedAt != nil && receivedAt.After(*state.SubmittedAt) {
 		return "ALREADY_SUBMITTED"
+	}
+	// An SEB session reserved at join has no clock until its first verified
+	// data load; nothing may be saved before it starts. Checked ahead of the
+	// status switch so a frame racing a submit or lock of the reservation
+	// cannot slip through the pre-transition exceptions below.
+	if state.StartedAt == nil {
+		return "NOT_STARTED"
 	}
 	switch state.SessionStatus {
 	case "IN_PROGRESS":

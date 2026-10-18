@@ -15,7 +15,8 @@
 //
 // Each session can only be submitted once, so this is a single-iteration
 // scenario: shared-iterations with exactly one iteration per VU. Re-running
-// it needs freshly joined sessions.
+// it needs freshly joined sessions — run-ladder.sh re-provisions between
+// repeats.
 import http from "k6/http"
 import { check, sleep } from "k6"
 import { Trend, Counter, Rate } from "k6/metrics"

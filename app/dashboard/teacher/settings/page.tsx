@@ -13,7 +13,11 @@ export const metadata: Metadata = {
   title: "Einstellungen — OpenExam",
 }
 
-export default async function SettingsPage() {
+interface Props {
+  searchParams: Promise<Record<string, string | string[] | undefined>>
+}
+
+export default async function SettingsPage({ searchParams }: Props) {
   const session = await auth.api.getSession({ headers: await headers() })
   if (!session) redirect("/login")
   if (session.user.role !== "TEACHER" && session.user.role !== "ADMIN")
@@ -35,6 +39,7 @@ export default async function SettingsPage() {
         name={session.user.name}
         email={session.user.email}
         callbackURL="/dashboard/teacher/settings"
+        emailChange={(await searchParams).emailChange}
         takesExams={false}
       />
       <div className="max-w-2xl">

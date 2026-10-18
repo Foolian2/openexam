@@ -84,7 +84,13 @@ describe.skipIf(!TEST_DATABASE_URL)("answers route against Postgres", () => {
     ).id
     sessionId = (
       await prisma.examSession.create({
-        data: { examId, userId, status: "IN_PROGRESS" },
+        data: {
+          examId,
+          userId,
+          status: "IN_PROGRESS",
+          startedAt: new Date(),
+          effectiveEndTime: new Date(Date.now() + 60 * 60 * 1000),
+        },
       })
     ).id
   })

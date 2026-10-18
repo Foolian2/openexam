@@ -46,6 +46,60 @@ oe_sudo() {
   fi
 }
 
+# Numeric group ID of a file, empty when unreadable. GNU stat first,
+# BSD/macOS stat as the fallback (the same pattern as scripts/cli/ops.sh
+# and scripts/test-cli.sh). Always succeeds — callers check for empty.
+oe_file_gid() {
+  stat -c %g "$1" 2>/dev/null || stat -f %g "$1" 2>/dev/null || true
+}
+
+# GID of a named group, empty when the group does not exist. getent also
+# sees NSS sources (LDAP/AD-joined hosts); /etc/group is the fallback for
+# the minimal images that carry no getent. Named lookup, not a dump — some
+# getent builds (macOS) do not enumerate. Always succeeds like oe_file_gid.
+oe_group_gid() {
+  local name="$1"
+  if oe_has getent; then
+    getent group "$name" 2>/dev/null | awk -F: -v n="$name" '$1 == n && !f { print $3; f = 1 }' || true
+  else
+    awk -F: -v n="$name" '$1 == n && !f { print $3; f = 1 }' /etc/group 2>/dev/null || true
+  fi
+}
+
+# Succeeds when no login-range account (uid >= 1000, UID_MIN's default)
+# except $2 has group $1 as its primary or a supplementary group — i.e. a
+# mode-0640 file with that group shares its group-readable contents with no
+# other human. System identities (root, sync, daemons) are not the threat
+# here; unresolvable member names count as shared. Used to keep the rendered
+# Alertmanager config's SMTP_PASSWORD away from shared groups (users, staff,
+# AD defaults) on hosts without a user-private primary group.
+oe_group_private_to() {
+  local gid="$1" user="$2" prog
+  prog='
+    FNR == NR {
+      uid[$1] = $3
+      if ($4 == gid && $1 != user && $3 >= 1000) shared = 1
+      next
+    }
+    $3 == gid {
+      n = split($4, members, ",")
+      for (i = 1; i <= n; i++) {
+        m = members[i]
+        if (m != "" && m != user && (!(m in uid) || uid[m] >= 1000)) shared = 1
+      }
+    }
+    END { exit shared ? 1 : 0 }
+  '
+  # Inline process substitution, never x=<(…): bash leaves that fd closed
+  # for the following command, so the reader cannot open the /dev/fd path.
+  if oe_has getent; then
+    awk -F: -v gid="$gid" -v user="$user" "$prog" \
+      <(getent passwd 2>/dev/null) <(getent group 2>/dev/null)
+  else
+    awk -F: -v gid="$gid" -v user="$user" "$prog" /etc/passwd /etc/group
+  fi
+}
+
 oe_docker_installed() { oe_has docker; }
 oe_docker_running() { docker info >/dev/null 2>&1; }
 oe_compose_v2() { docker compose version >/dev/null 2>&1; }

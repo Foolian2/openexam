@@ -123,3 +123,12 @@ committed file — enable both under **Settings → Code security**:
 - **Secret scanning** — GitHub's own scanner, complements gitleaks.
 - **Push protection** — blocks commits containing recognized secret
   patterns before they land in history.
+
+## Uploaded answer files
+
+Uploads are opaque answer data. Extension checks enforce the submission format;
+content-type claims do not establish file safety. Downloads force attachment
+handling, `application/octet-stream` and `X-Content-Type-Options: nosniff`.
+Magic-number checks are not required because supported text and source-code
+formats have no reliable signature. Scan downloaded files according to your
+school's endpoint policy before opening them.

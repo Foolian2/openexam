@@ -33,7 +33,8 @@
 # with it.
 #
 # Usage: docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
-# (or scripts/deploy.sh, which also reloads nginx so it re-resolves web IPs)
+# (or scripts/deploy.sh, which also reloads nginx; nginx re-resolves upstream
+# IPs on its own since its upstreams use `resolve`, see nginx/nginx.conf)
 #
 # Every service gets a `logging:` block (json-file, bounded max-size/max-file)
 # — previously unset anywhere in this file, i.e. unbounded log growth on
@@ -57,7 +58,7 @@ services:
     # older mainline. Config is unchanged and verified against 1.30 with
     # `nginx -t` (it already uses the modern `http2 on;` form rather than
     # the `listen ... http2` spelling deprecated since 1.25.1).
-    image: nginx:1.30-alpine@sha256:dc5069ad14f19660b141b21236140b91656bf89bbc3e2417c70ae650cd66104c
+    image: nginx:1.30-alpine@sha256:970364228b1e4f932abc22d321932816782cca8a20b85a77552a7cfe9acfb3b5
     restart: unless-stopped
     ports:
       - "80:80"
@@ -76,6 +77,18 @@ services:
       - ws-backend
     networks:
       - edge
+    # Accept-queue depth for the exam-start burst, paired with `backlog=8192`
+    # on nginx.conf's default_server listeners. Both sysctls are per network
+    # namespace, so they apply to nginx's own netns (where published-port
+    # traffic is DNAT'ed to) and need no host-level change. Without them the
+    # kernel caps nginx's backlog at the namespace default somaxconn (4096 on
+    # current kernels, 128 on old ones) and keeps tcp_max_syn_backlog at
+    # 1024 — the value measured in this container on 2026-10-14, when 2400
+    # students joining in the same second overflowed it and the first 1-2 s
+    # of joins were reset (see the listen comment in nginx.conf).
+    sysctls:
+      net.core.somaxconn: 8192
+      net.ipv4.tcp_max_syn_backlog: 8192
     healthcheck:
       test: ["CMD-SHELL", "nginx -t"]
       interval: 30s
@@ -87,8 +100,12 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "1"
-          memory: 256M
+          cpus: "2"
+          # 256M was exhausted at ~3200 concurrent students: nginx workers were
+          # OOM-killed and their WebSockets dropped (benchmark 2026-10-13,
+          # nginx.conf worker_processes). 1G leaves headroom to find the
+          # application's own ceiling instead of this container's.
+          memory: 1G
           pids: 512
 
   web:
@@ -175,7 +192,30 @@ services:
       # sees every host core, so on a 16-core host that's a real risk. At
       # 6 replicas, 5 each (30) plus ws-backend's 30 stays well under a stock
       # max_connections of 100 (the measured plateau at load was 31 total).
-      DB_POOL_MAX: "5"
+      #
+      # Re-measured 2026-10-13 under the combined benchmark (answer saves +
+      # integrity events + 100 SSR renders/s): the six web replicas held 4-7
+      # connections each right after load (36 total, more than DB_POOL_MAX
+      # alone accounts for), and Postgres peaked at 86-93 of
+      # max_connections=100 with ws-backend at pool_max_conns=30. Budget for
+      # ~40 web connections, not 30.
+      #
+      # Raised 5 -> 8 after the 2026-10-14 exam-start rush (2400 students
+      # joining 96 exams in the same second), where five connections per
+      # replica queued joins long enough for Prisma to fail 115 of them with
+      # P2028. Budget against postgres's max_connections=150: ws-backend 30,
+      # exporters + GlitchTip ~20 (the 86-93 peak above minus web and
+      # ws-backend), 3 superuser-reserved slots, leaving ~97. Six replicas x
+      # 8 = 48 configured; with the same +2-per-replica overshoot measured
+      # above that is ~60, a peak of ~110-115 of 150 — still ~35 free for
+      # psql, migrations and backups. Don't go past 10 without raising
+      # max_connections (and postgres's memory limit) to match.
+      DB_POOL_MAX: "8"
+      # How long an interactive transaction may wait for one of those pool
+      # connections before failing with P2028 (lib/prisma.ts). Unset means
+      # 10 s there; Prisma's own default of 2 s is what turned the rush
+      # test's pool queue into HTTP 500s.
+      DB_TX_MAX_WAIT_MS: ${DB_TX_MAX_WAIT_MS:-}
       REDIS_URL: redis://redis:6379
       # Exam-start admission queue (lib/exam-admission.ts). Both are optional
       # — unset means the built-in defaults (25 students/s, 45 s cap), which
@@ -206,8 +246,6 @@ services:
       MICROSOFT_CLIENT_ID: ${MICROSOFT_CLIENT_ID}
       MICROSOFT_CLIENT_SECRET: ${MICROSOFT_CLIENT_SECRET}
       MICROSOFT_TENANT_ID: ${MICROSOFT_TENANT_ID}
-      SCHOOL_STUDENT_DOMAINS: ${SCHOOL_STUDENT_DOMAINS:-}
-      SCHOOL_TEACHER_DOMAINS: ${SCHOOL_TEACHER_DOMAINS:-}
       # SMTP (email verification / notifications).
       SMTP_HOST: ${SMTP_HOST}
       SMTP_PORT: ${SMTP_PORT}
@@ -306,11 +344,18 @@ services:
     build:
       context: ./ws-backend
     restart: unless-stopped
+    # ws-backend's SIGTERM path (main.go) allows 15 s for the HTTP server plus
+    # 20 s for the hub to drain in-flight saves and flush buffered answers.
+    # Docker's default 10 s would SIGKILL it mid-flush on every recreate.
+    stop_grace_period: 40s
     deploy:
       resources:
         limits:
           cpus: "2"
-          memory: 512M
+          # 512M was OOM-killed at 4000 concurrent students (benchmark
+          # 2026-10-13); resident memory grew 295 -> 383 MiB between 2400 and
+          # 3200 students.
+          memory: 1536M
           pids: 256
     environment:
       PORT: 8080
@@ -324,7 +369,11 @@ services:
       # still fell back to offloadDurable's inline path under the capacity
       # benchmark's integrity-load scenario, leaving a 61s tail even after
       # that fix. 30 stays under max_connections=100 alongside the web
-      # tier's 6 x 5 = 30 (docker-compose.prod.yml's web service).
+      # tier's 6 x 5 = 30 (docker-compose.prod.yml's web service) — in
+      # practice ~36-40, see the web service's DB_POOL_MAX comment. Do NOT
+      # raise this without raising max_connections: at 50 the 2026-10-13
+      # benchmark reached 98/100 and the web tier started failing with "too
+      # many clients"; it also did not improve answer-ack latency.
       DATABASE_URL: postgresql://openexam:${POSTGRES_PASSWORD}@postgres:5432/openexam?pool_max_conns=30
       REDIS_URL: redis://redis:6379
       BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET}
@@ -407,11 +456,21 @@ services:
       # default seccomp profile, and loosening seccomp on the one container
       # holding every exam answer and password hash is not worth the
       # remaining throughput. io_workers stays at the default 3 — raise it
-      # only with a k6 baseline showing it helps.
+      # only with a k6 baseline (load/scenarios/) showing it helps.
       - -c
       - io_method=worker
       - -c
       - io_workers=3
+      # Default is 100. The 2026-10-13 benchmark reached 86-93 of 100 with the
+      # web tier (~36-40) + ws-backend (30) + exporters/GlitchTip under a
+      # combined answer-save + integrity + SSR load, and 98/100 with a 50-conn
+      # ws-backend pool, at which point the web tier failed with "too many
+      # clients". 150 keeps ~50 slots free. Changing this needs a Postgres
+      # restart (the container is recreated on the next `docker compose up`);
+      # each backend adds a few MB, well inside the 2304M limit (1.2 GB seen
+      # at load).
+      - -c
+      - max_connections=150
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
@@ -435,7 +494,7 @@ services:
   #
   # NOT volume-compatible with the redis:7 image this replaced: Redis 7.4
   # writes RDB v12, which Valkey refuses by default ("Can't handle RDB format
-  # version 12") — that crash-looped the whole app tier once. Hence
+  # version 12") — that crash-looped the whole app tier once (#207). Hence
   # the separate `valkey_data` volume: scripts/valkey-migrate.sh copies
   # redis_data into it, loads the copy once with `--rdb-version-check
   # relaxed` and rewrites it in Valkey's own format. redis_data is left
@@ -638,7 +697,7 @@ services:
 
   redis-exporter:
     profiles: [monitoring]
-    image: oliver006/redis_exporter:v1.91.1-alpine@sha256:30e56152988ca4bb3784e10debaac8905b78f6a7ff2bbd362a40b8c2a78eb1d6
+    image: oliver006/redis_exporter:v1.94.0-alpine@sha256:2f5c00216f2142f23e6d13de341325101c31f93b8f6c3e72fe33087136bf43ec
     restart: unless-stopped
     environment:
       REDIS_ADDR: redis://redis:6379
@@ -750,7 +809,7 @@ services:
   # network needs to reach it.
   blackbox-exporter:
     profiles: [monitoring]
-    image: prom/blackbox-exporter:v0.28.0@sha256:e753ff9f3fc458d02cca5eddab5a77e1c175eee484a8925ac7d524f04366c2fc
+    image: prom/blackbox-exporter:v0.29.0@sha256:9613f2884689b6fad9f1939f6a3b0388c93a022cfaededb19545b329b5c83dea
     restart: unless-stopped
     command: ["--config.file=/etc/blackbox/blackbox.yml"]
     volumes:
@@ -768,7 +827,7 @@ services:
 
   prometheus:
     profiles: [monitoring]
-    image: prom/prometheus:v3.14.0@sha256:5ce7540c3c00ef4ab0c9d2c995c6a5b9c421f44b4a115d97a2c7af3b1c21cbb0
+    image: prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
     restart: unless-stopped
     command:
       - --config.file=/etc/prometheus/prometheus.yml
@@ -808,8 +867,23 @@ services:
 
   alertmanager:
     profiles: [monitoring]
-    image: prom/alertmanager:v0.34.0@sha256:690c7b525f4367aa91f73e2f91c632206d32e97c6384bdbf2fb7a861b420340d
+    image: prom/alertmanager:v0.34.1@sha256:e9733bafb1bdef9b00e25a21f8f99dc26a22224bf16641ad754d1649f4c3357a
     restart: unless-stopped
+    # setup-monitoring.sh records the rendered config's host group. Preserve
+    # the image's unprivileged user while allowing that group to read it.
+    # The fallback is a sentry, not a usable default. `${…:?…}` cannot be
+    # used here: compose interpolates the whole file before profiles apply,
+    # so a required variable would also break plain `docker compose config`
+    # and a non-monitoring `up` on hosts that never ran setup-monitoring.sh.
+    # `:-0` was no better — a missing setup re-run showed up as a silent
+    # crash-loop on a config nobody could read. This placeholder only bites
+    # when the monitoring profile actually starts, and the daemon's error
+    # names the fix: "unable to find group
+    # run-scripts-setup-monitoring.sh-first". Re-run
+    # scripts/setup-monitoring.sh (it writes ALERTMANAGER_CONFIG_GID back
+    # into .env.prod) after a fresh checkout or a recreated .env.prod.
+    group_add:
+      - "${ALERTMANAGER_CONFIG_GID:-run-scripts-setup-monitoring.sh-first}"
     command:
       - --config.file=/etc/alertmanager/alertmanager.yml
     volumes:
@@ -833,8 +907,10 @@ services:
       options: { max-size: "5m", max-file: "3" }
 
   grafana:
+    # grafana-oss is no longer updated; grafana/grafana is the supported OSS
+    # image: https://grafana.com/docs/grafana/latest/setup-grafana/installation/docker/
     profiles: [monitoring]
-    image: grafana/grafana-oss:13.0.2@sha256:5dad0df181cb644a14e13617b913b261a54f7d4fd4510721dba420929f35bea2
+    image: grafana/grafana:13.2.4@sha256:dbbc38ea21103cefb50396340cd88afec779c7e070b0a7bf5a75b4ce46651d3f
     restart: unless-stopped
     environment:
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}

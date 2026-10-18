@@ -15,7 +15,7 @@ import {
  * update in real time without a page reload.
  *
  * Note: requires ws-backend and Better Auth session persistence
- * (storeSessionInDatabase: true) to be configured.
+ * (storeSessionInDatabase: true) to be configured — see #46.
  */
 test.describe("live time extension", () => {
   test("teacher extends time, student sees updated timer via WS", async ({

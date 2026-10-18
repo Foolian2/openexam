@@ -35,6 +35,7 @@ export const EXHAUSTIVE_KINDS = [
   "CONTEXT_MENU_BLOCKED",
   "DEVTOOLS_SUSPECTED",
   "SHORTCUT_BLOCKED",
+  "PAGE_FOCUS_LOST",
 ] as const satisfies readonly IntegrityEventKind[]
 
 // Best-effort client-reported behavioral signals — see
@@ -44,6 +45,7 @@ export const EXHAUSTIVE_KINDS = [
 export const INTEGRITY_KIND_LABELS: Record<IntegrityEventKind, string> = {
   TAB_HIDDEN: "Tab gewechselt",
   WINDOW_BLUR: "Fenster verlassen",
+  PAGE_FOCUS_LOST: "Prüfungsseite hat Fokus verloren (Hinweis)",
   COPY_BLOCKED: "Kopieren blockiert",
   PASTE_BLOCKED: "Einfügen blockiert",
   CONTEXT_MENU_BLOCKED: "Rechtsklick blockiert",
@@ -69,7 +71,10 @@ export interface MonitorSession {
   namApplied: boolean
   lastSeenAt: string | null
   answerCount: number
+  /** Events requiring review; excludes informational PAGE_FOCUS_LOST. */
   integrityEventCount: number
+  /** Optional for compatibility with older monitor snapshots. */
+  focusLossEventCount?: number
   // Set when this session's SEB Browser Exam Key changed or stopped arriving
   // mid-exam. A signal for the invigilator to look at the candidate, never a
   // reason the student was blocked — see lib/seb-guard.ts.
@@ -87,6 +92,7 @@ export type MonitorSessionPatch = Partial<
   Pick<
     MonitorSession,
     | "integrityEventCount"
+    | "focusLossEventCount"
     | "lastSeenAt"
     | "status"
     | "effectiveEndTime"
@@ -99,6 +105,7 @@ export type MonitorSessionPatch = Partial<
 
 const MONITOR_PATCH_KEYS_LIST = [
   "integrityEventCount",
+  "focusLossEventCount",
   "lastIntegrityEvent",
   "lastSeenAt",
   "status",

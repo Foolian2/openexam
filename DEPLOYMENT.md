@@ -339,6 +339,12 @@ nothing of it runs until you set it up: `deploy.sh` adds
 `--profile monitoring` by itself once `setup-monitoring.sh` has rendered
 `monitoring/alertmanager/alertmanager.yml`. When you run `docker compose`
 by hand against a monitoring service, add `--profile monitoring` too.
+Alertmanager's container also needs `ALERTMANAGER_CONFIG_GID` from
+`.env.prod` (written by `setup-monitoring.sh`). When it is missing — a
+fresh checkout next to an old `.env.prod`, say — starting the monitoring
+profile fails with `unable to find group run-scripts-setup-monitoring.sh-first`;
+re-run `./scripts/setup-monitoring.sh` instead of touching the compose
+file. Commands that leave the profile off are unaffected.
 
 1. Fill in the monitoring section of `.env.prod` (see `.env.example`'s
    comments): `GRAFANA_ADMIN_PASSWORD`, `GLITCHTIP_SECRET_KEY`,
@@ -352,6 +358,21 @@ by hand against a monitoring service, add `--profile monitoring` too.
    Brings up every monitoring service, renders Alertmanager's config from
    `.env.prod`'s SMTP_* values, and installs the PITR + cert-expiry cron
    lines. Prints the SSH-tunnel commands for each dashboard on success.
+   The rendered config is mode `0640`, owned by the setup user, and placed
+   in the dedicated `openexam-monitoring` group — created on the first run
+   (the one step that may ask for sudo; re-runs reuse it) and recorded as
+   `ALERTMANAGER_CONFIG_GID` in `.env.prod`. Compose hands that group to
+   Alertmanager's unprivileged user as its only supplementary group, so the
+   SMTP settings are readable inside the container while the group has no
+   human members who could read them on the host — inheriting the setup
+   user's primary group would leak `SMTP_PASSWORD` to everyone sharing it
+   (`users`, `staff`, an AD default group). Without root to create the
+   group, setup falls back to the setup user's own group, but only when
+   that group has no other members (the Debian/Ubuntu per-user default); on
+   a shared primary group it refuses and prints the two commands (create
+   `openexam-monitoring`, assign the config to it) to run first.
+   Setup also works when the setup user has no crontab yet; rerunning it
+   keeps one entry for each monitoring job.
 3. **GlitchTip project setup** (one-time, manual — GlitchTip has no API for
    this that fits a script): open registration is disabled
    (`ENABLE_OPEN_USER_REGISTRATION: "false"`), so create the admin user
@@ -525,16 +546,35 @@ contents. Requires an explicit `--yes-i-am-sure` flag.
 # Restore the latest backup, no WAL replay past it:
 ./scripts/pitr-restore.sh --latest --yes-i-am-sure
 
-# Restore to a specific point in time:
-./scripts/pitr-restore.sh --target-time "2026-08-13 12:00:00+00" --yes-i-am-sure
+# Historical --target-time restores are currently disabled.
 ```
 
-This stops `web`/`ws-backend`/`postgres`, fetches the base backup into
-`postgres_data`, configures Postgres to replay archived WAL up to the target
-time, starts it in recovery, and waits for it to promote — then prints the
-command to bring the app tier back up. Before stopping anything it starts the
-`walg-sftp` tunnel, waits for it to report healthy, and lists the archive's
-base backups; if either fails, nothing is changed. Watch progress with
+**Historical targets are disabled in the in-place restore script.** Selecting
+an older backup does not prove that its data objects and required WAL are
+complete. The script rejects `--target-time` before stopping services or
+changing database files. Historical recovery must first be performed and
+validated on a scratch volume; only a verified recovered cluster may replace
+live data. Automated staging and validation are required before re-enabling
+this option. Continuous WAL archiving and base backups remain enabled.
+
+The supported `--latest` flow below remains destructive. It now takes an
+automatic safety dump into `./backups/` before anything is stopped and
+refuses to proceed if that dump fails or comes back empty, and it fetches
+the base backup into a staging directory so a failed fetch leaves the live
+data directory intact. Neither guard substitutes for independent offsite
+copies or a rehearsed restore drill — take and verify those first.
+
+This stops `web`/`ws-backend`/`postgres`, fetches the most recent base
+backup into `postgres_data`, configures Postgres with `recovery_target =
+'immediate'` so recovery stops at the base backup's first consistent state
+instead of replaying archived WAL past it, starts it in recovery, and waits
+for it to promote — then prints the command to bring the app tier back up.
+Before stopping anything it takes the safety dump, starts the `walg-sftp`
+tunnel, waits for it to report healthy, and lists the archive's base
+backups; if any of those fail, nothing is changed. Recovery settings are
+rewritten rather than appended, so a `recovery_target*` left in
+`postgresql.auto.conf` by an older restore cannot make Postgres refuse to
+start with "multiple recovery targets specified". Watch progress with
 `docker compose -f docker-compose.prod.yml -f docker-compose.sftp.yml
 --env-file .env.prod logs -f postgres`. Use the command the script prints
 (it includes the SFTP overlay): a bare `-f docker-compose.prod.yml` command
@@ -939,8 +979,9 @@ part of the application's configuration.
   so these dumps and wal-g already include them.
 - **Restore**: `docker compose ... exec -T postgres pg_restore -U openexam
   -d openexam --clean --if-exists < backups/<file>.dump` for a `pg_dump`
-  archive: `scripts/pitr-restore.sh` for a point-in-time restore (requires
-  the monitoring stack; see above).
+  archive: `scripts/pitr-restore.sh` to restore the latest base backup
+  (historical point-in-time targets are currently refused; requires the
+  monitoring stack; see above).
 - **`postgres`'s image is now built locally**, not a bare pinned upstream
   image (`infra/postgres/Dockerfile`, adds the `wal-g` binary for PITR
   above). Security patches now arrive via Dependabot bumping that

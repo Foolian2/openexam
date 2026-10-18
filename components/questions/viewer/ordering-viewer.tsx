@@ -45,17 +45,44 @@ function SortableItem({
   text: string
   index: number
 }) {
-  const { attributes, listeners, setNodeRef, transform, transition } =
-    useSortable({ id })
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    setActivatorNodeRef,
+    transform,
+    transition,
+  } = useSortable({ id })
   return (
     <div
       ref={setNodeRef}
       style={{ transform: CSS.Transform.toString(transform), transition }}
-      className="flex cursor-grab items-center gap-2 rounded-md border bg-card px-3 py-2 text-sm active:cursor-grabbing"
-      {...attributes}
-      {...listeners}
+      className="flex cursor-grab items-center gap-2 rounded-md border bg-card px-3 py-2 text-sm select-none active:cursor-grabbing"
+      // Mouse/pen can drag anywhere. Touch starts only on the handle so
+      // swiping the text still scrolls the exam, including long lists.
+      onPointerDown={(event) => {
+        if (
+          event.pointerType !== "touch" ||
+          (event.target as Element).closest("[data-drag-handle]")
+        ) {
+          listeners?.onPointerDown?.(event)
+        }
+      }}
     >
-      <GripVertical className="h-4 w-4 shrink-0 text-muted-foreground" />
+      <button
+        ref={setActivatorNodeRef}
+        type="button"
+        data-drag-handle
+        aria-label={`Element ${index + 1} verschieben`}
+        className="-my-2 -ml-3 flex size-11 shrink-0 touch-none items-center justify-center rounded-md focus-visible:outline-2 focus-visible:outline-ring"
+        {...attributes}
+        onKeyDown={(event) => listeners?.onKeyDown?.(event)}
+      >
+        <GripVertical
+          className="h-4 w-4 text-muted-foreground"
+          aria-hidden="true"
+        />
+      </button>
       <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full border bg-muted text-[11px] text-muted-foreground tabular-nums">
         {index + 1}
       </span>

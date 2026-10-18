@@ -68,7 +68,10 @@ export function autoGrade(
         if (hit) correctCount++
       }
       const fraction = c.blanks.length > 0 ? correctCount / c.blanks.length : 0
-      return { points: roundHalf(maxPoints * fraction), autoGraded: true }
+      return {
+        points: proportionalPoints(maxPoints, fraction),
+        autoGraded: true,
+      }
     }
     case "MATCHING": {
       const c: MatchingConfig | null = q.config
@@ -88,7 +91,10 @@ export function autoGrade(
         if (m.rightId === matchingRightId(seed, m.leftId)) correctCount++
       }
       const fraction = c.pairs.length > 0 ? correctCount / c.pairs.length : 0
-      return { points: roundHalf(maxPoints * fraction), autoGraded: true }
+      return {
+        points: proportionalPoints(maxPoints, fraction),
+        autoGraded: true,
+      }
     }
     case "TRUE_FALSE": {
       const c: TrueFalseConfig | null = q.config
@@ -134,14 +140,21 @@ export function autoGrade(
         if (orderedIds[i] === c.items[i].id) correctCount++
       }
       const fraction = c.items.length > 0 ? correctCount / c.items.length : 0
-      return { points: roundHalf(maxPoints * fraction), autoGraded: true }
+      return {
+        points: proportionalPoints(maxPoints, fraction),
+        autoGraded: true,
+      }
     }
     default:
       return null
   }
 }
 
-/** Round to the nearest half point (Swiss grading convention). */
-function roundHalf(points: number): number {
-  return Math.round(points * 2) / 2
+/** Preserve full credit and bound half-point rounding by the actual maximum. */
+function proportionalPoints(maxPoints: number, fraction: number): number {
+  if (fraction >= 1) return maxPoints
+  return Math.min(
+    maxPoints,
+    Math.max(0, Math.round(maxPoints * fraction * 2) / 2)
+  )
 }

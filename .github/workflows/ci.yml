@@ -80,9 +80,9 @@ jobs:
         # action-setup hard-fails on a mismatch with "Multiple versions of pnpm
         # specified" before a single step runs.
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: 22
+          node-version: 26
           cache: pnpm
 
       - name: Install dependencies
@@ -129,9 +129,9 @@ jobs:
         # action-setup hard-fails on a mismatch with "Multiple versions of pnpm
         # specified" before a single step runs.
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: 22
+          node-version: 26
           cache: pnpm
 
       - name: Install dependencies
@@ -169,6 +169,20 @@ jobs:
         env:
           SHADOW_DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
 
+      - name: Grading transaction regression against Postgres
+        # The suite is `describe.skipIf(!TEST_DATABASE_URL)`, so an unset (or
+        # renamed) variable would skip every test and still exit 0. Fail
+        # loudly instead of letting the regression test silently not run.
+        run: |
+          if [ -z "$TEST_DATABASE_URL" ]; then
+            echo "::error::TEST_DATABASE_URL is unset — the Postgres grading regression would be skipped"
+            exit 1
+          fi
+          pnpm exec prisma migrate deploy
+          pnpm exec vitest run __tests__/grade-session-sql.test.ts
+        env:
+          TEST_DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
+
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -190,9 +204,9 @@ jobs:
         # action-setup hard-fails on a mismatch with "Multiple versions of pnpm
         # specified" before a single step runs.
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: 22
+          node-version: 26
           cache: pnpm
 
       - name: Install dependencies
@@ -211,6 +225,10 @@ jobs:
 
   e2e:
     name: E2E
+    # On 2026-08-20 the turbopack dev server alone grew past 11G RSS and
+    # thrash-swapped the then self-hosted runners offline. The suite runs
+    # against a production build (E2E_PROD_SERVER, ~hundreds of MB) instead,
+    # which fits a standard GitHub-hosted runner.
     runs-on: ubuntu-latest
 
     services:
@@ -220,6 +238,8 @@ jobs:
           POSTGRES_USER: openexam
           POSTGRES_PASSWORD: openexam
           POSTGRES_DB: openexam
+        # Non-default host port, kept from the self-hosted runner era, where
+        # 5432 could be taken on the host.
         ports:
           - 5455:5432
         options: >-
@@ -244,7 +264,8 @@ jobs:
     env:
       # E2E runs against a real production build (`pnpm build` + `pnpm
       # start`, see E2E_PROD_SERVER below): realistic behavior and a fraction
-      # of the memory the turbopack dev server needs.
+      # of the memory the turbopack dev server needed (it grew past 11G RSS
+      # on 2026-08-20 and thrash-swapped the dedicated runner offline).
       # NODE_ENV is "production" under the prod server, so email verification
       # and CAPTCHA must be skipped explicitly (see lib/auth.ts).
       DATABASE_URL: postgresql://openexam:openexam@localhost:5455/openexam
@@ -257,8 +278,10 @@ jobs:
       AT_REST_ENC_KEY: ci-at-rest-enc-value-without-keywords-abcdefghijklmn
       MATCHING_ID_SECRET: ci-matching-id-value-without-keywords-abcdefghijklmn
       BETTER_AUTH_SECRET: ci-better-auth-value-without-keywords-abcdefghijklmn
-      # Port for the Playwright-managed server; playwright.config.ts and the
-      # Origin headers in e2e/ key off E2E_PORT.
+      # Non-default port for the Playwright-managed server. Kept from the
+      # shared self-hosted-runner era (port 3000 was often squatted); still
+      # worth keeping since playwright.config.ts and the Origin headers in
+      # e2e/ key off E2E_PORT regardless.
       E2E_PORT: "3100"
       # Playwright webServer starts `pnpm start` (production build) instead
       # of `pnpm dev --turbopack` — see playwright.config.ts.
@@ -300,9 +323,9 @@ jobs:
         # action-setup hard-fails on a mismatch with "Multiple versions of pnpm
         # specified" before a single step runs.
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: 22
+          node-version: 26
           cache: pnpm
 
       - name: Install dependencies
@@ -313,6 +336,25 @@ jobs:
 
       - name: Run migrations
         run: pnpm exec prisma migrate deploy
+
+      - name: Exam lifecycle races against Postgres
+        run: |
+          # describe.skipIf(!TEST_DATABASE_URL) would silently drop the only
+          # real-database lifecycle coverage if this is ever unset.
+          test -n "$TEST_DATABASE_URL"
+          pnpm exec vitest run __tests__/exam-lifecycle-sql.test.ts
+        env:
+          TEST_DATABASE_URL: ${{ env.DATABASE_URL }}
+
+      - name: Session answers autosave against Postgres
+        run: |
+          # Same silent-skip hazard as the lifecycle suite above: without
+          # TEST_DATABASE_URL the describe.skipIf drops this suite without
+          # failing the job.
+          test -n "$TEST_DATABASE_URL"
+          pnpm exec vitest run __tests__/session-answers-sql.test.ts
+        env:
+          TEST_DATABASE_URL: ${{ env.DATABASE_URL }}
 
       - name: Cache Next.js build cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
@@ -346,7 +388,7 @@ jobs:
 
       - name: Upload Playwright report
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: playwright-report
           path: playwright-report/
@@ -362,13 +404,13 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: "1.26.9"
+          go-version: "1.27.2"
           cache-dependency-path: ws-backend/go.sum
 
       - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
         with:
           working-directory: ws-backend
-          version: v2.12.2
+          version: v2.14.0
 
       # ws-backend has had tests since it was written and CI never ran them —
       # only the linter. The room/hub suites cover the answer-save state machine
@@ -401,6 +443,8 @@ jobs:
           scripts/create-cap-site-key.sh scripts/gen-env-prod.sh scripts/issue-cert.sh
           scripts/setup-prod.sh scripts/deploy.sh scripts/backup.sh scripts/check-dns.sh
           scripts/bootstrap-cert.sh scripts/configure-firewall.sh scripts/rollback.sh
+          scripts/pitr-restore.sh scripts/test-restore.sh scripts/test-pitr-restore.sh
+          scripts/test-restore-postgres.sh
 
       # ./openexam install local must run on macOS, whose /bin/bash is still
       # 3.2 — bash-4-only syntax (associative arrays, mapfile, ${v,,}) would
@@ -414,6 +458,9 @@ jobs:
 
       - name: CLI self-test under the runner's bash
         run: bash scripts/test-cli.sh
+
+      - name: Restore transaction against disposable Postgres
+        run: bash scripts/test-restore-postgres.sh
 
   build:
     name: Build
@@ -441,9 +488,9 @@ jobs:
         # action-setup hard-fails on a mismatch with "Multiple versions of pnpm
         # specified" before a single step runs.
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: 22
+          node-version: 26
           cache: pnpm
 
       - name: Install dependencies
