@@ -246,6 +246,13 @@ services:
       MICROSOFT_CLIENT_ID: ${MICROSOFT_CLIENT_ID}
       MICROSOFT_CLIENT_SECRET: ${MICROSOFT_CLIENT_SECRET}
       MICROSOFT_TENANT_ID: ${MICROSOFT_TENANT_ID}
+      # School email domains (lib/school-domains.ts). Microsoft logins are only
+      # accepted for addresses on one of these domains, so lib/env.ts refuses
+      # to boot with Microsoft configured while both lists are empty — without
+      # these two entries a deployment using the documented Microsoft
+      # integration dies in env validation even though .env.prod lists them.
+      SCHOOL_STUDENT_DOMAINS: ${SCHOOL_STUDENT_DOMAINS:-}
+      SCHOOL_TEACHER_DOMAINS: ${SCHOOL_TEACHER_DOMAINS:-}
       # SMTP (email verification / notifications).
       SMTP_HOST: ${SMTP_HOST}
       SMTP_PORT: ${SMTP_PORT}

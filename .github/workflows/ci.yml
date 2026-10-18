@@ -454,6 +454,7 @@ jobs:
           koalaman/shellcheck@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d
           -x --severity=warning
           openexam scripts/lib/ui.sh scripts/lib/detect.sh scripts/lib/env-file.sh
+          scripts/lib/recovery-conf.sh scripts/lib/restore-in-container.sh
           scripts/cli/*.sh scripts/test-cli.sh
           scripts/offsite.sh scripts/install-docker.sh scripts/install-cron.sh
           scripts/create-cap-site-key.sh scripts/gen-env-prod.sh scripts/issue-cert.sh

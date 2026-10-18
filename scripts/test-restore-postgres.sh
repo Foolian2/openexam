@@ -99,6 +99,8 @@ fi
   || { echo 'FAIL: a failed fetch destroyed the existing data directory'; exit 1; }
 [ ! -e "$scratch/pgdata/.restore-staging" ] \
   || { echo 'FAIL: a failed fetch left a staging directory behind'; exit 1; }
+[ ! -e "$scratch/pgdata/.restore-old" ] \
+  || { echo 'FAIL: a failed fetch left a parked-copy directory behind'; exit 1; }
 
 restore_program > "$scratch/fetch-ok" 2>&1 \
   || { echo 'FAIL: a successful fetch was rejected'; sed 's/^/  /' "$scratch/fetch-ok"; exit 1; }
@@ -106,8 +108,25 @@ restore_program > "$scratch/fetch-ok" 2>&1 \
 [ ! -e "$scratch/pgdata/important.dat" ] || { echo 'FAIL: stale data survived the restore'; exit 1; }
 [ ! -e "$scratch/pgdata/old-tablespace" ] || { echo 'FAIL: stale directory survived the restore'; exit 1; }
 [ ! -e "$scratch/pgdata/.restore-staging" ] || { echo 'FAIL: staging directory not cleaned up'; exit 1; }
+[ ! -e "$scratch/pgdata/.restore-old" ] || { echo 'FAIL: parked old cluster not cleaned up'; exit 1; }
 grep -q "^recovery_target = 'immediate'" "$scratch/pgdata/postgresql.auto.conf" \
   || { echo 'FAIL: recovery settings not installed after the swap'; exit 1; }
+
+# A swap interrupted half-way parks the pre-restore cluster in .restore-old;
+# a re-run must refuse to touch PGDATA rather than delete or overwrite that
+# last good copy.
+mkdir -p "$scratch/pgdata/.restore-old"
+printf 'parked cluster\n' > "$scratch/pgdata/.restore-old/important.dat"
+if restore_program > "$scratch/guard" 2>&1; then
+  echo 'FAIL: a re-run over an interrupted swap reported success'
+  sed 's/^/  /' "$scratch/guard"
+  exit 1
+fi
+[ -f "$scratch/pgdata/.restore-old/important.dat" ] \
+  || { echo 'FAIL: a re-run over an interrupted swap destroyed the parked cluster'; exit 1; }
+[ -f "$scratch/pgdata/PG_VERSION" ] \
+  || { echo 'FAIL: a refused re-run still modified the data directory'; exit 1; }
+rm -rf "$scratch/pgdata/.restore-old"
 
 # Regression for the recovery-target clash. A recovery_target_time written by
 # an earlier historical restore survives into later base backups via
@@ -140,4 +159,5 @@ PGDATA="$scratch/pgdata" sh scripts/lib/recovery-conf.sh
   || { echo 'FAIL: re-running the restore duplicated recovery settings'; cat "$conf"; exit 1; }
 
 echo 'ok: PostgreSQL preserves the original schema on invalid and truncated input and restores valid archives'
+echo 'ok: the replacement swaps by rename and never drops the parked old cluster before every fetched file has landed'
 echo 'ok: recovery settings are rewritten, not appended, and are idempotent'
