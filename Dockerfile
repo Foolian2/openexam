@@ -21,7 +21,7 @@
 # Dependabot and re-verify before adopting a new base.
 
 # node:26-alpine (2026-08-12)
-FROM node:26-alpine@sha256:143494b1da2945f061539253adc65e4f1569ddf07da2d384c022c791a9d90a4a AS base
+FROM node:26-alpine@sha256:6f08a523443ddedf52941874c203475b0ad503e859ad70cb26ab8be9a517dbd5 AS base
 # The pinned digest ships OpenSSL 3.5.7-r0, which carries CVE-2026-14456
 # (unbounded memory growth in the QUIC server, HIGH). Alpine v3.24/main
 # already has the patched 3.5.8-r0, but upstream node:26-alpine has not been
@@ -115,7 +115,7 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY scripts/setup-walg-sftp.mjs ./scripts/
 ENTRYPOINT ["node", "scripts/setup-walg-sftp.mjs"]
 
-FROM node:26-alpine@sha256:143494b1da2945f061539253adc65e4f1569ddf07da2d384c022c791a9d90a4a AS runner
+FROM node:26-alpine@sha256:6f08a523443ddedf52941874c203475b0ad503e859ad70cb26ab8be9a517dbd5 AS runner
 WORKDIR /app
 ENV NODE_ENV=production \
     HOSTNAME=0.0.0.0 \
