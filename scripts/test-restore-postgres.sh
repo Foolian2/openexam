@@ -11,9 +11,17 @@ cleanup() {
 trap cleanup EXIT
 container=$(docker run --rm -d --network none -e POSTGRES_USER=openexam \
   -e POSTGRES_DB=openexam -e POSTGRES_HOST_AUTH_METHOD=trust postgres:18-alpine)
+# Probe with a real query against the target database over TCP. `pg_isready`
+# alone answers success during the entrypoint's temporary init server (socket
+# only, and before POSTGRES_DB exists) and again during its shutdown/restart
+# handover, so the first `psql -d openexam` after it can die with 'database
+# "openexam" does not exist' or 'the database system is shutting down'. The
+# init server listens on the Unix socket only, so a TCP round-trip through
+# `SELECT 1` proves the final server is up *and* the database exists.
 ready=0
 for _ in $(seq 1 30); do
-  if docker exec "$container" pg_isready -U openexam >/dev/null 2>&1; then ready=1; break; fi
+  if docker exec "$container" psql -h 127.0.0.1 -U openexam -d openexam \
+    -tAc 'SELECT 1' >/dev/null 2>&1; then ready=1; break; fi
   sleep 1
 done
 [ "$ready" -eq 1 ] || { echo 'FAIL: scratch database did not start'; exit 1; }

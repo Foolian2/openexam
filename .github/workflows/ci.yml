@@ -146,6 +146,22 @@ jobs:
       - name: tsc --noEmit
         run: pnpm run typecheck
 
+      - name: Create the shadow database for the drift check
+        # `prisma migrate diff --from-migrations` replays every migration into
+        # the shadow database and leaves the resulting schema behind (without a
+        # _prisma_migrations table). With `ci` doubling as the shadow database,
+        # the grading regression's `prisma migrate deploy` below then fails on
+        # that leftover schema with P3005 ("database schema is not empty"), so
+        # the drift check gets its own `ci_shadow`. Prisma refuses to create the
+        # database named by SHADOW_DATABASE_URL ("Database `ci_shadow` does not
+        # exist") and the postgres service only provisions `ci`, hence this
+        # step. CREATE DATABASE can only run against the always-present
+        # `postgres` maintenance database, and Prisma 7's `db execute` takes
+        # its URL from prisma.config.ts (DATABASE_URL) instead of a flag.
+        run: echo 'CREATE DATABASE ci_shadow;' | pnpm exec prisma db execute --stdin
+        env:
+          DATABASE_URL: postgresql://ci:ci@localhost:5432/postgres
+
       - name: Check for schema/migration drift
         # Applies prisma/migrations onto the throwaway shadow DB and diffs
         # the result against schema.prisma. A non-empty diff means the
@@ -167,7 +183,7 @@ jobs:
             exit 1
           fi
         env:
-          SHADOW_DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
+          SHADOW_DATABASE_URL: postgresql://ci:ci@localhost:5432/ci_shadow
 
       - name: Grading transaction regression against Postgres
         # The suite is `describe.skipIf(!TEST_DATABASE_URL)`, so an unset (or
