@@ -2,6 +2,7 @@
 //
 // integrity:event is the only inbound message that does a synchronous
 // Postgres write (SaveIntegrityEvent) inside the room's single goroutine —
+// ws-backend/AUDIT.md names this the top performance vulnerability, because
 // while that INSERT is in flight the room processes no answer:save for
 // anyone in it. In a browser these fire on tab-switch, blur, blocked copy or
 // paste, so a room full of students glancing away generates a steady stream.

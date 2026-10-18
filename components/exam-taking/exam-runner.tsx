@@ -55,6 +55,7 @@ import { useExamSocket } from "@/hooks/use-exam-socket"
 import { useIntegrityMonitor } from "@/hooks/use-integrity-monitor"
 import { ExamSystemStatus } from "@/components/exam-taking/exam-system-status"
 import { useClock } from "@/hooks/use-clock"
+import { replaceDocument } from "@/lib/document-navigation"
 import { getSebKey, sebFetch } from "@/lib/seb-client"
 import { apiMutate } from "@/lib/api-mutate"
 import { sessionGate } from "@/lib/session-state"
@@ -114,6 +115,10 @@ type SaveState = "dirty" | "saving" | "saved" | "error"
 const AUTOSAVE_DEBOUNCE_MS = 800
 const AUTO_SUBMIT_RETRY_MS = 10_000
 const MAX_AUTO_SUBMIT_ATTEMPTS = 5
+// Upper bound on the pre-submit buffer drain. Each round catches answers
+// typed while the previous round was in flight; the bound keeps a stream of
+// edits from stalling the submission indefinitely.
+const MAX_SUBMIT_DRAIN_ROUNDS = 3
 const STATUS_POLL_MS = 15_000
 const STATUS_POLL_MS_WS_OPEN = 60_000
 const STATUS_REQUEST_TIMEOUT_MS = 10_000
@@ -178,6 +183,19 @@ export function ExamRunner({
   const [clockOffset, setClockOffset] = useState(0)
   const autoSubmittedRef = useRef(false)
   const autoSubmitAttemptsRef = useRef(0)
+  const autoSubmitRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null
+  )
+  const submitAttemptRef = useRef<(auto: boolean) => Promise<void>>(
+    async () => {}
+  )
+  useEffect(
+    () => () => {
+      if (autoSubmitRetryTimerRef.current)
+        clearTimeout(autoSubmitRetryTimerRef.current)
+    },
+    []
+  )
   const timeWarnedRef = useRef<{ five: boolean; one: boolean }>({
     five: false,
     one: false,
@@ -194,10 +212,8 @@ export function ExamRunner({
   // debounced tick and beforeunload, instead of on every keystroke, so typing
   // doesn't JSON-parse/stringify the whole record.
   //
-  // Stays null while rendering on the server, and in a browser that denies
-  // storage — see createLocalAnswerBuffer. Every use below is inside an effect
-  // or an event handler and already optional-chains, so a null buffer costs
-  // only crash-recovery, never an answer: saving runs on the network path.
+  // Persistence is optional, but the in-memory pending queue always exists,
+  // including when a managed browser denies access to localStorage.
   const bufferRef = useRef<AnswerBuffer<AnswerContent> | null>(null)
   if (bufferRef.current === null)
     bufferRef.current = createLocalAnswerBuffer(sessionId)
@@ -251,11 +267,25 @@ export function ExamRunner({
   // countdown tick fire immediately — a failing endpoint would otherwise be
   // hammered in a tight loop. Gives up after a few attempts; the server
   // force-submits on close and the grace window covers late retries.
-  const scheduleAutoSubmitRetry = useCallback(() => {
-    autoSubmitAttemptsRef.current += 1
-    if (autoSubmitAttemptsRef.current >= MAX_AUTO_SUBMIT_ATTEMPTS) return
-    setTimeout(() => {
-      autoSubmittedRef.current = false
+  //
+  // The prior pending timer is cancelled before re-arming, so a re-arm while
+  // one is already scheduled replaces it instead of stacking a second (and
+  // with it a second, duplicate submission attempt per interval).
+  //
+  // countAttempt=false is the re-arm path for a fire that was swallowed
+  // because another submission was in flight: no attempt actually ran, so
+  // the MAX_AUTO_SUBMIT_ATTEMPTS budget must not be spent on it — otherwise
+  // retries still stop below the bound.
+  const scheduleAutoSubmitRetry = useCallback((countAttempt = true) => {
+    if (countAttempt) {
+      autoSubmitAttemptsRef.current += 1
+      if (autoSubmitAttemptsRef.current >= MAX_AUTO_SUBMIT_ATTEMPTS) return
+    }
+    if (autoSubmitRetryTimerRef.current)
+      clearTimeout(autoSubmitRetryTimerRef.current)
+    autoSubmitRetryTimerRef.current = setTimeout(() => {
+      autoSubmitRetryTimerRef.current = null
+      void submitAttemptRef.current(true)
     }, AUTO_SUBMIT_RETRY_MS)
   }, [])
 
@@ -411,8 +441,9 @@ export function ExamRunner({
         if (!res.ok) {
           if (data.error?.code === "NOT_STARTED") {
             // Shared start not reached yet (the take page let us through a
-            // moment early): wait for it in the waiting room.
-            router.replace(`/exam/${examId}/wait`)
+            // moment early): wait for it in the waiting room. A full load,
+            // since the waiting room checks SEB too — see replaceDocument.
+            replaceDocument(`/exam/${examId}/wait`)
             return
           }
           setLoadError(
@@ -553,12 +584,37 @@ export function ExamRunner({
 
   const handleSubmit = useCallback(
     async (auto: boolean) => {
-      if (submitting) return
+      if (submitting) {
+        // An armed auto-submit retry that lands while another submission is
+        // in flight must not silently end the chain: its timer was already
+        // consumed, so re-arm one. The swallowed fire never started an
+        // attempt and must not spend from the retry budget either.
+        if (auto) scheduleAutoSubmitRetry(false)
+        return
+      }
+      // Claimed only here: when the call early-returned above, no attempt
+      // was made, and onExpired must still be able to start one afterwards.
+      if (auto) autoSubmittedRef.current = true
       setSubmitting(true)
       setSubmitError("")
-      // Flush anything still buffered before submitting.
-      const flushResults = await (bufferRef.current?.flush(saveAnswer) ??
-        Promise.resolve([]))
+      // Flush the latest pending values now; delayed autosaves must not race
+      // the submission or send again after the session has become terminal.
+      for (const timer of Object.values(timersRef.current)) clearTimeout(timer)
+      timersRef.current = {}
+      // flush() drains a single snapshot of the buffer, so an answer typed
+      // while a round is in flight would escape the drain and race the submit
+      // below. Re-drain until the buffer comes back empty — bounded, so a
+      // stream of edits can't stall the submission forever — and stop early
+      // as soon as a round makes no progress at all: a save the server keeps
+      // rejecting won't succeed on an immediate retry.
+      let flushResults: Array<[string, boolean]> = []
+      for (let round = 0; round < MAX_SUBMIT_DRAIN_ROUNDS; round++) {
+        flushResults = await (bufferRef.current?.flush(saveAnswer) ??
+          Promise.resolve([]))
+        const pending = bufferRef.current?.entries().length ?? 0
+        if (pending === 0) break
+        if (flushResults.length > 0 && !flushResults.some(([, ok]) => ok)) break
+      }
       // A manual submit must not silently drop answers that only exist in
       // localStorage. Auto-submit proceeds anyway — the deadline has passed
       // and a partial submission beats losing the whole session.
@@ -607,17 +663,30 @@ export function ExamRunner({
         if (auto) scheduleAutoSubmitRetry()
         return
       }
-      bufferRef.current?.clearAll()
+      if (autoSubmitRetryTimerRef.current) {
+        clearTimeout(autoSubmitRetryTimerRef.current)
+        autoSubmitRetryTimerRef.current = null
+      }
+      // No blanket clearAll() here. flush() already dropped every entry it
+      // delivered (discardIfMatch — removals are snapshot-scoped), so the
+      // buffer now holds only saves that failed and answers typed while this
+      // submission was in flight. Those exist nowhere durable yet: clearing
+      // them is exactly what used to destroy the answers that failed to
+      // save. They stay buffered and persisted so a later delivery attempt
+      // (the retry loop, a grace-window write) can still land them.
       if (state) router.push(`/exam/${state.exam.id}/complete`)
     },
     [sessionId, state, submitting, router, saveAnswer, scheduleAutoSubmitRetry]
   )
 
+  useEffect(() => {
+    submitAttemptRef.current = handleSubmit
+  }, [handleSubmit])
+
   // Countdown lives inside <TimerBadge> (a leaf with its own 1s interval), so
   // the per-second tick never re-renders the question list. Warnings and the
-  // auto-submit fire through stable callbacks; while the badge sits at 0 it
-  // keeps calling onExpired each tick, so a re-armed auto-submit retry
-  // (autoSubmittedRef reset) still gets another attempt.
+  // auto-submit fire through stable callbacks. Failed submissions schedule
+  // their own bounded retries rather than relying on another expiry effect.
   const onFiveMinLeft = useCallback(() => {
     if (timeWarnedRef.current.five) return
     timeWarnedRef.current.five = true
@@ -631,10 +700,30 @@ export function ExamRunner({
   }, [])
 
   const onExpired = useCallback(() => {
+    // autoSubmittedRef is claimed by handleSubmit only when an auto attempt
+    // actually starts. If this fires while a manual submit is in flight the
+    // call early-returns, the ref stays unset, and the effect re-run after
+    // that submit settles still triggers the auto-submit instead of
+    // silently never running one.
     if (autoSubmittedRef.current) return
-    autoSubmittedRef.current = true
     void handleSubmit(true)
   }, [handleSubmit])
+
+  // Tear the buffer down on unmount. persistNow() runs first: destroy()
+  // alone would drop a pending debounced write and with it the
+  // crash-recovery copy of the latest answers. destroy() then cancels the
+  // debounce timers so they can't outlive the component — a stale timer's
+  // persistNow would otherwise overwrite the record of a newer buffer for
+  // the same session (StrictMode dev double-mount, quick remount), and the
+  // next load would replay those older entries as pending and re-save
+  // stale content over a newer server answer.
+  useEffect(() => {
+    const buffer = bufferRef.current
+    return () => {
+      buffer?.persistNow()
+      buffer?.destroy()
+    }
+  }, [])
 
   // Flush the in-memory buffer to localStorage if the tab dies before the
   // next debounced write — same crash-safety as the old per-keystroke write,

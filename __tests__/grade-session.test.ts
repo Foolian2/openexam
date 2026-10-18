@@ -4,7 +4,19 @@ const findUniqueMock = vi.fn()
 const updateManyMock = vi.fn()
 const executeRawMock = vi.fn()
 const createManyMock = vi.fn()
-const transactionMock = vi.fn(async (ops: unknown[]) => Promise.all(ops))
+const lockMock = vi.fn()
+const dbMock = {
+  examSession: {
+    findUnique: (...args: unknown[]) => findUniqueMock(...args),
+    updateMany: (...args: unknown[]) => updateManyMock(...args),
+  },
+  grade: { createMany: (...args: unknown[]) => createManyMock(...args) },
+  $queryRaw: (...args: unknown[]) => lockMock(...args),
+  $executeRaw: (...args: unknown[]) => executeRawMock(...args),
+}
+const transactionMock = vi.fn(
+  async (callback: (db: typeof dbMock) => Promise<void>) => callback(dbMock)
+)
 
 vi.mock("@/lib/prisma", () => ({
   prisma: {
@@ -14,7 +26,8 @@ vi.mock("@/lib/prisma", () => ({
     },
     grade: { createMany: (...args: unknown[]) => createManyMock(...args) },
     $executeRaw: (...args: unknown[]) => executeRawMock(...args),
-    $transaction: (ops: unknown[]) => transactionMock(ops),
+    $transaction: (callback: (db: typeof dbMock) => Promise<void>) =>
+      transactionMock(callback),
   },
 }))
 
@@ -38,7 +51,10 @@ function mcQuestion(id: string, points = 4) {
 }
 
 function mcAnswer(questionId: string, selected: string[]) {
-  return { questionId, content: { type: "MULTIPLE_CHOICE", selectedOptionIds: selected } }
+  return {
+    questionId,
+    content: { type: "MULTIPLE_CHOICE", selectedOptionIds: selected },
+  }
 }
 
 beforeEach(() => {
@@ -48,53 +64,51 @@ beforeEach(() => {
   executeRawMock.mockReset()
   createManyMock.mockReset()
   transactionMock.mockClear()
+  lockMock.mockReset()
 })
 
 describe("autoGradeSession", () => {
-  it("clears needsRegrade before reading the answers it grades", async () => {
+  it("clears needsRegrade under the session lock before reading answers", async () => {
     findUniqueMock.mockResolvedValue(null)
     await autoGradeSession(sessionId)
     expect(updateManyMock).toHaveBeenCalledWith({
       where: { id: sessionId, needsRegrade: true },
       data: { needsRegrade: false },
     })
-    // A late answer flushed after the read re-sets the flag; clearing it
-    // after the read instead would silently drop that signal.
+    expect(lockMock.mock.invocationCallOrder[0]).toBeLessThan(
+      updateManyMock.mock.invocationCallOrder[0]
+    )
+    // Lock acquisition precedes both the flag clear and answer read.
     expect(updateManyMock.mock.invocationCallOrder[0]).toBeLessThan(
       findUniqueMock.mock.invocationCallOrder[0]
     )
   })
 
-  it("restores needsRegrade when grading fails after clearing it", async () => {
-    updateManyMock.mockResolvedValue({ count: 1 })
+  it("propagates grading failure so the transaction rolls back its flag clear", async () => {
     findUniqueMock.mockRejectedValue(new Error("db down"))
     await expect(autoGradeSession(sessionId)).rejects.toThrow("db down")
-    expect(updateManyMock).toHaveBeenLastCalledWith({
-      where: { id: sessionId },
-      data: { needsRegrade: true },
-    })
-  })
-
-  it("does not set needsRegrade on failure when it was not set before", async () => {
-    findUniqueMock.mockRejectedValue(new Error("db down"))
-    await expect(autoGradeSession(sessionId)).rejects.toThrow("db down")
+    // A single guarded updateMany (where needsRegrade: true) inside the
+    // transaction: no compensating restore write is ever attempted, and the
+    // rollback is the transaction's job.
     expect(updateManyMock).toHaveBeenCalledTimes(1)
+    expect(transactionMock).toHaveBeenCalledTimes(1)
   })
 
-  it("does nothing when the session does not exist", async () => {
+  it("opens a transaction and attempts only the flag clear when the session does not exist", async () => {
     findUniqueMock.mockResolvedValue(null)
     await autoGradeSession(sessionId)
-    expect(transactionMock).not.toHaveBeenCalled()
+    expect(executeRawMock).not.toHaveBeenCalled()
   })
 
   it("does nothing when there is nothing gradeable and no grades exist", async () => {
     findUniqueMock.mockResolvedValue({
       answers: [],
       grades: [],
-      exam: { questions: [{ id: "q1", type: "FREE_TEXT", points: 5, config: {} }] },
+      exam: {
+        questions: [{ id: "q1", type: "FREE_TEXT", points: 5, config: {} }],
+      },
     })
     await autoGradeSession(sessionId)
-    expect(transactionMock).not.toHaveBeenCalled()
     expect(executeRawMock).not.toHaveBeenCalled()
     expect(createManyMock).not.toHaveBeenCalled()
   })
@@ -109,7 +123,15 @@ describe("autoGradeSession", () => {
 
     expect(createManyMock).toHaveBeenCalledTimes(1)
     expect(createManyMock).toHaveBeenCalledWith({
-      data: [{ sessionId, questionId: "q1", points: 4, maxPoints: 4, autoGraded: true }],
+      data: [
+        {
+          sessionId,
+          questionId: "q1",
+          points: 4,
+          maxPoints: 4,
+          autoGraded: true,
+        },
+      ],
       skipDuplicates: true,
     })
     expect(executeRawMock).not.toHaveBeenCalled()
@@ -152,7 +174,6 @@ describe("autoGradeSession", () => {
 
     expect(executeRawMock).not.toHaveBeenCalled()
     expect(createManyMock).not.toHaveBeenCalled()
-    expect(transactionMock).not.toHaveBeenCalled()
   })
 
   it("does not throw or attempt to recover when a concurrent manual grade wins the UPDATE race ($executeRaw matches 0 rows)", async () => {
@@ -191,7 +212,15 @@ describe("autoGradeSession", () => {
 
     expect(createManyMock).toHaveBeenCalledTimes(1)
     expect(createManyMock).toHaveBeenCalledWith({
-      data: [{ sessionId, questionId: "q1", points: 4, maxPoints: 4, autoGraded: true }],
+      data: [
+        {
+          sessionId,
+          questionId: "q1",
+          points: 4,
+          maxPoints: 4,
+          autoGraded: true,
+        },
+      ],
       skipDuplicates: true,
     })
     // No second attempt / no throw — the caller (gradeWithRetry) sees a
@@ -201,20 +230,34 @@ describe("autoGradeSession", () => {
 
   it("splits mixed questions into create and update buckets in one transaction", async () => {
     findUniqueMock.mockResolvedValue({
-      answers: [mcAnswer("q1", ["a"]), mcAnswer("q2", ["a"]), mcAnswer("q3", ["a"])],
+      answers: [
+        mcAnswer("q1", ["a"]),
+        mcAnswer("q2", ["a"]),
+        mcAnswer("q3", ["a"]),
+      ],
       grades: [
         { questionId: "q1", autoGraded: true }, // -> update
         { questionId: "q2", autoGraded: false }, // -> skip
         // q3 has no grade row -> create
       ],
-      exam: { questions: [mcQuestion("q1"), mcQuestion("q2"), mcQuestion("q3")] },
+      exam: {
+        questions: [mcQuestion("q1"), mcQuestion("q2"), mcQuestion("q3")],
+      },
     })
     await autoGradeSession(sessionId)
 
     expect(transactionMock).toHaveBeenCalledTimes(1)
     expect(executeRawMock).toHaveBeenCalledTimes(1)
     expect(createManyMock).toHaveBeenCalledWith({
-      data: [{ sessionId, questionId: "q3", points: 4, maxPoints: 4, autoGraded: true }],
+      data: [
+        {
+          sessionId,
+          questionId: "q3",
+          points: 4,
+          maxPoints: 4,
+          autoGraded: true,
+        },
+      ],
       skipDuplicates: true,
     })
   })

@@ -13,6 +13,8 @@ import (
 	"time"
 
 	ws "github.com/coder/websocket"
+	dto "github.com/prometheus/client_model/go"
+	"openexam/ws-backend/internal/metrics"
 
 	"openexam/ws-backend/internal/protocol"
 	"openexam/ws-backend/internal/store"
@@ -62,7 +64,7 @@ func (f *fakeRoomStore) GetAnswerSaveState(ctx context.Context, examID, sessionI
 		copy := *state
 		return &copy, nil
 	}
-	return &store.AnswerSaveState{SessionStatus: "IN_PROGRESS", ExamStatus: "ACTIVE"}, nil
+	return startedSaveState(), nil
 }
 
 func (f *fakeRoomStore) SaveIntegrityEvent(ctx context.Context, sessionID, kind, detail string, clientTime time.Time) error {
@@ -156,6 +158,7 @@ type testServer struct {
 	// integritySeed stands in for the already-persisted integrity-event
 	// count that GetExamSessionAuth reads; set it before dialing a student.
 	integritySeed atomic.Int64
+	focusLossSeed atomic.Int64
 	// status overrides the ExamSession status the register handler presents;
 	// defaults to IN_PROGRESS.
 	status string
@@ -184,6 +187,7 @@ func newTestServer(t *testing.T, room *Room) *testServer {
 		room.RegisterStudent(c, &store.ExamSessionAuth{
 			ID: sessionID, Status: status,
 			IntegrityEventCount: int(ts.integritySeed.Load()),
+			FocusLossEventCount: int(ts.focusLossSeed.Load()),
 			Questions:           []store.QuestionAuth{{ID: "q-1", Type: "FREE_TEXT"}},
 		})
 		runConn(room, c)
@@ -546,10 +550,17 @@ func TestRoom_AnswerSave_RejectsQuestionOutsideExam(t *testing.T) {
 	}
 }
 
+// startedSaveState is an open session whose clock has started.
+func startedSaveState() *store.AnswerSaveState {
+	startedAt := time.Now().Add(-time.Minute)
+	return &store.AnswerSaveState{SessionStatus: "IN_PROGRESS", ExamStatus: "ACTIVE", StartedAt: &startedAt}
+}
+
 func TestRoom_ControlEvent_LocksStudentAndRejectsSave(t *testing.T) {
 	lockedAt := time.Now().Add(-time.Second)
+	startedAt := lockedAt.Add(-time.Hour)
 	rs := &fakeRoomStore{answerState: &store.AnswerSaveState{
-		SessionStatus: "LOCKED", ExamStatus: "ACTIVE", LockedAt: &lockedAt,
+		SessionStatus: "LOCKED", ExamStatus: "ACTIVE", LockedAt: &lockedAt, StartedAt: &startedAt,
 	}}
 	room, _ := newTestRoom(t, rs, &fakeBuffer{}, &fakeFlusher{}, time.Minute)
 	ts := newTestServer(t, room)
@@ -580,8 +591,9 @@ func TestRoom_ControlEvent_LocksStudentAndRejectsSave(t *testing.T) {
 
 func TestRoom_AnswerSave_RejectsAuthoritativeLockWithoutControlEvent(t *testing.T) {
 	lockedAt := time.Now().Add(-time.Second)
+	startedAt := lockedAt.Add(-time.Hour)
 	rs := &fakeRoomStore{answerState: &store.AnswerSaveState{
-		SessionStatus: "LOCKED", ExamStatus: "ACTIVE", LockedAt: &lockedAt,
+		SessionStatus: "LOCKED", ExamStatus: "ACTIVE", LockedAt: &lockedAt, StartedAt: &startedAt,
 	}}
 	buf := &fakeBuffer{}
 	room, _ := newTestRoom(t, rs, buf, &fakeFlusher{}, time.Minute)
@@ -641,8 +653,9 @@ func TestRoom_AnswerSave_PreservesFrameReceivedBeforeLock(t *testing.T) {
 	// Model the DB check running after a lock commits while the socket frame
 	// itself was read before lockedAt. This is the boundary the flusher uses.
 	lockedAt := time.Now().Add(time.Minute)
+	startedAt := lockedAt.Add(-time.Hour)
 	rs := &fakeRoomStore{answerState: &store.AnswerSaveState{
-		SessionStatus: "LOCKED", ExamStatus: "ACTIVE", LockedAt: &lockedAt,
+		SessionStatus: "LOCKED", ExamStatus: "ACTIVE", LockedAt: &lockedAt, StartedAt: &startedAt,
 	}}
 	buf := &fakeBuffer{}
 	room, _ := newTestRoom(t, rs, buf, &fakeFlusher{}, time.Minute)
@@ -724,38 +737,53 @@ func TestAnswerSaveRejectionUsesCommittedLifecycleBoundaries(t *testing.T) {
 	}{
 		{
 			name:     "post-lock frame is denied",
-			state:    store.AnswerSaveState{SessionStatus: "LOCKED", ExamStatus: "ACTIVE", LockedAt: &lockedAt},
+			state:    store.AnswerSaveState{SessionStatus: "LOCKED", ExamStatus: "ACTIVE", LockedAt: &lockedAt, StartedAt: &base},
 			received: lockedAt.Add(time.Millisecond), want: "LOCKED",
 		},
 		{
 			name:     "pre-lock frame remains eligible",
-			state:    store.AnswerSaveState{SessionStatus: "LOCKED", ExamStatus: "ACTIVE", LockedAt: &lockedAt},
+			state:    store.AnswerSaveState{SessionStatus: "LOCKED", ExamStatus: "ACTIVE", LockedAt: &lockedAt, StartedAt: &base},
 			received: lockedAt, want: "",
 		},
 		{
 			name:     "post-submit frame is denied",
-			state:    store.AnswerSaveState{SessionStatus: "SUBMITTED", ExamStatus: "ACTIVE", SubmittedAt: &submittedAt},
+			state:    store.AnswerSaveState{SessionStatus: "SUBMITTED", ExamStatus: "ACTIVE", SubmittedAt: &submittedAt, StartedAt: &base},
 			received: submittedAt.Add(time.Millisecond), want: "ALREADY_SUBMITTED",
 		},
 		{
 			name:     "pre-submit frame remains eligible",
-			state:    store.AnswerSaveState{SessionStatus: "AUTO_SUBMITTED", ExamStatus: "CLOSED", SubmittedAt: &submittedAt, ExamClosedAt: &closedAt},
+			state:    store.AnswerSaveState{SessionStatus: "AUTO_SUBMITTED", ExamStatus: "CLOSED", SubmittedAt: &submittedAt, ExamClosedAt: &closedAt, StartedAt: &base},
 			received: submittedAt, want: "",
 		},
 		{
 			name:     "closed exam rejects post-close frame",
-			state:    store.AnswerSaveState{SessionStatus: "AUTO_SUBMITTED", ExamStatus: "CLOSED", SubmittedAt: &submittedAt, ExamClosedAt: &closedAt},
+			state:    store.AnswerSaveState{SessionStatus: "AUTO_SUBMITTED", ExamStatus: "CLOSED", SubmittedAt: &submittedAt, ExamClosedAt: &closedAt, StartedAt: &base},
 			received: closedAt.Add(time.Millisecond), want: "EXAM_CLOSED",
 		},
 		{
 			name:     "deadline grace uses received time",
-			state:    store.AnswerSaveState{SessionStatus: "IN_PROGRESS", ExamStatus: "ACTIVE", EffectiveEndTime: &deadline},
+			state:    store.AnswerSaveState{SessionStatus: "IN_PROGRESS", ExamStatus: "ACTIVE", StartedAt: &base, EffectiveEndTime: &deadline},
 			received: deadline.Add(31 * time.Second), want: "EXPIRED",
 		},
 		{
 			name:     "within deadline grace remains eligible",
-			state:    store.AnswerSaveState{SessionStatus: "IN_PROGRESS", ExamStatus: "ACTIVE", EffectiveEndTime: &deadline},
+			state:    store.AnswerSaveState{SessionStatus: "IN_PROGRESS", ExamStatus: "ACTIVE", StartedAt: &base, EffectiveEndTime: &deadline},
 			received: deadline.Add(30 * time.Second), want: "",
+		},
+		{
+			name:     "session without a started clock is denied",
+			state:    store.AnswerSaveState{SessionStatus: "IN_PROGRESS", ExamStatus: "ACTIVE"},
+			received: base, want: "NOT_STARTED",
+		},
+		{
+			name:     "pre-lock frame on a never-started reservation is denied",
+			state:    store.AnswerSaveState{SessionStatus: "LOCKED", ExamStatus: "ACTIVE", LockedAt: &lockedAt},
+			received: base, want: "NOT_STARTED",
+		},
+		{
+			name:     "pre-submit frame on a never-started reservation is denied",
+			state:    store.AnswerSaveState{SessionStatus: "SUBMITTED", ExamStatus: "ACTIVE", SubmittedAt: &submittedAt},
+			received: base, want: "NOT_STARTED",
 		},
 	}
 	for _, tt := range tests {
@@ -1453,7 +1481,7 @@ func TestRoom_AnswerSave_SlowCheckDoesNotBlockOtherSessions(t *testing.T) {
 		if sessionID == "sess-slow" {
 			<-release
 		}
-		return &store.AnswerSaveState{SessionStatus: "IN_PROGRESS", ExamStatus: "ACTIVE"}, nil
+		return startedSaveState(), nil
 	}}
 	room, _ := newTestRoom(t, rs, &fakeBuffer{}, &fakeFlusher{}, time.Minute)
 	ts := newTestServer(t, room)
@@ -1497,7 +1525,7 @@ func TestRoom_AnswerSave_KeepsPerSessionOrder(t *testing.T) {
 	calls := 0
 	first := make(chan struct{})
 	rs := &fakeRoomStore{answerStateHook: func(_ context.Context, _, _ string, _ time.Time) (*store.AnswerSaveState, error) {
-		return &store.AnswerSaveState{SessionStatus: "IN_PROGRESS", ExamStatus: "ACTIVE"}, nil
+		return startedSaveState(), nil
 	}}
 	buf := &fakeBuffer{onSave: func(string) {
 		mu.Lock()
@@ -1530,5 +1558,111 @@ func TestRoom_AnswerSave_KeepsPerSessionOrder(t *testing.T) {
 		if env := readEnvelope(t, student); env.ID != want {
 			t.Fatalf("got ack %q, want %q", env.ID, want)
 		}
+	}
+}
+
+func TestRoom_FocusLossIsInformationalAcrossReconnect(t *testing.T) {
+	rs := newFakeRoomStore()
+	rs.snapshot = []store.MonitorSession{{ID: "sess-1"}}
+	room, _ := newTestRoom(t, rs, &fakeBuffer{}, &fakeFlusher{}, time.Minute)
+	ts := newTestServer(t, room)
+	ts.integritySeed.Store(3)
+	ts.focusLossSeed.Store(4)
+	monitor := dial(t, wsURL(ts.srv.URL, "/ws/monitor/exam-1"))
+	readEnvelope(t, monitor)
+	student := dial(t, wsURL(ts.srv.URL, "/ws/exam/x?session=sess-1"))
+	readEnvelope(t, student)
+	send := func(c *ws.Conn, kind string, warnings, info float64) {
+		t.Helper()
+		msg, _ := protocol.Encode(protocol.TypeIntegrityEvent, "", protocol.IntegrityEventData{Kind: kind})
+		if err := c.Write(context.Background(), ws.MessageText, msg); err != nil {
+			t.Fatal(err)
+		}
+		update := readEnvelope(t, monitor)
+		var data protocol.MonitorUpdateData
+		if err := json.Unmarshal(update.Data, &data); err != nil {
+			t.Fatal(err)
+		}
+		if data.Patch["integrityEventCount"] != warnings || data.Patch["focusLossEventCount"] != info {
+			t.Fatalf("unexpected counts: %v, want warnings=%v info=%v", data.Patch, warnings, info)
+		}
+	}
+	send(student, "PAGE_FOCUS_LOST", 3, 5)
+	rs.waitForSaves(t, 1)
+	if err := student.Close(ws.StatusNormalClosure, "reconnect"); err != nil {
+		t.Fatal(err)
+	}
+	<-ts.studentGone
+	// Stale persisted counts must not undo either live counter.
+	student = dial(t, wsURL(ts.srv.URL, "/ws/exam/x?session=sess-1"))
+	readEnvelope(t, student)
+	send(student, "TAB_HIDDEN", 4, 5)
+	rs.waitForSaves(t, 1)
+	if got := rs.events(); got[0] != "sess-1:PAGE_FOCUS_LOST:" || got[1] != "sess-1:TAB_HIDDEN:" {
+		t.Fatalf("unexpected saved events: %v", got)
+	}
+}
+
+func TestRoom_FocusLossHasSeparateStoredEventCap(t *testing.T) {
+	rs := newFakeRoomStore()
+	room, _ := newTestRoom(t, rs, &fakeBuffer{}, &fakeFlusher{}, time.Minute)
+	ts := newTestServer(t, room)
+	ts.integritySeed.Store(100)
+	ts.focusLossSeed.Store(maxStoredFocusLossEvents)
+	monitor := dial(t, wsURL(ts.srv.URL, "/ws/monitor/exam-1"))
+	readEnvelope(t, monitor)
+	student := dial(t, wsURL(ts.srv.URL, "/ws/exam/x?session=sess-1"))
+	readEnvelope(t, student)
+	send := func(kind string, warnings, info float64) {
+		t.Helper()
+		msg, _ := protocol.Encode(protocol.TypeIntegrityEvent, "", protocol.IntegrityEventData{Kind: kind})
+		if err := student.Write(context.Background(), ws.MessageText, msg); err != nil {
+			t.Fatal(err)
+		}
+		var data protocol.MonitorUpdateData
+		update := readEnvelope(t, monitor)
+		if err := json.Unmarshal(update.Data, &data); err != nil {
+			t.Fatal(err)
+		}
+		if data.Patch["integrityEventCount"] != warnings || data.Patch["focusLossEventCount"] != info {
+			t.Fatalf("unexpected counts: %v, want warnings=%v info=%v", data.Patch, warnings, info)
+		}
+	}
+	// Focus loss at its own cap is counted but not persisted...
+	send("PAGE_FOCUS_LOST", 100, maxStoredFocusLossEvents+1)
+	rs.expectNoSave(t, 150*time.Millisecond)
+	// ...and does not use up the rows reserved for events needing review.
+	send("TAB_HIDDEN", 101, maxStoredFocusLossEvents+1)
+	rs.waitForSaves(t, 1)
+	if got := rs.events(); len(got) != 1 || got[0] != "sess-1:TAB_HIDDEN:" {
+		t.Fatalf("unexpected saved events: %v", got)
+	}
+}
+
+// A second registration for the same session replaces the first: one session
+// keeps exactly one live socket, so the connection gauge must count it once.
+// The replacement must not increment on registration, and unregistering the
+// replaced socket must be a no-op rather than decrement the replacement's
+// count — otherwise the gauge drifts upward for every reconnect.
+func TestRoom_ReplacedSocketKeepsAccurateGauge(t *testing.T) {
+	r := newRoom("audit-exam", &fakeRoomStore{}, &fakeBuffer{}, &fakeFlusher{}, nil, "audit-instance", time.Hour, 0, nil)
+	gauge := metrics.ActiveConnections.WithLabelValues("student")
+	value := func() float64 { m := &dto.Metric{}; _ = gauge.Write(m); return m.GetGauge().GetValue() }
+	before := value()
+	defer func() { gauge.Set(before) }()
+	a := NewStudentClient(nil, "u", "s", nil)
+	b := NewStudentClient(nil, "u", "s", nil)
+	auth := &store.ExamSessionAuth{ID: "s", Status: "IN_PROGRESS"}
+	r.handleRegister(context.Background(), registration{client: a, sessionAuth: auth})
+	r.handleRegister(context.Background(), registration{client: b, sessionAuth: auth})
+	if got := r.students["s"]; got != b {
+		t.Fatalf("students[\"s\"] = %p, want the replacement %p", got, b)
+	}
+	r.handleUnregister(a)
+	r.handleUnregister(b)
+	delta := value() - before
+	t.Logf("sockets remaining=%d gauge drift=%v", len(r.students), delta)
+	if len(r.students) != 0 || delta != 0 {
+		t.Fatal("connection gauge drifted after replacement")
 	}
 }

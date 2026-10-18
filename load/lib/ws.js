@@ -40,7 +40,8 @@ export function answerSaveEnvelope(questionId, content, id) {
 }
 
 // integrity:event — the one inbound path that does a synchronous Postgres
-// write inside the room goroutine (internal/hub/room.go). The server allow-lists `kind`, rate-limits each kind
+// write inside the room goroutine (internal/hub/room.go, flagged in
+// ws-backend/AUDIT.md). The server allow-lists `kind`, rate-limits each kind
 // to one event per 2s per session, caps `detail` at 200 chars and stops
 // persisting after 200 rows per session; a scenario driving this faster than
 // 2s/kind measures the rate limiter, not the write path.

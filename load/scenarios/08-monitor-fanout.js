@@ -3,7 +3,8 @@
 //
 //   monitor_snapshot_latency — WS open -> first monitor:snapshot. Building a
 //     snapshot calls ListMonitorSessions, a Postgres query executed inside
-//     the single-goroutine room loop, so every teacher connecting to a busy room
+//     the single-goroutine room loop (ws-backend/AUDIT.md flags this as the
+//     top performance risk), so every teacher connecting to a busy room
 //     stalls that room's answer processing for the duration of the query.
 //     This is a pure client-side round trip — no clock skew involved.
 //

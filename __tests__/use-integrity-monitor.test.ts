@@ -175,6 +175,63 @@ describe("focus loss", () => {
     expect(onEvent).toHaveBeenCalledWith("WINDOW_BLUR", undefined)
   })
 
+  describe("macOS SEB native controls", () => {
+    function macSeb() {
+      vi.spyOn(navigator, "userAgent", "get").mockReturnValue(
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) SEB/3.7.1.1"
+      )
+      window.SafeExamBrowser = { security: { updateKeys: vi.fn() } }
+    }
+
+    it("records sustained visible focus loss as information", () => {
+      macSeb()
+      const { onEvent } = setup()
+      focused = false
+      fire(window, new Event("blur"))
+      vi.advanceTimersByTime(1_499)
+      expect(onEvent).not.toHaveBeenCalled()
+      vi.advanceTimersByTime(1)
+      expect(onEvent.mock.calls).toEqual([["PAGE_FOCUS_LOST", undefined]])
+    })
+
+    it("still reports a hidden exam as TAB_HIDDEN only", () => {
+      macSeb()
+      const { onEvent } = setup()
+      focused = false
+      fire(window, new Event("blur"))
+      hidden = true
+      fire(document, new Event("visibilitychange"))
+      vi.advanceTimersByTime(5_000)
+      expect(onEvent.mock.calls).toEqual([["TAB_HIDDEN", undefined]])
+    })
+
+    it("cancels brief focus loss", () => {
+      macSeb()
+      const { onEvent } = setup()
+      focused = false
+      fire(window, new Event("blur"))
+      vi.advanceTimersByTime(200)
+      focused = true
+      fire(window, new Event("focus"))
+      vi.advanceTimersByTime(5_000)
+      expect(onEvent).not.toHaveBeenCalled()
+    })
+
+    it.each([
+      ["Macintosh; Intel Mac OS X 10_15_7", false],
+      ["Windows NT 10.0", true],
+      ["iPad; CPU OS 18_3 like Mac OS X", true],
+    ])("preserves window-blur detection for %s (SEB API: %s)", (ua, seb) => {
+      vi.spyOn(navigator, "userAgent", "get").mockReturnValue(ua)
+      if (seb) window.SafeExamBrowser = { security: { updateKeys: vi.fn() } }
+      const { onEvent } = setup()
+      focused = false
+      fire(window, new Event("blur"))
+      vi.advanceTimersByTime(1_500)
+      expect(onEvent.mock.calls).toEqual([["WINDOW_BLUR", undefined]])
+    })
+  })
+
   describe("reload (F5)", () => {
     // Set by hand: happy-dom's PageTransitionEvent drops `persisted`, and a
     // test can only dispatch untrusted events.

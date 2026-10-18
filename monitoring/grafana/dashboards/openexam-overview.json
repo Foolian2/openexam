@@ -55,7 +55,7 @@
     {
       "id": 12,
       "title": "WebSocket inbound queue wait (p99)",
-      "description": "How long frames wait for the room goroutine. Rising here with flat CPU is the queueing signature that leads the ack latency above.",
+      "description": "How long frames wait for the room goroutine. Rising here with flat CPU is the queueing signature observed during capacity testing, and leads the ack latency above.",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },

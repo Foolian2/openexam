@@ -130,6 +130,13 @@ export async function POST(request: NextRequest, { params }: Params) {
   ) {
     return apiError("VALIDATION_ERROR", "Ungültige Fragenkonfiguration", 400)
   }
+  // The extension restricts the teacher's requested submission format, not
+  // whether bytes are safe to execute. Arbitrary formats (including source
+  // code and text with no magic number) are supported. Files stay opaque in
+  // AnswerFile and every download uses downloadHeaders from
+  // lib/answer-file-headers.ts: attachment, application/octet-stream and
+  // nosniff. Never render or execute these bytes.
+  // nosemgrep: openexam-file-upload-trusts-client-content-type
   const ext = "." + (file.name.split(".").pop()?.toLowerCase() ?? "")
   // The extension is client-derived and ends up inside the file key, so pin
   // it to a plain lowercase-alphanumeric suffix. Without this a teacher config

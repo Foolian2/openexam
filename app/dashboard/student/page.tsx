@@ -84,7 +84,9 @@ function SessionContinueButton({ row }: { row: SessionRow }) {
   if (!row.canContinue) return null
   return (
     <Button asChild size="sm" variant="outline">
-      <Link href={`/exam/${row.examId}/take`}>Fortsetzen</Link>
+      {/* A plain <a>, not next/link: inside SEB a client-side navigation
+          fails the take page's Config Key check (lib/document-navigation.ts). */}
+      <a href={`/exam/${row.examId}/take`}>Fortsetzen</a>
     </Button>
   )
 }

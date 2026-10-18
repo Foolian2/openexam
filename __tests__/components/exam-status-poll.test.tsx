@@ -6,6 +6,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest"
 const mocks = vi.hoisted(() => ({
   fetch: vi.fn(),
   router: { push: vi.fn() },
+  replaceDocument: vi.fn(),
   socket: {
     connected: false,
     sendAnswer: vi.fn(async () => false),
@@ -14,6 +15,9 @@ const mocks = vi.hoisted(() => ({
 }))
 
 vi.mock("next/navigation", () => ({ useRouter: () => mocks.router }))
+vi.mock("@/lib/document-navigation", () => ({
+  replaceDocument: mocks.replaceDocument,
+}))
 vi.mock("next-themes", () => ({ useTheme: () => ({ theme: "light" }) }))
 vi.mock("@/lib/seb-client", () => ({
   sebFetch: mocks.fetch,
@@ -63,6 +67,7 @@ beforeEach(() => {
   vi.spyOn(Math, "random").mockReturnValue(0.5)
   mocks.fetch.mockReset()
   mocks.router.push.mockReset()
+  mocks.replaceDocument.mockReset()
   // Node 26 also exposes Web Storage globals; use this test browser's
   // storage so the simulated runner exercises browser persistence.
   vi.stubGlobal("localStorage", new BrowserStorage())
@@ -146,4 +151,18 @@ it("aborts an active status read and cancels further polling on unmount", async 
   expect(signal.aborted).toBe(true)
   await act(async () => vi.advanceTimersByTimeAsync(60_000))
   expect(mocks.fetch).toHaveBeenCalledTimes(2)
+})
+
+it("goes back to the waiting room with a full load before the shared start", async () => {
+  mocks.fetch.mockResolvedValueOnce(
+    new Response(
+      JSON.stringify({
+        error: { code: "NOT_STARTED", message: "Noch nicht gestartet" },
+      }),
+      { status: 409 }
+    )
+  )
+  await mount()
+  // Not a soft navigation: the waiting room checks SEB's Config Key too.
+  expect(mocks.replaceDocument).toHaveBeenCalledWith("/exam/e1/wait")
 })

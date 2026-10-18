@@ -40,7 +40,6 @@ jobs:
     name: Secret scan (gitleaks)
     runs-on: ubuntu-latest
     steps:
-      # Pinned by SHA; bump deliberately after reviewing the diff.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
@@ -97,9 +96,9 @@ jobs:
         # action-setup hard-fails on a mismatch with "Multiple versions of pnpm
         # specified" before a single step runs.
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: 22
+          node-version: 26
           cache: pnpm
 
       - name: Install dependencies
@@ -109,11 +108,13 @@ jobs:
         run: pnpm audit --prod --audit-level=high
 
   # --- S1: Go vulnerability scan (also first CI coverage for ws-backend) --
-  # Fail-closed: baseline verified clean on the pinned 1.26.9 toolchain,
-  # which carries the go1.26.9 stdlib fixes (crypto/tls, net/http and
-  # net/textproto: GO-2026-6603 to GO-2026-6617) on top of the go1.26.6
-  # ones (GO-2026-6218, GO-2026-6090, GO-2026-6089, GO-2026-6088,
-  # GO-2026-5972, GO-2026-5026). See SECURITY.md.
+  # Fail-closed: baseline verified clean on Go 1.27.2, the version the
+  # ws-backend image builds with (govulncheck: no vulnerabilities found,
+  # 2026-10-16). Before that it was the 1.26.9 toolchain, which carries the
+  # go1.26.9 stdlib fixes (crypto/tls, net/http and net/textproto:
+  # GO-2026-6603 to GO-2026-6617) on top of the go1.26.6 ones
+  # (GO-2026-6218, GO-2026-6090, GO-2026-6089, GO-2026-6088, GO-2026-5972,
+  # GO-2026-5026). See SECURITY.md.
   go-vulncheck:
     name: Go build, test, vulncheck (ws-backend)
     runs-on: ubuntu-latest
@@ -126,7 +127,7 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: "1.26.9"
+          go-version: "1.27.2"
           cache-dependency-path: ws-backend/go.sum
 
       - name: go build
@@ -150,10 +151,11 @@ jobs:
           govulncheck ./...
 
   # --- S2: container image scanning ----------------------------------------
-  # Fail-closed: both base images scan 0 CRITICAL/HIGH, so a
+  # Fail-closed (2026-08-12): both base images scan 0 CRITICAL/HIGH, so a
   # scan finding blocks the merge. See SECURITY.md.
   container-scan:
     name: Container image scan (trivy)
+    # docker/build-push-action + Trivy need Docker on Linux — provided by ubuntu-latest.
     runs-on: ubuntu-latest
     # Job-level override of the workflow-level permissions (job-level replaces,
     # not merges): actions: write is required for the type=gha buildx cache
@@ -183,7 +185,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # The default `docker` driver cannot export the type=gha cache below;
-      # a docker-container builder can.
+      # a docker-container builder can. The self-hosted runners came with
+      # one preinstalled, GitHub-hosted runners do not.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
@@ -198,9 +201,10 @@ jobs:
           tags: openexam-${{ matrix.name }}:scan
           build-args: |
             NEXT_PUBLIC_BASE_URL=http://localhost:3000
-          # type=gha buildx cache: repeat runs restore every unchanged layer,
-          # so the multi-stage Next.js build only re-executes the steps whose
-          # inputs changed.
+          # type=gha buildx cache: free (Actions cache, 10GB/repo), shared
+          # across runs. Repeat runs restore every unchanged layer (the
+          # multi-stage Next.js build only re-executes the steps whose inputs
+          # changed) on the otherwise empty GitHub-hosted VM.
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -237,13 +241,19 @@ jobs:
           category: "trivy-${{ matrix.name }}"
 
   # --- S3: third-party image scanning --------------------------------------
-  # container-scan only sees images this repo builds; this covers every
-  # image the stack pulls.
+  # The container-scan job above only ever sees images this repo BUILDS. Every
+  # image the stack PULLS -- postgres, grafana, minio, cap, the exporters --
+  # went unscanned entirely, which is how nginx-log-exporter sat on a 2021
+  # build with 69 unfixable Go 1.13 stdlib CVEs (5 critical) until someone
+  # scanned it by hand on 2026-08-27.
   #
-  # Advisory, unlike container-scan: findings accumulate against a digest pin
-  # purely through time passing, so failing closed would block every unrelated
-  # PR on the age of the pins. The CVE load tracks the pinned version, not the
-  # digest, so treat a rising count as a prompt to check for a newer version.
+  # ADVISORY, deliberately, unlike container-scan: findings here accumulate
+  # against a digest pin purely through time passing, so failing closed would
+  # block every unrelated PR on the age of the pins.
+  #
+  # Baseline and upgrade measurements: SECURITY.md, "Scan triage". Preserve
+  # per-image JSON reports below: totals alone cannot tell maintainers which
+  # packages have fixes or which upstream rebuilds are still needed.
   third-party-image-scan:
     name: Third-party image scan (trivy)
     runs-on: ubuntu-latest
@@ -274,8 +284,10 @@ jobs:
           TRIVY="ghcr.io/aquasecurity/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969"
           docker pull -q "$TRIVY"
           status=0
+          mkdir -p third-party-reports
           printf '%-8s %-8s %s\n' CRITICAL HIGH IMAGE
           while read -r img; do
+            report="third-party-reports/$(printf '%s' "${img%%@*}" | tr '/:' '__').json"
             # Don't let one unpullable image end the step: under `bash -e` a
             # failed pull aborted the loop, so the images sorting after it
             # were never reported and the log showed a docker error instead of
@@ -288,21 +300,21 @@ jobs:
               continue
             fi
             # Same reasoning for the scan itself: a trivy failure truncates
-            # out.json, which then crashes the parser below and takes the
+            # the report, which then crashes the parser below and takes the
             # remaining images with it.
             if ! docker run --rm \
               -v /var/run/docker.sock:/var/run/docker.sock \
               -e TRIVY_DB_REPOSITORY \
               "$TRIVY" image --quiet --scanners vuln \
-              --severity CRITICAL,HIGH --format json "$img" > out.json; then
+              --severity CRITICAL,HIGH --format json "$img" > "$report"; then
               printf '%-8s %-8s %s\n' SCAN FAIL "${img%%@*}"
               status=1
               continue
             fi
-            python3 - "$img" <<'EOF'
+            python3 - "$img" "$report" <<'EOF'
           import json, sys, collections
           counts = collections.Counter()
-          with open('out.json') as fh:
+          with open(sys.argv[2]) as fh:
               data = json.load(fh)
           for result in data.get('Results') or []:
               for vuln in result.get('Vulnerabilities') or []:
@@ -312,14 +324,27 @@ jobs:
           done < images.txt
           exit $status
 
+      - name: Preserve third-party vulnerability reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: third-party-vulnerability-reports
+          path: |
+            images.txt
+            third-party-reports/*.json
+          retention-days: 14
+
   # --- S4: SAST (rule packs + audit-derived custom rules) -----------------
   # Results surface in the job log and the SARIF upload (see SECURITY.md).
   #
-  # Advisory (continue-on-error). PR and push scans are baselined, so only
-  # findings a change introduces are reported as blocking.
+  # Still advisory (continue-on-error), but no longer permanently red: the
+  # step below baselines PR and push scans so only new findings are reported.
+  # The full local scan is clean after the 2026-10-17 triage (SECURITY.md).
+  # Keep advisory until a hosted run confirms it; hosted Actions were blocked
+  # by account billing during that triage.
   semgrep:
     name: Semgrep SAST
-    # container: jobs are only supported on Linux runners.
+    # container: jobs are only supported on Linux runners; ubuntu-latest qualifies.
     runs-on: ubuntu-latest
     continue-on-error: true
     container:

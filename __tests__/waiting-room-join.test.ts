@@ -5,8 +5,9 @@ import { NextRequest } from "next/server"
 // an ordinary late join after it, and the race between the two.
 const m = vi.hoisted(() => ({
   exam: { findUnique: vi.fn() },
-  session: { findUnique: vi.fn() },
+  session: { findUnique: vi.fn(), upsert: vi.fn() },
   transaction: vi.fn(),
+  joinActive: vi.fn(),
   auth: vi.fn(),
   audit: vi.fn(),
   limit: vi.fn(),
@@ -15,6 +16,7 @@ const m = vi.hoisted(() => ({
 vi.mock("@/lib/prisma", () => ({
   prisma: { exam: m.exam, examSession: m.session, $transaction: m.transaction },
 }))
+vi.mock("@/lib/join-active-exam", () => ({ joinActiveExam: m.joinActive }))
 vi.mock("@/lib/api-auth", () => ({ requireStudent: m.auth }))
 vi.mock("@/lib/audit", () => ({ createAuditLog: m.audit }))
 vi.mock("@/lib/rate-limit", () => ({ rateLimit: m.limit }))
@@ -149,11 +151,11 @@ describe("waiting room join", () => {
 describe("late join after Start", () => {
   it("gets the full time limit from the join, not capped at scheduledEnd", async () => {
     m.exam.findUnique.mockResolvedValue(examRow({ status: "ACTIVE" }))
-    const tx = txWith("ACTIVE")
+    m.joinActive.mockImplementation(async (create) => ({ id: "s1", ...create }))
     const { POST } = await import("@/app/api/sessions/route")
     const res = await POST(join())
     expect(res.status).toBe(201)
-    const create = tx.examSession.upsert.mock.calls[0][0].create
+    const create = m.joinActive.mock.calls[0][0]
     expect(create.status).toBe("IN_PROGRESS")
     // 11:00 + 60 min, although the stale scheduledEnd says 10:30.
     expect(create.effectiveEndTime).toEqual(new Date("2030-01-01T12:00:00Z"))

@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react"
 import { useRouter } from "next/navigation"
 import { Hourglass, Loader2, WifiOff } from "lucide-react"
 import { useClock } from "@/hooks/use-clock"
+import { replaceDocument } from "@/lib/document-navigation"
 import { Button } from "@/components/ui/button"
 import {
   Card,
@@ -121,12 +122,14 @@ export function WaitingRoom({
       () => {
         if (entering.current) return
         entering.current = true
-        router.replace(`/exam/${examId}/take`)
+        // A full load, not router.replace: inside SEB a soft navigation
+        // fails the take page's Config Key check. See replaceDocument.
+        replaceDocument(`/exam/${examId}/take`)
       },
       Math.max(0, delay)
     )
     return () => clearTimeout(timer)
-  }, [startedAt, offset, examId, router])
+  }, [startedAt, offset, examId])
 
   const secondsLeft = startedAt
     ? Math.max(

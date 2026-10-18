@@ -90,7 +90,7 @@ func TestGetAnswerSaveStateReadsCommittedLifecycleRows(t *testing.T) {
 		CREATE TABLE "ExamSession" (
 			id text PRIMARY KEY, "examId" text NOT NULL, status text NOT NULL,
 			"lockedAt" timestamp(3), "submittedAt" timestamp(3),
-			"effectiveEndTime" timestamp(3)
+			"startedAt" timestamp(3), "effectiveEndTime" timestamp(3)
 		);
 		CREATE TABLE "SessionLockInterval" (
 			id bigserial PRIMARY KEY, "sessionId" text NOT NULL REFERENCES "ExamSession"(id) ON DELETE CASCADE,
@@ -109,7 +109,7 @@ func TestGetAnswerSaveStateReadsCommittedLifecycleRows(t *testing.T) {
 		t.Fatalf("read lifecycle state: %v", err)
 	}
 	if state.SessionStatus != "IN_PROGRESS" || state.ExamStatus != "ACTIVE" ||
-		state.LockedAt != nil || state.SubmittedAt != nil {
+		state.LockedAt != nil || state.SubmittedAt != nil || state.StartedAt != nil {
 		t.Fatalf("unexpected lifecycle state: %+v", state)
 	}
 	lockedAt := time.Now().UTC().Truncate(time.Millisecond)
@@ -462,7 +462,7 @@ func TestFlushAnswers_PreservesPreLockSave(t *testing.T) {
 // Lock waits update row versions, but not the statement's interval snapshot.
 func TestLifecycleReadsRefreshIntervalSnapshotAfterLockWait(t *testing.T) {
 	ctx, setup, _, transition := testPostgres(t)
-	if _, err := setup.Exec(ctx, `CREATE TABLE "Exam" (id text PRIMARY KEY, status text, "closedAt" timestamp(3)); INSERT INTO "Exam" VALUES ('e','ACTIVE',NULL); ALTER TABLE "ExamSession" ADD COLUMN "examId" text DEFAULT 'e', ADD COLUMN "effectiveEndTime" timestamp(3);`); err != nil {
+	if _, err := setup.Exec(ctx, `CREATE TABLE "Exam" (id text PRIMARY KEY, status text, "closedAt" timestamp(3)); INSERT INTO "Exam" VALUES ('e','ACTIVE',NULL); ALTER TABLE "ExamSession" ADD COLUMN "examId" text DEFAULT 'e', ADD COLUMN "startedAt" timestamp(3), ADD COLUMN "effectiveEndTime" timestamp(3);`); err != nil {
 		t.Fatal(err)
 	}
 	var schema string
@@ -539,4 +539,89 @@ func TestLifecycleReadsRefreshIntervalSnapshotAfterLockWait(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Exercises both SQL snapshot paths, including their scan order, against
+// persisted informational and actionable events in an isolated schema.
+func TestMonitorCountsSeparatePageFocusLoss(t *testing.T) {
+	url := os.Getenv("TEST_DATABASE_URL")
+	if url == "" {
+		t.Skip("TEST_DATABASE_URL is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	admin, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	schema := fmt.Sprintf("focus_counts_%d", time.Now().UnixNano())
+	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+schema); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = admin.Exec(context.Background(), "DROP SCHEMA "+schema+" CASCADE")
+		_ = admin.Close(context.Background())
+	})
+	config, err := pgxpool.ParseConfig(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.ConnConfig.RuntimeParams["search_path"] = schema
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	_, err = pool.Exec(ctx, `
+ CREATE TYPE "IntegrityEventKind" AS ENUM ('PAGE_FOCUS_LOST', 'TAB_HIDDEN');
+ CREATE TABLE "User" (id text, name text, email text);
+ CREATE TABLE "Exam" (id text, "timeLimitMin" int, status text, "creatorId" text, "sebRequired" bool, "sebConfigKey" text);
+ CREATE TABLE "ExamSession" (
+  id text, "examId" text, "userId" text, status text,
+  "timeExtensionMin" int DEFAULT 0, "effectiveEndTime" timestamp,
+  "sebConfigKey" text, "sebKeyHash" text, "sebUserAgent" text,
+  "sebBrowserExamKey" text, "sebIntegrityFlaggedAt" timestamp,
+  "sebIntegrityReason" text, "startedAt" timestamp, "submittedAt" timestamp,
+  "submissionType" text, "namApplied" bool DEFAULT false,
+  "lastSeenAt" timestamp, "reconnectCount" int DEFAULT 0
+ );
+ CREATE TABLE "Question" (id text, type text, "examId" text);
+ CREATE TABLE "Answer" ("sessionId" text);
+ CREATE TABLE "Grade" ("sessionId" text, points float8, "maxPoints" float8, "autoGraded" bool);
+ CREATE TABLE "IntegrityEvent" (id text, "sessionId" text, kind "IntegrityEventKind", detail text, "clientTime" timestamp, "createdAt" timestamp);
+ INSERT INTO "User" VALUES ('u', 'Test Student', 'test@example.invalid');
+ INSERT INTO "Exam" VALUES ('e', 30, 'ACTIVE', 'teacher', true, NULL);
+ INSERT INTO "ExamSession" (id, "examId", "userId", status) VALUES ('s', 'e', 'u', 'IN_PROGRESS');
+ `)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Store{pool: pool}
+	assertCounts := func(warnings, info int) {
+		t.Helper()
+		auth, err := s.GetExamSessionAuth(ctx, "s")
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows, err := s.ListMonitorSessions(ctx, "e")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 1 {
+			t.Fatalf("got %d monitor sessions, want 1", len(rows))
+		}
+		if auth.IntegrityEventCount != warnings || auth.FocusLossEventCount != info ||
+			rows[0].IntegrityEventCount != warnings || rows[0].FocusLossEventCount != info {
+			t.Fatalf("counts diverged: auth=%+v snapshot=%+v, want warnings=%d info=%d", auth, rows[0], warnings, info)
+		}
+	}
+	assertCounts(0, 0)
+	if err := s.SaveIntegrityEvent(ctx, "s", "PAGE_FOCUS_LOST", "", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	assertCounts(0, 1)
+	if err := s.SaveIntegrityEvent(ctx, "s", "TAB_HIDDEN", "", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	assertCounts(1, 1)
 }

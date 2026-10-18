@@ -37,7 +37,7 @@ re-run `pnpm exec prisma migrate dev`. (Production is a different matter entirel
 
 - **Node 26**, **pnpm 12.3.4** (pinned via `packageManager` in `package.json` — use `corepack
   enable` or match the version manually).
-- **Go 1.25** for `ws-backend/` (only needed if you're touching the WebSocket server).
+- **Go 1.26** for `ws-backend/` (only needed if you're touching the WebSocket server).
 
 ## Before opening a PR
 

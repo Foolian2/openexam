@@ -113,9 +113,25 @@ func (h *Hub) GetOrCreateRoom(examID string) *Room {
 	go func() {
 		defer h.wg.Done()
 		defer recovery.Guard(h.log, "room run loop")
+		// A join may already have installed a replacement while this
+		// stopped room was draining; removeRoomIfCurrent deletes the entry
+		// only while it still points at this instance.
+		defer h.removeRoomIfCurrent(examID, r)
 		r.run(h.roomCtx)
 	}()
 	return r
+}
+
+// removeRoomIfCurrent deletes the hub's room entry for examID only while it
+// still points at r. A join may already have installed a replacement while
+// the stopped room was draining; an unconditional delete here would drop
+// that newer instance from the hub and orphan its clients.
+func (h *Hub) removeRoomIfCurrent(examID string, r *Room) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.rooms[examID] == r {
+		delete(h.rooms, examID)
+	}
 }
 
 // publish fans a monitor delta out to the other ws-backend instances.

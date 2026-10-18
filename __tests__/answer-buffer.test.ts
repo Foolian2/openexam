@@ -348,7 +348,9 @@ describe("createAnswerBuffer", () => {
 // The exam runner builds its buffer with the lazy-ref idiom, which runs while
 // the component renders — and Next.js renders "use client" components on the
 // server too. Reading localStorage there threw and broke SSR of the exam page
-// entirely, so this helper must hand back null rather than touch it.
+// entirely, so this helper always returns a working buffer: when localStorage
+// is missing or unusable it falls back to a no-op storage and keeps pending
+// answers in memory.
 describe("createLocalAnswerBuffer", () => {
   const original = Object.getOwnPropertyDescriptor(globalThis, "localStorage")
 
@@ -357,19 +359,27 @@ describe("createLocalAnswerBuffer", () => {
     else delete (globalThis as { localStorage?: unknown }).localStorage
   })
 
-  it("returns null when localStorage is absent (server render)", () => {
+  it("retains pending answers in memory when localStorage is absent", () => {
     delete (globalThis as { localStorage?: unknown }).localStorage
-    expect(createLocalAnswerBuffer("s1")).toBeNull()
+    const buffer = createLocalAnswerBuffer("s1")
+    buffer.enqueue("q1", freeText("pending"))
+    expect(buffer.entries()).toEqual([["q1", freeText("pending")]])
+    buffer.persistNow()
+    buffer.destroy()
   })
 
-  it("returns null when reading localStorage throws (storage denied)", () => {
+  it("retains pending answers in memory when storage access throws", () => {
     Object.defineProperty(globalThis, "localStorage", {
       configurable: true,
       get() {
         throw new Error("SecurityError: storage is disabled")
       },
     })
-    expect(createLocalAnswerBuffer("s1")).toBeNull()
+    const buffer = createLocalAnswerBuffer("s1")
+    buffer.enqueue("q1", freeText("pending"))
+    expect(buffer.entries()).toEqual([["q1", freeText("pending")]])
+    buffer.persistNow()
+    buffer.destroy()
   })
 
   it("returns a working buffer when localStorage is available", () => {
@@ -383,9 +393,8 @@ describe("createLocalAnswerBuffer", () => {
       },
     })
     const buffer = createLocalAnswerBuffer("s1")
-    expect(buffer).not.toBeNull()
-    buffer?.enqueue("q1", freeText("one"))
-    buffer?.persistNow()
+    buffer.enqueue("q1", freeText("one"))
+    buffer.persistNow()
     expect(JSON.parse(store.get(STORAGE_KEY) ?? "null")).toEqual({
       q1: freeText("one"),
     })

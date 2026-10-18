@@ -259,32 +259,14 @@ export function createAnswerBuffer<T = unknown>(
   }
 }
 
-/**
- * localStorage-backed buffer, or null where localStorage cannot be used.
- *
- * Returning null rather than throwing matters in two places:
- *
- * Server rendering. Next.js renders "use client" components on the server
- * too, so reading `localStorage` while the component renders throws there.
- * The exam runner creates its buffer with the lazy-ref idiom — that runs
- * during render — so every server render of the exam page died with
- * "ReferenceError: localStorage is not defined" and the page could only ever
- * be client-rendered.
- *
- * A browser that denies storage. Reading `localStorage` throws SecurityError
- * when site data is blocked (Safari's private mode, a locked-down managed
- * profile). A student in that state would otherwise be unable to open the
- * exam at all, which is a worse outcome than losing crash-safety: answers
- * still save over the network on the normal debounced path, and the buffer
- * only adds recovery across a crash or reload.
- *
- * The nullable return is the point — it makes callers acknowledge both cases
- * instead of inheriting a latent throw.
- */
+/** Keep pending answers in memory even if browser persistence is denied. */
 export function createLocalAnswerBuffer<T = unknown>(
   sessionId: string
-): AnswerBuffer<T> | null {
-  const storage = getLocalStorage()
-  if (storage === null) return null
+): AnswerBuffer<T> {
+  const storage = getLocalStorage() ?? {
+    getItem: () => null,
+    setItem: () => {},
+    removeItem: () => {},
+  }
   return createAnswerBuffer<T>({ sessionId, storage })
 }

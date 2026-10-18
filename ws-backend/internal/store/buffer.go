@@ -23,8 +23,9 @@ func answersHashKey(examID string) string {
 // Buffer is a Redis-backed write-behind cache for answer saves: WS clients
 // get an ack as soon as the value lands in Redis, and a background Flusher
 // batches it into Postgres every FlushInterval. This bounds Postgres write
-// load under ~1000 concurrent typists without losing acked data (a crash
-// only loses the unflushed tail, matching the accepted risk in the design).
+// load under ~1000 concurrent typists. A worker crash leaves pending values
+// discoverable in Redis for the next worker; Redis durability is configured
+// separately by the deployment.
 //
 // An entry stays in the live hash until Postgres has it. lib/finalize-session
 // waits for a submitted session's fields to leave this hash before grading,
@@ -173,12 +174,9 @@ func (f *Flusher) flushAll(ctx context.Context) {
 	}
 }
 
-// snapshotAndClearDirtyScript reads the exam's buffer and clears its dirty
-// flag in one step. A SaveAnswer landing after it re-adds the exam to the
-// dirty set (its SADD runs after this SREM), so the next tick picks it up
-// even when this flush deletes nothing of it.
-var snapshotAndClearDirtyScript = redis.NewScript(`
-redis.call("SREM", KEYS[2], ARGV[1])
+// snapshotScript leaves dirty membership intact until the SQL commit and
+// cleanup complete. If the worker dies, the next worker can discover the hash.
+var snapshotScript = redis.NewScript(`
 return redis.call("HGETALL", KEYS[1])
 `)
 
@@ -187,13 +185,16 @@ return redis.call("HGETALL", KEYS[1])
 // sent back to Redis). A field overwritten by a newer save while the flush
 // was in flight keeps the newer value for the next tick. Every entry carries
 // its receive time, so a re-save of identical content is still a new value.
-// ARGV is field1, sha1(value1), field2, sha1(value2), ...
+// ARGV is examID, field1, sha1(value1), field2, sha1(value2), ...
 var deleteIfUnchangedScript = redis.NewScript(`
-for i = 1, #ARGV, 2 do
+for i = 2, #ARGV, 2 do
 	local current = redis.call("HGET", KEYS[1], ARGV[i])
 	if current and redis.sha1hex(current) == ARGV[i + 1] then
 		redis.call("HDEL", KEYS[1], ARGV[i])
 	end
+end
+if redis.call("HLEN", KEYS[1]) == 0 then
+ redis.call("SREM", KEYS[2], ARGV[1])
 end
 return 0
 `)
@@ -223,12 +224,17 @@ func newLockToken() (string, error) {
 	return hex.EncodeToString(b[:]), nil
 }
 
-// flushExam drains one exam's buffer. At most one flush per exam runs at a
-// time across all ws-backend instances: the snapshot leaves entries in the
-// hash until Postgres has them, so overlapping flushes (every
-// SESSION_SUBMITTED of a mass submission starts one) would each resend the
-// whole batch, and an older snapshot of an unsequenced save could commit
-// after a newer one.
+// flushExam drains one exam's buffer. While the flush lock holds, at most one
+// flush per exam runs at a time across all ws-backend instances: the snapshot
+// leaves entries in the hash until Postgres has them, so overlapping flushes
+// (every SESSION_SUBMITTED of a mass submission starts one) would each resend
+// the whole batch. The lock is TTL-only, so a transaction that outlives
+// flushLockTTL can overlap a successor flush. Sequenced writes stay safe under
+// that overlap — the upsert's clientSeq predicate turns the duplicate into a
+// no-op — but legacy/unsequenced writes are last-writer-wins, so an older
+// snapshot can commit after a newer one; that is the accepted residual. A
+// stalled flush can delay persistence, never strand data: the exam remains
+// dirty until cleanup and the entries stay in the hash.
 func (f *Flusher) flushExam(ctx context.Context, examID string) error {
 	token, err := newLockToken()
 	if err != nil {
@@ -241,7 +247,7 @@ func (f *Flusher) flushExam(ctx context.Context, examID string) error {
 	}
 	if !acquired {
 		// The running flush's snapshot covers everything buffered before it
-		// started, and anything newer re-added the exam to the dirty set, so
+		// started, and the exam remains in the dirty set until cleanup, so
 		// the next tick picks it up.
 		return nil
 	}
@@ -255,19 +261,25 @@ func (f *Flusher) flushExam(ctx context.Context, examID string) error {
 
 	hashKey := answersHashKey(examID)
 
-	values, err := snapshotAndClearDirtyScript.Run(ctx, f.rdb, []string{hashKey, dirtyExamsSet}, examID).StringSlice()
+	values, err := snapshotScript.Run(ctx, f.rdb, []string{hashKey}).StringSlice()
 	if err != nil {
 		return err
 	}
 	if len(values) == 0 {
-		return nil
+		return deleteIfUnchangedScript.Run(ctx, f.rdb, []string{hashKey, dirtyExamsSet}, examID).Err()
 	}
 
 	upserts := make([]AnswerUpsert, 0, len(values)/2)
 	sessionSet := make(map[string]struct{})
-	deleteArgs := make([]any, 0, len(values))
+	deleteArgs := make([]any, 1, len(values)+1)
+	deleteArgs[0] = examID
 	for i := 0; i+1 < len(values); i += 2 {
 		field, raw := values[i], values[i+1]
+		// Redis Lua only provides sha1hex. This is a compare-and-delete
+		// checksum of server-serialized buffer entries (including receive time),
+		// not a signature or authentication token. Keep it paired with
+		// deleteIfUnchangedScript; changing only this side loses cleanup.
+		// nosemgrep: go.lang.security.audit.crypto.use_of_weak_crypto.use-of-sha1
 		sum := sha1.Sum([]byte(raw))
 		deleteArgs = append(deleteArgs, field, hex.EncodeToString(sum[:]))
 
@@ -290,9 +302,13 @@ func (f *Flusher) flushExam(ctx context.Context, examID string) error {
 
 	if err := f.store.FlushAnswers(ctx, upserts); err != nil {
 		f.log.Error("flusher: flush failed, keeping buffer for retry", "examId", examID, "error", err)
-		// Nothing was removed from the hash, so only the dirty flag needs
-		// restoring. Use a fresh context: if ctx was canceled (e.g. room
-		// shutdown) the exam must still be retried by a later tick.
+		// Dirty membership survives until cleanup, so on an ordinary failure
+		// this SAdd is redundant. It stays as belt-and-braces for the
+		// lock-lapse overlap: a successor flush that took over after this
+		// flush's lock expired could have cleaned up and cleared the dirty
+		// flag, and re-marking guarantees a later tick revisits the entries
+		// still in the hash. Use a fresh context: if ctx was canceled (e.g.
+		// room shutdown) the exam must still be retried by a later tick.
 		restoreCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if dirtyErr := f.rdb.SAdd(restoreCtx, dirtyExamsSet, examID).Err(); dirtyErr != nil {
@@ -306,7 +322,7 @@ func (f *Flusher) flushExam(ctx context.Context, examID string) error {
 	// (a no-op for sequenced saves), but would hold up the submit drain wait.
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := deleteIfUnchangedScript.Run(cleanupCtx, f.rdb, []string{hashKey}, deleteArgs...).Err(); err != nil && !errors.Is(err, redis.Nil) {
+	if err := deleteIfUnchangedScript.Run(cleanupCtx, f.rdb, []string{hashKey, dirtyExamsSet}, deleteArgs...).Err(); err != nil && !errors.Is(err, redis.Nil) {
 		f.log.Error("flusher: failed to clear flushed entries", "examId", examID, "error", err)
 		// Fresh context: the failure may be cleanupCtx's own deadline, and
 		// without the dirty flag the leftover entries are never revisited.

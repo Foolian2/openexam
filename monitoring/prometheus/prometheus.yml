@@ -37,6 +37,23 @@ scrape_configs:
     static_configs:
       - targets: ["ws-backend:8080"]
 
+  # The same ws-backend /metrics, but fetched through nginx's `websocket`
+  # upstream (nginx.conf, the :8082 server) — the path every student socket
+  # takes. Its only purpose is `up`: if nginx cannot reach ws-backend (on
+  # 2026-10-14 it kept a stale IP after ws-backend was recreated, and every WS
+  # upgrade returned 502 while the direct scrape above stayed green),
+  # ContainerDown fires for this job. All scraped series are dropped so
+  # ws-backend's metrics aren't stored twice; `up` is synthesized by
+  # Prometheus and survives the drop.
+  - job_name: ws-backend-via-nginx
+    metrics_path: /ws-backend/metrics
+    static_configs:
+      - targets: ["nginx:8082"]
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: ".+"
+        action: drop
+
   - job_name: node
     static_configs:
       - targets: ["node-exporter:9100"]

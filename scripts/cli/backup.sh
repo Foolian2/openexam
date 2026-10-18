@@ -269,12 +269,31 @@ cmd_backup() {
 # objects that are in the archive, so a dump from before a migration would
 # leave that migration's newer tables and enums behind.
 oe_pg_restore() (
-  set -o pipefail
-  {
-    printf 'DROP SCHEMA IF EXISTS public CASCADE;\nCREATE SCHEMA public;\n'
-    oe_prod exec -T postgres pg_restore -U openexam --no-owner -f - < "$1"
-  } | oe_prod exec -T postgres psql -U openexam -d openexam \
-    -v ON_ERROR_STOP=1 --single-transaction -q -o /dev/null
+  # Plain-SQL rendering can be larger than the archive itself; spool it
+  # somewhere with room (OE_RESTORE_SPOOL_DIR, e.g. the backups volume)
+  # instead of relying on /tmp having space.
+  local spool_dir="${OE_RESTORE_SPOOL_DIR:-${TMPDIR:-/tmp}}"
+  local sql
+  sql=$(mktemp "$spool_dir/openexam-restore-sql.XXXXXX") || return 1
+  cleanup() { rm -f -- "$sql"; }
+  trap cleanup EXIT
+  # Belt and braces for an interrupted restore: bash already runs the EXIT
+  # trap on fatal signals, but a trapped signal is deferred until the
+  # current foreground command (pg_restore/psql) finishes, so keep both the
+  # unconditional EXIT cleanup and an explicit exit status per signal
+  # (128 + signo: 130 for INT, 143 for TERM).
+  trap 'cleanup; exit 130' INT
+  trap 'cleanup; exit 143' TERM
+  # A failed producer cannot roll back a consumer that already committed
+  # valid DROP/CREATE statements. Finish the entire SQL file before psql;
+  # cleanup removes it again on every exit path, spool left empty.
+  printf 'DROP SCHEMA IF EXISTS public CASCADE;\nCREATE SCHEMA public;\n' > "$sql" || return 1
+  if ! oe_prod exec -T postgres pg_restore -U openexam --no-owner -f - < "$1" >> "$sql"; then
+    echo "ERROR: pg_restore failed; restore aborted before any change." >&2
+    return 1
+  fi
+  oe_prod exec -T postgres psql -U openexam -d openexam \
+    -v ON_ERROR_STOP=1 --single-transaction -f - -q -o /dev/null < "$sql"
 )
 
 oe_health_check() {
@@ -336,7 +355,7 @@ cmd_restore() {
   ui_kv "Dump" "$file ($(du -h "$file" | cut -f1))"
   ui_kv "Into" "the openexam database on $domain"
   if crontab -l 2>/dev/null | grep -q pitr-backup.sh; then
-    ui_dim "Need a specific point in time instead? See scripts/pitr-restore.sh (DEPLOYMENT.md)."
+    ui_dim "Need to rebuild from the wal-g base backup archive instead? See scripts/pitr-restore.sh (DEPLOYMENT.md)."
   fi
   echo
   ui_type_to_confirm "$domain" "This replaces ALL current data (exams, answers, accounts) with the dump." \
@@ -354,7 +373,7 @@ cmd_restore() {
   local restore_ok=1
   if ! ui_run "Restoring $file" oe_pg_restore "$source"; then
     restore_ok=0
-    ui_warn "Restore failed and was rolled back — the database is unchanged."
+    ui_warn "Restore failed — the database is unchanged (aborted before psql ran or rolled back in its transaction)."
   fi
   rm -f "$source"
   ui_run "Starting web and ws-backend" oe_prod up -d web ws-backend || exit 1

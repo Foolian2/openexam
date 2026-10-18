@@ -170,6 +170,100 @@ oe_repair_dev_env >/dev/null
 check "repair is idempotent" [ "$before" = "$(cat "$DEV_ENV")" ]
 DEV_ENV=.env
 
+# ── optional SMTP on unattended production installs ──
+# shellcheck source=scripts/cli/install.sh
+. scripts/cli/install.sh
+(
+  unset SMTP_HOST SMTP_PORT SMTP_USER SMTP_PASSWORD SMTP_FROM SMTP_SECURE
+  OE_ASSUME_YES=1
+  oe_ask_smtp </dev/null >/dev/null
+  [ "$SMTP_ENABLED" -eq 0 ]
+) && pass "unattended install skips unconfigured SMTP" || fail "unattended install skips unconfigured SMTP"
+(
+  unset SMTP_HOST SMTP_PORT SMTP_USER SMTP_PASSWORD SMTP_FROM SMTP_SECURE
+  OE_ASSUME_YES=0
+  oe_ask_smtp </dev/null >/dev/null
+  [ "$SMTP_ENABLED" -eq 0 ]
+) && pass "nonterminal install skips unconfigured SMTP" || fail "nonterminal install skips unconfigured SMTP"
+(
+  OE_ASSUME_YES=1
+  DOMAIN=exam.school.ch
+  SMTP_HOST=smtp.school.ch SMTP_PORT=465 SMTP_USER=test-user SMTP_PASSWORD=test-password
+  SMTP_FROM='OpenExam <test@school.ch>'
+  oe_ask_smtp </dev/null >/dev/null
+  [ "$SMTP_ENABLED" -eq 1 ] && [ "$SMTP_SECURE" = true ] && [ "$SMTP_USER" = test-user ] && [ "$SMTP_PASSWORD" = test-password ]
+) && pass "unattended install keeps configured SMTP" || fail "unattended install keeps configured SMTP"
+
+# ── monitoring setup: private config and an initially absent crontab ──
+# Production monitoring is Linux-only; local CLI checks also run on macOS.
+if [ "$(oe_os)" = linux ]; then
+  fixture="$tmp/monitoring"
+  mkdir -p "$fixture/scripts/lib" "$fixture/monitoring/alertmanager" "$fixture/bin"
+  cp scripts/setup-monitoring.sh "$fixture/scripts/"
+  cp scripts/lib/production-compose.sh scripts/lib/env-file.sh scripts/lib/pitr-state.sh scripts/lib/detect.sh "$fixture/scripts/lib/"
+  cp monitoring/alertmanager/alertmanager.yml.tmpl "$fixture/monitoring/alertmanager/"
+  cat > "$fixture/.env.prod" <<'ENV'
+WALG_STORAGE_BACKEND=disabled
+GRAFANA_ADMIN_PASSWORD=fixture-password
+GLITCHTIP_SECRET_KEY=fixture-secret
+GLITCHTIP_DB_PASSWORD=fixture-password
+MONITORING_DB_PASSWORD=fixture-password
+ALERT_EMAIL_TO=test@example.com
+SMTP_HOST=smtp.example.com
+SMTP_PORT=587
+SMTP_FROM=test@example.com
+SMTP_USER=test
+SMTP_PASSWORD=fixture-password
+SMTP_SECURE=false
+NEXT_PUBLIC_CAP_WIDGET_ENDPOINT=/cap-api/abcdef1234/
+ENV
+  cat > "$fixture/bin/docker" <<'MOCK'
+#!/bin/sh
+printf '%s\n' "$ALERTMANAGER_CONFIG_GID" > "$FIXTURE_DOCKER_LOG"
+MOCK
+  cat > "$fixture/bin/crontab" <<'MOCK'
+#!/bin/sh
+if [ "$1" = -l ]; then
+  [ -f "$FIXTURE_CRONTAB" ] || exit 1
+  cat "$FIXTURE_CRONTAB"
+else
+  cat > "$FIXTURE_CRONTAB.new"
+  mv "$FIXTURE_CRONTAB.new" "$FIXTURE_CRONTAB"
+fi
+MOCK
+  chmod +x "$fixture/bin/docker" "$fixture/bin/crontab"
+  run_monitoring_fixture() {
+    PATH="$fixture/bin:$PATH" FIXTURE_DOCKER_LOG="$fixture/docker-gid" FIXTURE_CRONTAB="$fixture/crontab" \
+      "$BASH" "$fixture/scripts/setup-monitoring.sh" > "$fixture/setup.log" 2>&1
+  }
+  check "monitoring setup handles absent crontab" run_monitoring_fixture
+  am_config="$fixture/monitoring/alertmanager/alertmanager.yml"
+  check "monitoring config is mode 640" [ "$(stat -c %a "$am_config")" = 640 ]
+  check "monitoring config group is persisted" [ "$(env_get ALERTMANAGER_CONFIG_GID "$fixture/.env.prod")" = "$(stat -c %g "$am_config")" ]
+  check "compose receives monitoring config group" [ "$(cat "$fixture/docker-gid")" = "$(stat -c %g "$am_config")" ]
+  check "monitoring config renders SMTP values" grep -q 'smtp_auth_password: "fixture-password"' "$am_config"
+  check "monitoring installs both cron jobs" [ "$(wc -l < "$fixture/crontab" | tr -d ' ')" = 2 ]
+  am_inode=$(stat -c %i "$am_config")
+  check "monitoring setup reruns successfully" run_monitoring_fixture
+  check "monitoring cron jobs are not duplicated" [ "$(wc -l < "$fixture/crontab" | tr -d ' ')" = 2 ]
+  # Re-runs rewrite the config in place: a replaced file would change the
+  # bind mount's inode (stale config until recreate) and its group.
+  check "monitoring rerun keeps the config inode" [ "$(stat -c %i "$am_config")" = "$am_inode" ]
+  # The rendered config holds SMTP_PASSWORD and is group-readable: its group
+  # must not be shared with other user accounts (setup-monitoring.sh's
+  # contract), whether that is the dedicated openexam-monitoring group or a
+  # user-private fallback.
+  check "monitoring config group is not shared with other users" \
+    oe_group_private_to "$(stat -c %g "$am_config")" "$(id -un)"
+  if [ -n "$(oe_group_gid openexam-monitoring)" ]; then
+    check "monitoring config uses the dedicated group" \
+      [ "$(stat -c %g "$am_config")" = "$(oe_group_gid openexam-monitoring)" ]
+  fi
+fi
+# ── transactional restore command boundary ──
+check "restore rejects partial archive output" bash scripts/test-restore.sh
+check "historical restore refuses destructive execution" bash scripts/test-pitr-restore.sh
+
 # ── entrypoint ──
 check "help exits 0" sh -c './openexam help >/dev/null'
 check "subcommand help exits 0" sh -c './openexam install local --help >/dev/null && ./openexam doctor --help >/dev/null'
