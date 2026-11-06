@@ -108,9 +108,9 @@ jobs:
         run: pnpm audit --prod --audit-level=high
 
   # --- S1: Go vulnerability scan (also first CI coverage for ws-backend) --
-  # Fail-closed: baseline verified clean on Go 1.27.2, the version the
+  # Fail-closed: baseline verified clean on Go 1.27.3, the version the
   # ws-backend image builds with (govulncheck: no vulnerabilities found,
-  # 2026-10-16). Before that it was the 1.26.9 toolchain, which carries the
+  # 2026-11-06; previously 1.27.2 on 2026-10-16). Before that it was the 1.26.9 toolchain, which carries the
   # go1.26.9 stdlib fixes (crypto/tls, net/http and net/textproto:
   # GO-2026-6603 to GO-2026-6617) on top of the go1.26.6 ones
   # (GO-2026-6218, GO-2026-6090, GO-2026-6089, GO-2026-6088, GO-2026-5972,
@@ -127,7 +127,7 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: "1.27.2"
+          go-version: "1.27.3"
           cache-dependency-path: ws-backend/go.sum
 
       - name: go build
@@ -235,7 +235,7 @@ jobs:
       - name: Upload SARIF
         # Requires GitHub Advanced Security — skip gracefully when not enabled.
         continue-on-error: true
-        uses: github/codeql-action/upload-sarif@24c7eb380a2dc368f2d129e4c65e51d172983a1e # v4
+        uses: github/codeql-action/upload-sarif@093c0af4c358e174c90d33c5672595fb14c89183 # v4
         with:
           sarif_file: "trivy-${{ matrix.name }}.sarif"
           category: "trivy-${{ matrix.name }}"
@@ -434,7 +434,7 @@ jobs:
         if: always()
         # Requires GitHub Advanced Security — skip gracefully when not enabled.
         continue-on-error: true
-        uses: github/codeql-action/upload-sarif@24c7eb380a2dc368f2d129e4c65e51d172983a1e # v4
+        uses: github/codeql-action/upload-sarif@093c0af4c358e174c90d33c5672595fb14c89183 # v4
         with:
           sarif_file: semgrep.sarif
           category: semgrep

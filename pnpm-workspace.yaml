@@ -40,6 +40,11 @@ overrides:
   # still allow 1.2.1, which hangs on crafted section offsets (GHSA-68fv-2mgg-jv7q).
   source-map-js: ^1.2.2
   '@hono/node-server': ^1.19.13
+  # @sentry/bundler-plugins still asks for glob ^13, whose minimatch is
+  # vulnerable (GHSA for glob <=14.0.1 / minimatch <11.0.1). Only used for
+  # source-map upload, which this deployment never runs; 14.x keeps the same
+  # exports, so the scoped bump is safe.
+  '@sentry/bundler-plugins>glob': 14.0.3
 allowBuilds:
   '@prisma/engines': true
   # sentry-cli's postinstall only fetches a native binary for uploading

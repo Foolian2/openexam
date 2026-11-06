@@ -21,6 +21,13 @@ All notable changes to OpenExam are documented here. The format follows
 - Harden proxy paths and upload-origin checks; refresh dependencies and image pins.
 - Improve exam-start burst handling, answer-save batching and monitoring alerts.
 
+### Security
+
+- Update Next.js to 16.4.5, better-auth to 1.7.17, nodemailer, sanitize-html,
+  Prisma 7.10.1 and the remaining minor/patch dependencies; clear all
+  production `pnpm audit` findings (Next.js, DOMPurify, nodemailer, sanitize-html).
+- Build ws-backend with Go 1.27.3 and pgx 5.12.0.
+
 ### Upgrade notes
 
 - Apply the additive `PAGE_FOCUS_LOST` database migration before updating the web
