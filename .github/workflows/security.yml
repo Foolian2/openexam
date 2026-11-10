@@ -235,7 +235,7 @@ jobs:
       - name: Upload SARIF
         # Requires GitHub Advanced Security — skip gracefully when not enabled.
         continue-on-error: true
-        uses: github/codeql-action/upload-sarif@24c7eb380a2dc368f2d129e4c65e51d172983a1e # v4
+        uses: github/codeql-action/upload-sarif@fbfa9f37476c0024508d051f3c34fcca3366b0e2 # v4
         with:
           sarif_file: "trivy-${{ matrix.name }}.sarif"
           category: "trivy-${{ matrix.name }}"
@@ -434,7 +434,7 @@ jobs:
         if: always()
         # Requires GitHub Advanced Security — skip gracefully when not enabled.
         continue-on-error: true
-        uses: github/codeql-action/upload-sarif@24c7eb380a2dc368f2d129e4c65e51d172983a1e # v4
+        uses: github/codeql-action/upload-sarif@fbfa9f37476c0024508d051f3c34fcca3366b0e2 # v4
         with:
           sarif_file: semgrep.sarif
           category: semgrep
