@@ -58,7 +58,10 @@ services:
     # older mainline. Config is unchanged and verified against 1.30 with
     # `nginx -t` (it already uses the modern `http2 on;` form rather than
     # the `listen ... http2` spelling deprecated since 1.25.1).
-    image: nginx:1.30-alpine@sha256:970364228b1e4f932abc22d321932816782cca8a20b85a77552a7cfe9acfb3b5
+    # Floor is 1.30.7: earlier releases carry the HTTP/2 remote code execution
+    # bugs CVE-2026-123007 and CVE-2026-123633, reachable here because both
+    # public 443 listeners set `http2 on;`. Do not pin a 1.30.6 or older digest.
+    image: nginx:1.30.7-alpine@sha256:bef154735288bc38d99fac41ae63730684bcc661503673a04a0f9bc526ba8598
     restart: unless-stopped
     ports:
       - "80:80"

@@ -6,6 +6,11 @@ All notable changes to OpenExam are documented here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- Update the edge proxy to nginx 1.30.7, fixing the HTTP/2 remote code
+  execution vulnerabilities CVE-2026-123007 and CVE-2026-123633.
+
 ### Fixed
 
 - Preserve queued answers through submission, reconnects, storage denial and
