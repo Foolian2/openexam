@@ -1,9 +1,11 @@
 # Base images pinned by digest (linux/amd64) so a re-pointed tag can never be
 # pulled silently; bump deliberately and re-verify.
 
-# golang:1.27.3-alpine → go1.27.3. (1.27.2, 2026-10-08, was the first 1.27 release with the
-# crypto/tls, net/http and net/textproto fixes GO-2026-6603 to GO-2026-6617.)
-FROM golang:1.27.3-alpine@sha256:fa3d596898d9f126af7c01d14ee7597bab3f39cccf392ef36b69fe77cd681f18 AS build
+# golang:1.27.4-alpine → go1.27.4 (2026-11-10 security release: net/http HTTP/1
+# server crash, CVE-2026-97033, plus cgo toolchain fixes). 1.27.2, 2026-10-08,
+# was the first 1.27 release with the crypto/tls, net/http and net/textproto
+# fixes GO-2026-6603 to GO-2026-6617.)
+FROM golang:1.27.4-alpine@sha256:70bd7ddea8b6cbe5d6943cde279d6b67feb10cc924fb9100d1d8757c1575b280 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
