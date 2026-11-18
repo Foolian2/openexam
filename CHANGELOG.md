@@ -21,6 +21,17 @@ All notable changes to OpenExam are documented here. The format follows
 - Harden proxy paths and upload-origin checks; refresh dependencies and image pins.
 - Improve exam-start burst handling, answer-save batching and monitoring alerts.
 
+### Security
+
+- Update the edge proxy to nginx 1.30.7, fixing the HTTP/2 remote code
+  execution vulnerabilities CVE-2026-123007 and CVE-2026-123633.
+- Update Next.js to 16.4.5, better-auth to 1.7.17, nodemailer, sanitize-html,
+  Prisma 7.10.1 and the remaining minor/patch dependencies; clear all
+  production `pnpm audit` findings (Next.js, DOMPurify, nodemailer, sanitize-html).
+- Build ws-backend with Go 1.27.4 (net/http HTTP/1 server crash, CVE-2026-97033)
+  and pgx 5.12.0.
+- Rebase the web image on node:26-alpine 2026-11-11 (Node 26.13.1, OpenSSL 3.5.9).
+
 ### Upgrade notes
 
 - Apply the additive `PAGE_FOCUS_LOST` database migration before updating the web
