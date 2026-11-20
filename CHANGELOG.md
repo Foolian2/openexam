@@ -22,6 +22,11 @@ All notable changes to OpenExam are documented here. The format follows
 - Improve exam-start burst handling, answer-save batching and monitoring alerts.
 - Admit a whole class launching SEB from one school network address; the
   launch-token check refused the 21st student.
+- Size per-IP sign-in, sign-up and passkey limits for a class behind one
+  school NAT address (200/min, was 5/min; Microsoft sign-in was 3 per 10 s).
+  Per-account limits and the Cap proof-of-work still bound guessing.
+- Give the Cap site key a class-sized rate limit (600/min per IP, was Cap's
+  default 30 per 5 s); `create-cap-site-key.sh` sets it on existing keys too.
 
 ### Security
 
@@ -46,6 +51,10 @@ All notable changes to OpenExam are documented here. The format follows
   or starting another exam; existing clients retain their launch configuration.
 - Run `scripts/setup-monitoring.sh` before starting the updated monitoring profile
   to set `ALERTMANAGER_CONFIG_GID`.
+- After deploying, run `scripts/create-cap-site-key.sh` once: it keeps the
+  existing site key and gives it the class-sized Cap rate limit. Then recreate
+  nginx (`up -d --force-recreate --no-deps nginx`) so the new Cap request
+  checks load; `deploy.sh`'s reload keeps the previously rendered config.
 - Node 26 and pnpm 12.3.4 are required. The WebSocket module requires Go 1.26;
   its production image and CI use Go 1.27.2.
 
