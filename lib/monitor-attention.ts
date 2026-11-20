@@ -1,5 +1,10 @@
 export type MonitorAttentionReason =
-  "DISCONNECTED" | "LOCKED" | "SEB_INTEGRITY" | "INTEGRITY_EVENTS" | "LOW_TIME"
+  | "DISCONNECTED"
+  | "LOCKED"
+  | "SEB_INTEGRITY"
+  | "DEVICE_REPLACED"
+  | "INTEGRITY_EVENTS"
+  | "LOW_TIME"
 
 export type MonitorConnectionState = "LIVE" | "POLLING" | "STALE"
 
@@ -10,6 +15,7 @@ export interface MonitorAttentionSession {
   answerCount: number
   integrityEventCount: number
   sebIntegrityFlagged?: boolean
+  deviceReplacedCount?: number
 }
 
 const OPEN_STATUSES = new Set(["IN_PROGRESS", "DISCONNECTED", "LOCKED"])
@@ -18,6 +24,7 @@ const ATTENTION_PRIORITY: Record<MonitorAttentionReason, number> = {
   DISCONNECTED: 500,
   LOCKED: 400,
   SEB_INTEGRITY: 300,
+  DEVICE_REPLACED: 250,
   INTEGRITY_EVENTS: 200,
   LOW_TIME: 100,
 }
@@ -49,6 +56,7 @@ export function getMonitorAttentionReasons(
   if (session.status === "DISCONNECTED") reasons.push("DISCONNECTED")
   if (session.status === "LOCKED") reasons.push("LOCKED")
   if (session.sebIntegrityFlagged) reasons.push("SEB_INTEGRITY")
+  if ((session.deviceReplacedCount ?? 0) > 0) reasons.push("DEVICE_REPLACED")
   if (session.integrityEventCount > 0) reasons.push("INTEGRITY_EVENTS")
 
   if (

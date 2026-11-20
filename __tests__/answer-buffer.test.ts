@@ -400,3 +400,165 @@ describe("createLocalAnswerBuffer", () => {
     })
   })
 })
+
+describe("tab-scoped records", () => {
+  class EnumerableStorage extends FakeStorage {
+    keys = new Set<string>()
+    get length() {
+      return this.keys.size
+    }
+    key(index: number): string | null {
+      return Array.from(this.keys)[index] ?? null
+    }
+    override setItem(key: string, value: string): void {
+      this.keys.add(key)
+      super.setItem(key, value)
+    }
+    override removeItem(key: string): void {
+      this.keys.delete(key)
+      super.removeItem(key)
+    }
+  }
+
+  const text = (t: string) => ({ type: "FREE_TEXT", text: t })
+
+  function bufferFor(storage: EnumerableStorage, tabId: string) {
+    return createAnswerBuffer({ sessionId: "s1", storage, tabId })
+  }
+
+  function replayed(storage: EnumerableStorage, tabId: string) {
+    let pending: Array<[string, unknown]> = []
+    bufferFor(storage, tabId).replay((p) => (pending = p))
+    return Object.fromEntries(pending)
+  }
+
+  it("keeps each tab's edits under its own key", () => {
+    const storage = new EnumerableStorage()
+    const a = bufferFor(storage, "tab-a")
+    const b = bufferFor(storage, "tab-b")
+    a.enqueue("q1", text("from a"))
+    b.enqueue("q2", text("from b"))
+    a.persistNow()
+    b.persistNow()
+    expect(storage.read(`${STORAGE_KEY}:tab-a`)).toEqual({ q1: text("from a") })
+    expect(storage.read(`${STORAGE_KEY}:tab-b`)).toEqual({ q2: text("from b") })
+  })
+
+  it("adopts only the pre-takeover edits of a replaced tab, never its detached ones", () => {
+    const storage = new EnumerableStorage()
+    const replacedTab = bufferFor(storage, "tab-a")
+    replacedTab.enqueue("q1", text("pre-takeover"))
+    replacedTab.persistNow()
+    replacedTab.markReplaced()
+    // Edits after the takeover land under the detached key.
+    replacedTab.enqueue("q2", text("post-takeover"))
+    replacedTab.persistNow()
+
+    // The new owner adopts the pre-takeover record (unsaved answers are not
+    // lost) but never the detached post-takeover edits.
+    expect(replayed(storage, "tab-b")).toEqual({ q1: text("pre-takeover") })
+    expect(storage.getItem(`${STORAGE_KEY}:tab-a:detached`)).not.toBeNull()
+  })
+
+  it("recovers all of a reclaimed tab's own edits on reload", () => {
+    const storage = new EnumerableStorage()
+    const replacedTab = bufferFor(storage, "tab-a")
+    replacedTab.enqueue("q1", text("pre-takeover"))
+    replacedTab.persistNow()
+    replacedTab.markReplaced()
+    replacedTab.enqueue("q2", text("post-takeover"))
+    replacedTab.persistNow()
+
+    // Reclaim clears the marker, so the tab's own replay adopts its detached
+    // record again alongside its base record.
+    const reclaimed = bufferFor(storage, "tab-a")
+    reclaimed.clearReplaced()
+    expect(replayed(storage, "tab-a")).toEqual({
+      q1: text("pre-takeover"),
+      q2: text("post-takeover"),
+    })
+  })
+
+  it("adopts the record of a tab that is gone, own edits winning", () => {
+    const storage = new EnumerableStorage()
+    storage.setItem(
+      `${STORAGE_KEY}:tab-crashed`,
+      JSON.stringify({ q1: text("crashed q1"), q2: text("crashed q2") })
+    )
+    storage.setItem(
+      `${STORAGE_KEY}:tab-b`,
+      JSON.stringify({ q2: text("own q2") })
+    )
+    expect(replayed(storage, "tab-b")).toEqual({
+      q1: text("crashed q1"),
+      q2: text("own q2"),
+    })
+    expect(storage.getItem(`${STORAGE_KEY}:tab-crashed`)).toBeNull()
+    expect(storage.read(`${STORAGE_KEY}:tab-b`)).toEqual({
+      q1: text("crashed q1"),
+      q2: text("own q2"),
+    })
+  })
+
+  it("adopts a record written before records were scoped by tab", () => {
+    const storage = new EnumerableStorage()
+    storage.setItem(STORAGE_KEY, JSON.stringify({ q1: text("legacy") }))
+    // Another session whose id extends this one's is not adopted.
+    storage.setItem(`${STORAGE_KEY}0`, JSON.stringify({ q9: text("other") }))
+    expect(replayed(storage, "tab-b")).toEqual({ q1: text("legacy") })
+    expect(storage.getItem(STORAGE_KEY)).toBeNull()
+    expect(storage.getItem(`${STORAGE_KEY}0`)).not.toBeNull()
+  })
+
+  it("resolves a lazy tab identity when the record is first used", () => {
+    const storage = new EnumerableStorage()
+    let tabId = "tab-copied"
+    const buffer = createAnswerBuffer({
+      sessionId: "s1",
+      storage,
+      tabId: () => tabId,
+    })
+    tabId = "tab-minted"
+    buffer.enqueue("q1", text("edit"))
+    buffer.persistNow()
+    expect(storage.read(`${STORAGE_KEY}:tab-minted`)).toEqual({
+      q1: text("edit"),
+    })
+  })
+
+  it("clears the replaced marker with the record after submit", () => {
+    const storage = new EnumerableStorage()
+    const buffer = bufferFor(storage, "tab-a")
+    buffer.markReplaced()
+    buffer.clearAll()
+    expect(storage.getItem(`${STORAGE_KEY}:tab-a:replaced`)).toBeNull()
+  })
+
+  it("clearAll removes every record of the session, including other tabs' and markers", () => {
+    const storage = new EnumerableStorage()
+    storage.setItem(`${STORAGE_KEY}:tab-a`, JSON.stringify({ q1: text("a") }))
+    storage.setItem(`${STORAGE_KEY}:tab-a:replaced`, "1")
+    storage.setItem(
+      `${STORAGE_KEY}:tab-b:detached`,
+      JSON.stringify({ q2: text("b") })
+    )
+    storage.setItem(STORAGE_KEY, JSON.stringify({ q3: text("legacy") }))
+    // A different session whose id merely extends this one's, and an
+    // unrelated key, must survive.
+    storage.setItem("openexam:pending:s10:x", JSON.stringify({ q9: text("x") }))
+    storage.setItem("unrelated", "1")
+
+    const buffer = bufferFor(storage, "tab-c")
+    buffer.enqueue("q4", text("own"))
+    buffer.persistNow()
+    buffer.clearAll()
+
+    expect(storage.getItem(`${STORAGE_KEY}:tab-a`)).toBeNull()
+    expect(storage.getItem(`${STORAGE_KEY}:tab-a:replaced`)).toBeNull()
+    expect(storage.getItem(`${STORAGE_KEY}:tab-b:detached`)).toBeNull()
+    expect(storage.getItem(STORAGE_KEY)).toBeNull()
+    expect(storage.getItem(`${STORAGE_KEY}:tab-c`)).toBeNull()
+    expect(storage.getItem("openexam:pending:s10:x")).not.toBeNull()
+    expect(storage.getItem("unrelated")).not.toBeNull()
+  })
+})

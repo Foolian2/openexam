@@ -9,6 +9,12 @@ import { rateLimit } from "@/lib/rate-limit"
 import { submitSessionSchema } from "@/lib/validators/session"
 import { isSubmitted, OPEN_STATUSES, submitKind } from "@/lib/session-state"
 import { verifySebAccess } from "@/lib/seb-guard"
+import {
+  activeDeviceWhere,
+  gateActiveDevice,
+  getExamDeviceId,
+  isActiveDevice,
+} from "@/lib/exam-device"
 import { publicRequestUrl } from "@/lib/seb-urls"
 import { finalizeSession } from "@/lib/finalize-session"
 import {
@@ -17,6 +23,7 @@ import {
   forbidden,
   notFound,
   rateLimited,
+  sessionReplaced,
   validationError,
 } from "@/lib/api-response"
 
@@ -26,6 +33,7 @@ export async function POST(request: NextRequest, { params }: Params) {
   const authed = await requireSession(request)
   if (authed instanceof NextResponse) return authed
   const session = authed
+  const deviceId = getExamDeviceId(request.headers)
 
   // Idempotent (replay-safe via idempotencyKey), but should still not be
   // hammerable — fail closed like join-exam, since this finalizes a graded
@@ -67,6 +75,9 @@ export async function POST(request: NextRequest, { params }: Params) {
   if (!guard.ok) {
     return forbidden("Safe Exam Browser erforderlich")
   }
+  if (!isActiveDevice(preSession, session.session.id, deviceId)) {
+    return sessionReplaced()
+  }
 
   let outcome: "submitted" | "replay"
   let examId = ""
@@ -76,10 +87,22 @@ export async function POST(request: NextRequest, { params }: Params) {
       if (!examSession || examSession.userId !== session.user.id)
         throw new ApiError(404, "NOT_FOUND", "Sitzung nicht gefunden")
       examId = examSession.examId
+      if (!isActiveDevice(examSession, session.session.id, deviceId)) {
+        throw new ApiError(409, "SESSION_REPLACED", "Sitzung wurde übernommen")
+      }
 
       if (isSubmitted(examSession.status)) {
         // Idempotent replay (e.g. client retry after a lost response).
-        if (examSession.idempotencyKey === idempotencyKey) return "replay"
+        if (examSession.idempotencyKey === idempotencyKey) {
+          await gateActiveDevice(tx, {
+            id,
+            status: examSession.status,
+            authSessionId: session.session.id,
+            deviceId,
+            conflictMessage: "Prüfung wurde bereits abgegeben",
+          })
+          return "replay"
+        }
         throw new ApiError(409, "CONFLICT", "Prüfung wurde bereits abgegeben")
       }
       if (examSession.status === "LOCKED") {
@@ -96,7 +119,11 @@ export async function POST(request: NextRequest, { params }: Params) {
       // submits could both pass the checks above. The status condition makes
       // only one of them win; the loser is treated as a replay/conflict.
       const updated = await tx.examSession.updateMany({
-        where: { id, status: { in: OPEN_STATUSES } },
+        where: {
+          id,
+          status: { in: OPEN_STATUSES },
+          ...activeDeviceWhere(session.session.id, deviceId),
+        },
         data: {
           status: kind === "AUTO_TIME" ? "AUTO_SUBMITTED" : "SUBMITTED",
           submissionType: kind,
@@ -106,6 +133,13 @@ export async function POST(request: NextRequest, { params }: Params) {
       })
       if (updated.count === 0) {
         const raced = await tx.examSession.findUnique({ where: { id } })
+        if (raced && !isActiveDevice(raced, session.session.id, deviceId)) {
+          throw new ApiError(
+            409,
+            "SESSION_REPLACED",
+            "Sitzung wurde übernommen"
+          )
+        }
         if (raced?.idempotencyKey === idempotencyKey) return "replay"
         throw new ApiError(409, "CONFLICT", "Prüfung wurde bereits abgegeben")
       }

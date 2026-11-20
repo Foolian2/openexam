@@ -6,8 +6,15 @@ import { createAuditLog } from "@/lib/audit"
 import { rateLimit } from "@/lib/rate-limit"
 import { sanitizeQuestion, seededShuffle } from "@/lib/exam-session"
 import { verifySebAccess } from "@/lib/seb-guard"
+import { getExamDeviceId, isActiveDevice } from "@/lib/exam-device"
 import { publicRequestUrl } from "@/lib/seb-urls"
-import { apiError, forbidden, notFound, rateLimited } from "@/lib/api-response"
+import {
+  apiError,
+  forbidden,
+  notFound,
+  rateLimited,
+  sessionReplaced,
+} from "@/lib/api-response"
 import { isWaiting } from "@/lib/session-state"
 import { loadSessionAnswers } from "@/lib/ws-answer-buffer"
 import { redis } from "@/lib/redis"
@@ -56,6 +63,15 @@ export async function GET(request: NextRequest, { params }: Params) {
   })
   if (!guard.ok) {
     return forbidden("Safe Exam Browser erforderlich")
+  }
+  if (
+    !isActiveDevice(
+      examSession,
+      session.session.id,
+      getExamDeviceId(request.headers)
+    )
+  ) {
+    return sessionReplaced()
   }
 
   if (

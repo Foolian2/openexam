@@ -9,6 +9,7 @@ import {
   useState,
 } from "react"
 import { getSebKey, getSebRequestHash } from "@/lib/seb-client"
+import { getExamTabId } from "@/lib/exam-tab"
 import type { IntegrityEventKind } from "@/hooks/use-integrity-monitor"
 
 type AnswerContent = unknown
@@ -22,6 +23,10 @@ interface Envelope {
   type: string
   id?: string
   data?: unknown
+}
+
+interface AnswerErrorData {
+  code?: string
 }
 
 interface ControlData {
@@ -110,6 +115,7 @@ export function useExamSocket({
 
       const base = wsBaseUrl() || window.location.origin.replace(/^http/, "ws")
       const url = new URL(`${base}/ws/exam/${sessionId}`)
+      url.searchParams.set("deviceId", getExamTabId())
       const ws = new WebSocket(url)
       wsRef.current = ws
 
@@ -164,8 +170,21 @@ export function useExamSocket({
             break
           case "answer:error":
             if (env.id) resolveAck(env.id, false)
+            if (
+              (env.data as AnswerErrorData | undefined)?.code ===
+              "SESSION_REPLACED"
+            ) {
+              closedByUsRef.current = true
+              onControlRef.current({ action: "SESSION_REPLACED", sessionId })
+              ws.close()
+            }
             break
           case "exam:control":
+            // Another login or tab took the session over: reconnecting would
+            // only knock that one off in turn, so stop here for good.
+            if ((env.data as ControlData)?.action === "SESSION_REPLACED") {
+              closedByUsRef.current = true
+            }
             onControlRef.current(env.data as ControlData)
             break
           case "timer:sync":

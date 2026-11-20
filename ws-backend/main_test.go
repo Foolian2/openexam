@@ -51,10 +51,10 @@ type mutableSessionLookup struct {
 	err       error
 }
 
-func (s *mutableSessionLookup) LookupSession(context.Context, string) (string, string, time.Time, error) {
+func (s *mutableSessionLookup) LookupSession(context.Context, string) (string, string, string, time.Time, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.userID, s.role, s.expiresAt, s.err
+	return "auth-session-1", s.userID, s.role, s.expiresAt, s.err
 }
 
 func (s *mutableSessionLookup) set(userID, role string, expiresAt time.Time, err error) {
@@ -649,7 +649,7 @@ type sequencedLookup struct {
 	n    int
 }
 
-func (s *sequencedLookup) LookupSession(ctx context.Context, token string) (string, string, time.Time, error) {
+func (s *sequencedLookup) LookupSession(ctx context.Context, token string) (string, string, string, time.Time, error) {
 	s.mu.Lock()
 	i := s.n
 	if i >= len(s.errs) {
@@ -659,9 +659,9 @@ func (s *sequencedLookup) LookupSession(ctx context.Context, token string) (stri
 	err := s.errs[i]
 	s.mu.Unlock()
 	if err != nil {
-		return "", "", time.Time{}, err
+		return "", "", "", time.Time{}, err
 	}
-	return "user-1", "STUDENT", time.Now().Add(time.Hour), nil
+	return "auth-session-1", "user-1", "STUDENT", time.Now().Add(time.Hour), nil
 }
 
 func TestWatchSessionAuthorizationToleratesOneTransientFailure(t *testing.T) {
@@ -721,5 +721,52 @@ func TestWatchSessionAuthorizationClosesRevokedTokenImmediately(t *testing.T) {
 	_, _, err := conn.Read(readCtx)
 	if got := websocket.CloseStatus(err); got != websocket.StatusPolicyViolation {
 		t.Fatalf("revoked token not closed on the first recheck: status %v (error: %v)", got, err)
+	}
+}
+
+func TestActiveDeviceAllowed(t *testing.T) {
+	claimed := "auth-1"
+	device := "device-1"
+	empty := ""
+	cases := []struct {
+		name         string
+		activeAuth   *string
+		activeDevice *string
+		login        string
+		device       string
+		want         bool
+	}{
+		{"unclaimed admits any login", nil, nil, "auth-2", "device-2", true},
+		{"empty counts as unclaimed", &empty, &empty, "auth-2", "device-2", true},
+		{"legacy tab claim allows new tab", &claimed, nil, "auth-1", "device-2", true},
+		{"claiming login and tab", &claimed, &device, "auth-1", "device-1", true},
+		{"replaced login", &claimed, &device, "auth-2", "device-1", false},
+		{"replaced tab", &claimed, &device, "auth-1", "device-2", false},
+		{"missing tab", &claimed, &device, "auth-1", "", false},
+	}
+	for _, tc := range cases {
+		if got := activeDeviceAllowed(tc.activeAuth, tc.activeDevice, tc.login, tc.device); got != tc.want {
+			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestRequestedDeviceID(t *testing.T) {
+	for _, tc := range []struct {
+		query string
+		want  string
+		ok    bool
+	}{
+		{"", "", true},
+		{"?deviceId=550e8400-e29b-41d4-a716-446655440000", "550e8400-e29b-41d4-a716-446655440000", true},
+		{"?deviceId=", "", false},
+		{"?deviceId=anything", "", false},
+		{"?deviceId=550e8400-e29b-41d4-a716-446655440000&deviceId=550e8400-e29b-41d4-a716-446655440001", "", false},
+	} {
+		r := httptest.NewRequest(http.MethodGet, "/ws/exam/s"+tc.query, nil)
+		got, ok := requestedDeviceID(r)
+		if got != tc.want || ok != tc.ok {
+			t.Errorf("query %q: got (%q, %v), want (%q, %v)", tc.query, got, ok, tc.want, tc.ok)
+		}
 	}
 }

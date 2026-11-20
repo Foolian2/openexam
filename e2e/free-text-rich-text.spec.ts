@@ -1,4 +1,9 @@
-import { test, expect, type APIRequestContext, type Page } from "@playwright/test"
+import {
+  test,
+  expect,
+  type APIRequestContext,
+  type Page,
+} from "@playwright/test"
 import { uniqueEmail, signUp, promoteToTeacher, PASSWORD } from "./helpers"
 
 /**
@@ -51,9 +56,16 @@ test.describe("free-text rich text", () => {
     questionId = (await qRes.json()).question.id
 
     const publishRes = await teacherContext.post(`/api/exams/${examId}/publish`)
-    expect(publishRes.ok(), `publish failed: ${await publishRes.text()}`).toBe(true)
-    const activateRes = await teacherContext.post(`/api/exams/${examId}/activate`)
-    expect(activateRes.ok(), `activate failed: ${await activateRes.text()}`).toBe(true)
+    expect(publishRes.ok(), `publish failed: ${await publishRes.text()}`).toBe(
+      true
+    )
+    const activateRes = await teacherContext.post(
+      `/api/exams/${examId}/activate`
+    )
+    expect(
+      activateRes.ok(),
+      `activate failed: ${await activateRes.text()}`
+    ).toBe(true)
   })
 
   test.afterAll(async () => {
@@ -72,7 +84,9 @@ test.describe("free-text rich text", () => {
     await page.waitForURL(`**/exam/${examId}/take`)
 
     // The rich-text editor (toolbar + editable area) replaces the plain input.
-    await expect(page.getByRole("toolbar", { name: "Formatierung" })).toBeVisible()
+    await expect(
+      page.getByRole("toolbar", { name: "Formatierung" })
+    ).toBeVisible()
     const editor = page.getByRole("textbox")
     await expect(editor).toBeVisible()
     await expect(page.getByText("0 / 1000")).toBeVisible()
@@ -89,9 +103,7 @@ test.describe("free-text rich text", () => {
 
     const total = parts.join("").length
     await expect(page.getByText(`${total} / 1000`)).toBeVisible()
-    await expect(
-      editor.locator("strong", { hasText: boldWord })
-    ).toBeVisible()
+    await expect(editor.locator("strong", { hasText: boldWord })).toBeVisible()
 
     // Autosave persists; a reload restores the formatted answer. Scoped to
     // the banner: the same counter also appears in the Fragenübersicht rail.
@@ -115,10 +127,10 @@ test.describe("free-text rich text", () => {
     await page.goto(`/dashboard/teacher/grades/${examId}/${sessionId}`)
 
     // Formatted answer renders as HTML, keywords are highlighted with <mark>.
-    await expect(
-      page.locator("strong", { hasText: boldWord })
-    ).toBeVisible()
-    await expect(page.locator("mark", { hasText: "Bundesstadt" })).toHaveCount(1)
+    await expect(page.locator("strong", { hasText: boldWord })).toBeVisible()
+    await expect(page.locator("mark", { hasText: "Bundesstadt" })).toHaveCount(
+      1
+    )
     await expect(page.locator("mark", { hasText: "Schweiz" })).toHaveCount(1)
   })
 
@@ -137,7 +149,7 @@ test.describe("free-text rich text", () => {
     const editor = page.getByRole("textbox")
     await editor.click()
     await editor.pressSequentially(
-      '<img src=x onerror="document.body.setAttribute(\'data-xss\',\'1\')">Bern ist die Bundesstadt.'
+      "<img src=x onerror=\"document.body.setAttribute('data-xss','1')\">Bern ist die Bundesstadt."
     )
     await expect(
       page.getByRole("banner").getByText("1 von 1 Fragen beantwortet")
@@ -149,15 +161,23 @@ test.describe("free-text rich text", () => {
     // reload afterwards: the editor would re-parse (and strip) the payload.
     const mySessions = await page.request.get("/api/sessions")
     expect(mySessions.ok()).toBe(true)
-    const list = (await mySessions.json()).sessions as { id: string; exam: { id: string } }[]
+    const list = (await mySessions.json()).sessions as {
+      id: string
+      exam: { id: string }
+    }[]
     const mine = list.find((s) => s.exam.id === examId)
     expect(mine).toBeTruthy()
+    const deviceId = await page.evaluate(() =>
+      sessionStorage.getItem("openexam.examTabId")
+    )
+    expect(deviceId).toBeTruthy()
     const put = await page.request.put(`/api/sessions/${mine!.id}/answers`, {
+      headers: { "x-openexam-device-id": deviceId! },
       data: {
         questionId,
         content: {
           type: "FREE_TEXT",
-          text: '<img src=x onerror="document.body.setAttribute(\'data-xss\',\'1\')"><script>window.__xss = 1</script>Bern ist die Bundesstadt.',
+          text: "<img src=x onerror=\"document.body.setAttribute('data-xss','1')\"><script>window.__xss = 1</script>Bern ist die Bundesstadt.",
         },
       },
     })
@@ -178,9 +198,7 @@ test.describe("free-text rich text", () => {
     await expect(page.locator("body")).not.toHaveAttribute("data-xss", "1")
     await expect
       .poll(() =>
-        page.evaluate(
-          () => (window as unknown as { __xss?: number }).__xss
-        )
+        page.evaluate(() => (window as unknown as { __xss?: number }).__xss)
       )
       .toBe(undefined)
   })
@@ -204,7 +222,10 @@ test.describe("free-text rich text", () => {
   async function signInAsTeacher(page: Page): Promise<void> {
     const baseURL = new URL(page.url()).origin
     const headers = { origin: baseURL }
-    const out = await page.request.post("/api/auth/sign-out", { headers, data: {} })
+    const out = await page.request.post("/api/auth/sign-out", {
+      headers,
+      data: {},
+    })
     expect(out.ok(), `sign-out failed: ${await out.text()}`).toBe(true)
 
     for (let attempt = 0; attempt < 8; attempt++) {

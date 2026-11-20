@@ -1,5 +1,7 @@
 "use client"
 
+import { getExamTabId } from "@/lib/exam-tab"
+
 /**
  * Client-side bridge to the SEB JS API
  * (https://safeexambrowser.org/developer/seb-javascript-api.html).
@@ -49,7 +51,8 @@ function resolveSebKeys(): Promise<SebSecurityKeys> {
   if (cachedKeysPromise) return cachedKeysPromise
 
   const attempt: Promise<SebSecurityKeys> = new Promise((resolve) => {
-    const seb = typeof window !== "undefined" ? window.SafeExamBrowser : undefined
+    const seb =
+      typeof window !== "undefined" ? window.SafeExamBrowser : undefined
     if (!seb) {
       resolve({ configKey: null, browserExamKey: null })
       return
@@ -96,7 +99,11 @@ function resolveSebKeys(): Promise<SebSecurityKeys> {
   // the rest of the page's lifetime.
   cachedKeysPromise = attempt
   void attempt.then((keys) => {
-    if (!keys.configKey && !keys.browserExamKey && cachedKeysPromise === attempt) {
+    if (
+      !keys.configKey &&
+      !keys.browserExamKey &&
+      cachedKeysPromise === attempt
+    ) {
       cachedKeysPromise = null
     }
   })
@@ -129,11 +136,26 @@ const SEB_BEK_HEADER = "x-openexam-seb-requesthash"
  * `fetch` wrapper that attaches the SEB Config Key token and, when available,
  * the Browser Exam Key RequestHash.
  */
-export async function sebFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
+export async function sebFetch(
+  input: RequestInfo | URL,
+  init: RequestInit = {}
+): Promise<Response> {
   const { configKey, browserExamKey } = await resolveSebKeys()
-  if (!configKey && !browserExamKey) return fetch(input, init)
-
-  const headers = new Headers(init.headers)
+  const headers = new Headers(
+    input instanceof Request ? input.headers : undefined
+  )
+  new Headers(init.headers).forEach((value, name) => headers.set(name, value))
+  const url = new URL(
+    input instanceof Request ? input.url : String(input),
+    window.location.origin
+  )
+  if (
+    url.origin === window.location.origin &&
+    (url.pathname === "/api/sessions" ||
+      url.pathname.startsWith("/api/sessions/"))
+  ) {
+    headers.set("x-openexam-device-id", getExamTabId())
+  }
   if (configKey) headers.set("x-safeexambrowser-configkeyhash", configKey)
   if (browserExamKey) headers.set(SEB_BEK_HEADER, browserExamKey)
   return fetch(input, { ...init, headers })

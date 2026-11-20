@@ -5,6 +5,7 @@ import {
   partitionMonitorSessions,
 } from "@/lib/monitor-attention"
 
+import { applyMonitorPatch } from "@/lib/monitor-patch"
 const NOW = new Date("2026-08-20T12:00:00.000Z").getTime()
 
 function session(
@@ -15,6 +16,7 @@ function session(
     answerCount: number
     integrityEventCount: number
     sebIntegrityFlagged: boolean
+    deviceReplacedCount: number
   }> = {}
 ) {
   return {
@@ -29,6 +31,30 @@ function session(
 }
 
 describe("monitor attention queue", () => {
+  it("flags a session another login took over, below an SEB flag", () => {
+    expect(
+      getMonitorAttentionReasons(session({ deviceReplacedCount: 1 }), NOW, 4)
+    ).toEqual(["DEVICE_REPLACED"])
+    expect(
+      getMonitorAttentionReasons(session({ deviceReplacedCount: 0 }), NOW, 4)
+    ).toEqual([])
+
+    const result = partitionMonitorSessions(
+      [
+        session({ id: "integrity", integrityEventCount: 1 }),
+        session({ id: "device", deviceReplacedCount: 2 }),
+        session({ id: "seb", sebIntegrityFlagged: true }),
+      ],
+      NOW,
+      4
+    )
+    expect(result.attention.map((item) => item.session.id)).toEqual([
+      "seb",
+      "device",
+      "integrity",
+    ])
+  })
+
   it("prioritizes disconnected and locked sessions before integrity and low-time sessions", () => {
     const result = partitionMonitorSessions(
       [
@@ -140,5 +166,19 @@ describe("monitor connection state", () => {
         nowMs: NOW,
       })
     ).toBe("STALE")
+  })
+})
+
+describe("applyMonitorPatch", () => {
+  it("never lowers the replacement count from a delayed patch", () => {
+    const session = { id: "s1", deviceReplacedCount: 2, lastSeenAt: "a" }
+    expect(
+      applyMonitorPatch(session, { deviceReplacedCount: 1, lastSeenAt: "b" })
+    ).toEqual({ id: "s1", deviceReplacedCount: 2, lastSeenAt: "b" })
+    expect(applyMonitorPatch(session, { deviceReplacedCount: 3 })).toEqual({
+      id: "s1",
+      deviceReplacedCount: 3,
+      lastSeenAt: "a",
+    })
   })
 })

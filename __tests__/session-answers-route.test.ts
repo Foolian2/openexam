@@ -4,7 +4,7 @@ import { NextRequest } from "next/server"
 const { prismaMock, txMock, authMock, rateLimitMock, sebGuardMock } =
   vi.hoisted(() => {
     const txMock = {
-      examSession: { updateMany: vi.fn() },
+      examSession: { updateMany: vi.fn(), findUnique: vi.fn() },
       $queryRaw: vi.fn(),
       answer: { findUniqueOrThrow: vi.fn() },
     }
@@ -41,11 +41,14 @@ const SAVED_AT = new Date("2026-10-08T10:00:00Z")
 
 const freeText = { type: "FREE_TEXT", text: "Antwort" }
 
-function put(body: unknown) {
+function put(body: unknown, deviceId?: string) {
   return PUT(
     new NextRequest(`https://localhost/api/sessions/${SESSION_ID}/answers`, {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        ...(deviceId ? { "x-openexam-device-id": deviceId } : {}),
+      },
       body: JSON.stringify(body),
     }),
     { params: Promise.resolve({ id: SESSION_ID }) }
@@ -56,10 +59,15 @@ function save(content: unknown = freeText, clientSeq?: number) {
   return put({ questionId: QUESTION_ID, content, clientSeq })
 }
 
+function saveWithDevice(deviceId: string, content: unknown = freeText) {
+  return put({ questionId: QUESTION_ID, content }, deviceId)
+}
+
 beforeEach(() => {
   vi.clearAllMocks()
   authMock.api.getSession.mockResolvedValue({
     user: { id: "student1", role: "STUDENT" },
+    session: { id: "auth-1" },
   })
   rateLimitMock.mockResolvedValue({ allowed: true })
   sebGuardMock.mockResolvedValue({ ok: true })
@@ -122,12 +130,94 @@ describe("PUT /api/sessions/[id]/answers: access", () => {
     expectNothingWritten()
   })
 
+  it("refuses a login that another login has replaced", async () => {
+    prismaMock.examSession.findUnique.mockResolvedValue({
+      id: SESSION_ID,
+      examId: EXAM_ID,
+      userId: "student1",
+      status: "IN_PROGRESS",
+      startedAt: new Date("2026-10-08T09:00:00Z"),
+      effectiveEndTime: null,
+      activeAuthSessionId: "auth-2",
+      exam: { id: EXAM_ID },
+    })
+    const res = await save()
+    expect(res.status).toBe(409)
+    expect((await res.json()).error.code).toBe("SESSION_REPLACED")
+    expectNothingWritten()
+  })
+
+  it("accepts the login that holds the session", async () => {
+    prismaMock.examSession.findUnique.mockResolvedValue({
+      id: SESSION_ID,
+      examId: EXAM_ID,
+      userId: "student1",
+      status: "IN_PROGRESS",
+      startedAt: new Date("2026-10-08T09:00:00Z"),
+      effectiveEndTime: null,
+      activeAuthSessionId: "auth-1",
+      exam: { id: EXAM_ID },
+    })
+    expect((await save()).status).toBe(200)
+  })
+
+  it("refuses a bound tab when the device header is missing or foreign", async () => {
+    prismaMock.examSession.findUnique.mockResolvedValue({
+      id: SESSION_ID,
+      examId: EXAM_ID,
+      userId: "student1",
+      status: "IN_PROGRESS",
+      startedAt: new Date("2026-10-08T09:00:00Z"),
+      effectiveEndTime: null,
+      activeAuthSessionId: "auth-1",
+      activeDeviceId: UUID,
+      exam: { id: EXAM_ID },
+    })
+    // No header at all fails closed once a tab is bound.
+    let res = await save()
+    expect(res.status).toBe(409)
+    expect((await res.json()).error.code).toBe("SESSION_REPLACED")
+    expectNothingWritten()
+    // A different (but valid) tab id is equally refused.
+    res = await saveWithDevice("3f2504e0-4f89-41d3-9a0c-0305e82c3302")
+    expect(res.status).toBe(409)
+    expect((await res.json()).error.code).toBe("SESSION_REPLACED")
+    expectNothingWritten()
+    // The bound tab's own id is accepted.
+    expect((await saveWithDevice(UUID)).status).toBe(200)
+  })
+
+  it("refuses the in-transaction write when the row was bound to another tab meanwhile", async () => {
+    // First read: unbound legacy row, pre-check passes without a header.
+    prismaMock.examSession.findUnique.mockResolvedValue({
+      id: SESSION_ID,
+      examId: EXAM_ID,
+      userId: "student1",
+      status: "IN_PROGRESS",
+      startedAt: new Date("2026-10-08T09:00:00Z"),
+      effectiveEndTime: null,
+      exam: { id: EXAM_ID },
+    })
+    // Gate fails, and the re-read shows a tab binding from another tab.
+    txMock.examSession.updateMany.mockResolvedValueOnce({ count: 0 })
+    txMock.examSession.findUnique.mockResolvedValueOnce({
+      id: SESSION_ID,
+      activeAuthSessionId: "auth-1",
+      activeDeviceId: UUID,
+    })
+    const res = await save()
+    expect(res.status).toBe(409)
+    expect((await res.json()).error.code).toBe("SESSION_REPLACED")
+    expect(txMock.$queryRaw).not.toHaveBeenCalled()
+  })
+
   it("refuses the save after the deadline and its grace window", async () => {
     prismaMock.examSession.findUnique.mockResolvedValue({
       id: SESSION_ID,
       examId: EXAM_ID,
       userId: "student1",
       status: "IN_PROGRESS",
+      startedAt: new Date("2026-10-08T09:00:00Z"),
       effectiveEndTime: new Date(Date.now() - 5 * 60_000),
       exam: { id: EXAM_ID },
     })
@@ -226,6 +316,7 @@ describe("PUT /api/sessions/[id]/answers: write", () => {
       where: {
         id: SESSION_ID,
         status: { in: expect.arrayContaining(["IN_PROGRESS"]) },
+        AND: expect.any(Array),
       },
       data: { lastSeenAt: expect.any(Date) },
     })
@@ -237,6 +328,18 @@ describe("PUT /api/sessions/[id]/answers: write", () => {
     const res = await save()
     expect(res.status).toBe(409)
     expect((await res.json()).error.message).toBe("Sitzung ist nicht aktiv")
+    expect(txMock.$queryRaw).not.toHaveBeenCalled()
+  })
+
+  it("rejects a takeover after the first session read and before the answer write", async () => {
+    txMock.examSession.updateMany.mockResolvedValue({ count: 0 })
+    txMock.examSession.findUnique.mockResolvedValue({
+      id: SESSION_ID,
+      activeAuthSessionId: "auth-2",
+    })
+    const res = await save()
+    expect(res.status).toBe(409)
+    expect((await res.json()).error.code).toBe("SESSION_REPLACED")
     expect(txMock.$queryRaw).not.toHaveBeenCalled()
   })
 

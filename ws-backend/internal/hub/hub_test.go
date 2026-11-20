@@ -56,7 +56,7 @@ func newJoinTestServer(t *testing.T, h *Hub) *httptest.Server {
 		if err != nil {
 			return
 		}
-		c := NewStudentClient(conn, "user-1", "sess-1", nil)
+		c := NewStudentClient(conn, "user-1", "sess-1", "auth-1", nil)
 		room := h.JoinRoom("exam-1", c, &store.ExamSessionAuth{
 			ID: "sess-1", Status: "IN_PROGRESS",
 			Questions: []store.QuestionAuth{{ID: "q-1", Type: "FREE_TEXT"}},

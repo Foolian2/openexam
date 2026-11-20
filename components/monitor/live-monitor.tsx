@@ -69,6 +69,7 @@ import { useClock } from "@/hooks/use-clock"
 import { formatTime } from "@/lib/format-date"
 import {
   INTEGRITY_KIND_LABELS,
+  applyMonitorPatch,
   mergeKnownPatchKeys,
   type IntegrityEventKind,
   type MonitorSession,
@@ -98,6 +99,7 @@ const ATTENTION_REASON_LABELS: Record<MonitorAttentionReason, string> = {
   DISCONNECTED: "Verbindung getrennt",
   LOCKED: "Sitzung gesperrt",
   SEB_INTEGRITY: "SEB prüfen",
+  DEVICE_REPLACED: "Weiteres Gerät",
   INTEGRITY_EVENTS: "Auffälligkeiten",
   LOW_TIME: "Wenig Zeit",
 }
@@ -110,6 +112,7 @@ function getSessionChangeSignature(
   return [
     session.status,
     session.sebIntegrityFlagged ? "1" : "0",
+    session.deviceReplacedCount ?? 0,
     session.timeExtensionMin,
     // focusLossEventCount is left out on purpose: informational focus loss
     // should not make the row flash like an event that needs review.
@@ -239,7 +242,7 @@ export function LiveMonitor({ examId }: { examId: string }) {
       const existing = pending.get(sessionId)
       pending.set(
         sessionId,
-        existing ? { ...existing, ...knownPatch } : knownPatch
+        existing ? applyMonitorPatch(existing, knownPatch) : knownPatch
       )
       if (flushUpdatesRef.current !== null) return
       flushUpdatesRef.current = setTimeout(() => {
@@ -253,7 +256,7 @@ export function LiveMonitor({ examId }: { examId: string }) {
             const patch = updates.get(s.id)
             if (!patch) return s
             changed = true
-            return { ...s, ...patch }
+            return applyMonitorPatch(s, patch)
           })
           return changed ? { ...prev, sessions } : prev
         })
@@ -1159,6 +1162,20 @@ function SessionStatusBadges({ session }: { session: MonitorSession }) {
             {session.sebIntegrityReason === "bek_disappeared"
               ? "Der Safe Exam Browser wird von diesem Gerät nicht mehr gemeldet — möglicherweise wurde in einen normalen Browser gewechselt. Bitte klären Sie die Situation mit der Person."
               : "Die Safe-Exam-Browser-Konfiguration dieses Geräts hat sich während der Prüfung verändert — möglicherweise wurde eine andere Konfiguration geladen. Bitte klären Sie die Situation mit der Person."}
+          </TooltipContent>
+        </Tooltip>
+      )}
+      {(session.deviceReplacedCount ?? 0) > 0 && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span tabIndex={0} className="inline-flex outline-none">
+              <Badge variant="destructive" className="cursor-help">
+                Weiteres Gerät ({session.deviceReplacedCount}×)
+              </Badge>
+            </span>
+          </TooltipTrigger>
+          <TooltipContent side="top" className="max-w-64 font-normal">
+            {`Die Prüfung wurde ${session.deviceReplacedCount}-mal in einem anderen Fenster oder auf einem anderen Gerät übernommen. Das kann ein Neustart des Safe Exam Browsers sein – Details im Audit-Log. Bitte klären Sie die Situation mit der Person.`}
           </TooltipContent>
         </Tooltip>
       )}
