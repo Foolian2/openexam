@@ -76,7 +76,10 @@ services:
   # sign-up/sign-in/access-code join. Shares the redis service above via
   # REDIS_PREFIX instead of a dedicated instance of its own.
   cap:
-    image: tiago2/cap:latest
+    # Same pinned image as docker-compose.prod.yml. Not :latest — that now
+    # resolves to Cap 4.x, whose migration (see the prod file) breaks the dev
+    # captcha flow until site secrets are reset by hand.
+    image: tiago2/cap:3.1.17@sha256:b47424a1b4ab3e6e7205ba1ed35fa25c8817c78bf0a82a0c7dac5d3393167a03
     restart: unless-stopped
     environment:
       ADMIN_KEY: ${CAP_ADMIN_KEY:-dev-cap-admin-key-change-me}

@@ -20,6 +20,8 @@ All notable changes to OpenExam are documented here. The format follows
   before changing data; refuse historical restore targets pending scratch recovery.
 - Harden proxy paths and upload-origin checks; refresh dependencies and image pins.
 - Improve exam-start burst handling, answer-save batching and monitoring alerts.
+- Admit a whole class launching SEB from one school network address; the
+  launch-token check refused the 21st student.
 
 ### Security
 
@@ -31,6 +33,10 @@ All notable changes to OpenExam are documented here. The format follows
 - Build ws-backend with Go 1.27.4 (net/http HTTP/1 server crash, CVE-2026-97033)
   and pgx 5.12.0.
 - Rebase the web image on node:26-alpine 2026-11-11 (Node 26.13.1, OpenSSL 3.5.9).
+- Update the Cap captcha server to 3.1.17 (Bun 1.4.4 for CVE-2026-111497, a
+  forged-instrumentation fix, Debian 13.7 base) and pin the dev image too.
+- Refuse non-JSON bodies and bodies over 32 KB on the public Cap routes, closing
+  Cap's quadratic multipart parsing (elysia, CVE-2026-56669) at the edge.
 
 ### Upgrade notes
 

@@ -62,7 +62,11 @@ if ! docker exec -e CAP_ADMIN_KEY="$admin_key" "$cap_id" bun -e '
   const r = await fetch("http://localhost:3000/server/keys", {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${auth}` },
-    body: JSON.stringify({ name: "openexam" }),
+    // Cap >= 3.1.12 defaults new keys to "hashwx", which needs
+    // @cap.js/widget >= 0.1.58; the widget pinned in
+    // components/auth/cap-widget.tsx is older, so ask for the protocol it
+    // solves (the one every key created before 3.1.12 already uses).
+    body: JSON.stringify({ name: "openexam", protocol: "sha256-pow" }),
   });
   const keys = await r.json();
   if (!keys.siteKey) { console.error("key creation failed:", JSON.stringify(keys)); process.exit(1); }
