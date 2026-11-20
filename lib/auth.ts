@@ -130,6 +130,22 @@ function privacyAcceptanceFields(context: HookContext | undefined) {
 // emailVerification below lets each new address through, so without this
 // one account could mail any number of distinct addresses. Fails open
 // without Redis, like the cooldown.
+/**
+ * Per-IP limit on sign-in, sign-up and passkey routes: about 200 students
+ * per minute behind one school address, the same cohort size seb-enter
+ * admits (app/exam/[id]/seb-enter/route.ts). See rateLimit.customRules.
+ */
+const AUTH_PER_IP_RULE = { window: 60, max: 200 }
+
+/**
+ * Per-IP limit on sign-up, kept well below sign-in: every sign-up sends a
+ * verification mail to an address of the caller's choosing (password sign-up
+ * accepts any domain), so a sign-in-sized limit would let one address send
+ * ~200 mails a minute. 40 per 10 minutes still admits a class registering
+ * together in one lesson, and caps a day below what the old 5/min allowed.
+ */
+const SIGN_UP_PER_IP_RULE = { window: 600, max: 40 }
+
 const ACCOUNT_MAIL_LIMIT = 10
 const ACCOUNT_MAIL_WINDOW_SECONDS = 60 * 60
 
@@ -167,15 +183,22 @@ export const auth = betterAuth({
       process.env.NODE_ENV === "production" ||
       process.env.DISABLE_RATE_LIMIT !== "true",
     storage: "secondary-storage",
+    // better-auth keys every rule on client IP + path, and a school sends a
+    // whole class through one NAT address, so the sign-in rules are sized for
+    // a cohort arriving together rather than for one person (at 5/min the
+    // sixth student was refused). Sign-up is the exception, see
+    // SIGN_UP_PER_IP_RULE. They are a flood backstop only: guessing
+    // is stopped by the per-account limits in hooks.before
+    // (lib/account-rate-limit.ts) and the Cap proof-of-work each sign-in and
+    // sign-up must solve. The wildcards matter: better-auth's built-in rule
+    // for every other /sign-in/* path, Microsoft sign-in included, is 3 per
+    // 10 seconds per IP.
     customRules: {
-      "/sign-in/email": { window: 60, max: 5 },
-      "/sign-up/email": { window: 60, max: 5 },
+      "/sign-in/*": AUTH_PER_IP_RULE,
+      "/sign-up/*": SIGN_UP_PER_IP_RULE,
+      "/passkey/*": AUTH_PER_IP_RULE,
       "/request-password-reset": { window: 60, max: 3 },
       "/reset-password": { window: 60, max: 5 },
-      "/passkey/generate-authenticate-options": { window: 60, max: 5 },
-      "/passkey/verify-authentication": { window: 60, max: 5 },
-      "/passkey/generate-register-options": { window: 60, max: 5 },
-      "/passkey/verify-registration": { window: 60, max: 5 },
     },
   },
   hooks: {

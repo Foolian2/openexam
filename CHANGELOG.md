@@ -20,6 +20,14 @@ All notable changes to OpenExam are documented here. The format follows
   before changing data; refuse historical restore targets pending scratch recovery.
 - Harden proxy paths and upload-origin checks; refresh dependencies and image pins.
 - Improve exam-start burst handling, answer-save batching and monitoring alerts.
+- Admit a whole class launching SEB from one school network address; the
+  launch-token check refused the 21st student.
+- Size per-IP sign-in and passkey limits for a class behind one school NAT
+  address (200/min, was 5/min; Microsoft sign-in was 3 per 10 s) and sign-up
+  for a class registering together (40 per 10 min). Per-account limits and the
+  Cap proof-of-work still bound guessing.
+- Give the Cap site key a class-sized rate limit (600/min per IP, was Cap's
+  default 30 per 5 s); `create-cap-site-key.sh` sets it on existing keys too.
 
 ### Security
 
@@ -31,6 +39,10 @@ All notable changes to OpenExam are documented here. The format follows
 - Build ws-backend with Go 1.27.4 (net/http HTTP/1 server crash, CVE-2026-97033)
   and pgx 5.12.0.
 - Rebase the web image on node:26-alpine 2026-11-11 (Node 26.13.1, OpenSSL 3.5.9).
+- Update the Cap captcha server to 3.1.17 (Bun 1.4.4 for CVE-2026-111497, a
+  forged-instrumentation fix, Debian 13.7 base) and pin the dev image too.
+- Refuse non-JSON bodies and bodies over 32 KB on the public Cap routes, closing
+  Cap's quadratic multipart parsing (elysia, CVE-2026-56669) at the edge.
 
 ### Upgrade notes
 
@@ -40,6 +52,10 @@ All notable changes to OpenExam are documented here. The format follows
   or starting another exam; existing clients retain their launch configuration.
 - Run `scripts/setup-monitoring.sh` before starting the updated monitoring profile
   to set `ALERTMANAGER_CONFIG_GID`.
+- After deploying, run `scripts/create-cap-site-key.sh` once: it keeps the
+  existing site key and gives it the class-sized Cap rate limit. Then recreate
+  nginx (`up -d --force-recreate --no-deps nginx`) so the new Cap request
+  checks load; `deploy.sh`'s reload keeps the previously rendered config.
 - Node 26 and pnpm 12.3.4 are required. The WebSocket module requires Go 1.26;
   its production image and CI use Go 1.27.2.
 

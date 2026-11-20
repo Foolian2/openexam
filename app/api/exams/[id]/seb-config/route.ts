@@ -56,9 +56,14 @@ export async function GET(request: NextRequest, { params }: Params) {
     // resolves), so throttle the guess itself by exam+IP before consuming
     // it. Fail-closed: this hands out exam configs and burns a single-use
     // token, so an outage must refuse rather than allow unbounded guessing.
+    //
+    // Sized like seb-enter (the next hop): a whole class launches SEB together
+    // from one school NAT address, and at 20 the 21st student was refused.
+    // Guessing stays infeasible either way — launch tokens are 256-bit,
+    // single-use and expire after 5 minutes.
     const preLimit = await rateLimit(
       `seb-config-lt:${id}:${ip ?? "unknown"}`,
-      20,
+      200,
       60,
       "closed"
     )
