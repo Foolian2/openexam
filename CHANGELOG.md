@@ -22,9 +22,10 @@ All notable changes to OpenExam are documented here. The format follows
 - Improve exam-start burst handling, answer-save batching and monitoring alerts.
 - Admit a whole class launching SEB from one school network address; the
   launch-token check refused the 21st student.
-- Size per-IP sign-in, sign-up and passkey limits for a class behind one
-  school NAT address (200/min, was 5/min; Microsoft sign-in was 3 per 10 s).
-  Per-account limits and the Cap proof-of-work still bound guessing.
+- Size per-IP sign-in and passkey limits for a class behind one school NAT
+  address (200/min, was 5/min; Microsoft sign-in was 3 per 10 s) and sign-up
+  for a class registering together (40 per 10 min). Per-account limits and the
+  Cap proof-of-work still bound guessing.
 - Give the Cap site key a class-sized rate limit (600/min per IP, was Cap's
   default 30 per 5 s); `create-cap-site-key.sh` sets it on existing keys too.
 
