@@ -111,8 +111,9 @@ groups:
         annotations:
           summary: "nginx active connections approaching the documented capacity ceiling"
           description: >
-            nginx_connections_active has been above 1600 for 5 minutes, close to the
-            connection ceiling. Consider whether this is expected exam-start load or a problem.
+            nginx_connections_active has been above 1600 for 5 minutes — nginx.conf documents
+            active connections plateauing around 2072 with request failures starting well
+            before that. Consider whether this is expected exam-start load or a problem.
 
   # Service-level objectives, not infrastructure health. Every threshold here
   # is a target the load tests were run against: p95 WS ack < 100 ms, p95
@@ -183,8 +184,9 @@ groups:
         annotations:
           summary: "p95 REST latency above the 200ms target"
           description: >
-            p95 is {{ $value }}s, roughly the load level at which the box stops keeping up.
-            Check whether it is real growth
+            p95 is {{ $value }}s. Capacity testing measured 109ms at the 1 600-student SLO
+            crossing and 266ms at 2 400 (a FAIL), so this is roughly the load level at which
+            that document says the box stops keeping up. Check whether it is real growth
             before assuming a regression.
 
       - alert: PageLoadSLOBreach
@@ -198,7 +200,8 @@ groups:
         annotations:
           summary: "p95 page render above the 2s target"
           description: >
-            p95 is {{ $value }}s. SSR does not degrade gracefully under load. Treat this as
+            p95 is {{ $value }}s. SSR does not degrade gracefully here: capacity testing
+            measured a cliff from 40ms at 100 renders/s to 9 234ms at 200. Treat this as
             approaching a cliff edge, not as a gentle slope.
 
       - alert: WsAckLatencySLOBreach
@@ -233,7 +236,8 @@ groups:
           description: >
             p99 queue wait is {{ $value }}s. Frames are waiting on the single per-room
             goroutine rather than being processed. Check openexam_ws_async_queue_full_total
-            for the I/O that is blocking it; adding CPU will not help.
+            for the I/O that is blocking it; adding CPU will not help (RESULTS.md §5 saw CPU
+            usage FALL as this got worse).
 
   # Application signals that were already exported and had nothing watching
   # them. Each of these counters has existed since the metric was added; none
@@ -299,5 +303,5 @@ groups:
           summary: "Exam rooms are falling behind their background I/O"
           description: >
             Durable async jobs are hitting a full per-room queue and falling back to the
-            inline path, putting Postgres/Redis I/O back on the room goroutine. Expect ack
-            latency to follow.
+            inline path, putting Postgres/Redis I/O back on the room goroutine. This is the
+            exact regression capacity testing measured. Expect ack latency to follow.

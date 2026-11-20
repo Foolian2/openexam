@@ -95,11 +95,13 @@ type ExamSessionAuth struct {
 	// accepts a token matching either.
 	SessionSebConfigKey *string
 
-	// IntegrityEventCount is the number of already-persisted integrity
+	// IntegrityEventCount excludes informational PAGE_FOCUS_LOST;
+	// FocusLossEventCount counts those separately. Both count already-persisted
 	// events for this session. Read at registration so the room's in-memory
 	// counter survives reconnects and room restarts instead of starting
 	// over at zero (which made the teacher-visible badge jump backwards).
 	IntegrityEventCount int
+	FocusLossEventCount int
 	Questions           []QuestionAuth
 }
 
@@ -120,7 +122,8 @@ func (s *Store) GetExamSessionAuth(ctx context.Context, sessionID string) (*Exam
 		       es."sebKeyHash", es."sebUserAgent",
 		       es."sebBrowserExamKey", es."sebIntegrityFlaggedAt",
 		       es."activeAuthSessionId", es."activeDeviceId", es."deviceReplacedCount", es."claimVersion",
-		       (SELECT count(*) FROM "IntegrityEvent" ie WHERE ie."sessionId" = es.id)
+		       (SELECT count(*) FROM "IntegrityEvent" ie WHERE ie."sessionId" = es.id AND ie.kind <> 'PAGE_FOCUS_LOST'),
+		       (SELECT count(*) FROM "IntegrityEvent" ie WHERE ie."sessionId" = es.id AND ie.kind = 'PAGE_FOCUS_LOST')
 		FROM "ExamSession" es
 		JOIN "Exam" e ON e.id = es."examId"
 		WHERE es.id = $1
@@ -133,7 +136,8 @@ func (s *Store) GetExamSessionAuth(ctx context.Context, sessionID string) (*Exam
 		&out.SessionSebConfigKey,
 		&out.SebKeyHash, &out.SebUserAgent,
 		&out.SebBrowserExamKey, &out.SebIntegrityFlaggedAt,
-		&out.ActiveAuthSessionID, &out.ActiveDeviceID, &out.DeviceReplacedCount, &out.ClaimVersion, &out.IntegrityEventCount)
+		&out.ActiveAuthSessionID, &out.ActiveDeviceID, &out.DeviceReplacedCount, &out.ClaimVersion,
+		&out.IntegrityEventCount, &out.FocusLossEventCount)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -170,6 +174,7 @@ type AnswerSaveState struct {
 	ActiveDeviceID      *string
 	LockedAt            *time.Time
 	SubmittedAt         *time.Time
+	StartedAt           *time.Time
 	EffectiveEndTime    *time.Time
 	ExamClosedAt        *time.Time
 	ReceivedWhileLocked bool
@@ -191,40 +196,40 @@ func (s *Store) GetAnswerSaveState(ctx context.Context, examID, sessionID string
 // WithAnswerSaveState holds the ExamSession share lock through the callback.
 // A takeover's update must wait for a checked answer to reach Redis, and a
 // save arriving afterward sees the new claim before it can buffer anything.
+//
+// The settings, both locks and the read go to Postgres as one pgx batch
+// inside the transaction (BEGIN, batch, COMMIT: three round trips instead of
+// six), and the transaction commits with synchronous_commit off. It writes
+// nothing durable — FOR SHARE only stamps row locks, which do not outlive a
+// crash — so waiting for the WAL flush at COMMIT bought no durability and
+// capped the answer-ack rate under load (2026-10-13 benchmark: ~2.8k acks/s
+// plateau, ack latency dominated by this check). The transaction cannot be a
+// single batch end to end because the callback runs between the read and
+// COMMIT. Statement order and lock order are unchanged.
 func (s *Store) WithAnswerSaveState(ctx context.Context, examID, sessionID string, receivedAt time.Time, use func(*AnswerSaveState) error) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
+
+	receivedAtValue := pgTimestamp(&receivedAt)
+	batch := &pgx.Batch{}
 	// The share locks below are held through the caller's Redis write. Bound
 	// the wait for them: behind a queued exclusive lock (a takeover claim, a
 	// teacher lock or close) every later save would otherwise queue too and
 	// pin a pool connection each. A timed-out save is refused and retried.
-	if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '2s'`); err != nil {
-		return err
-	}
+	batch.Queue(`SET LOCAL lock_timeout = '2s'`)
+	batch.Queue(`SET LOCAL synchronous_commit = off`)
 	// Row-lock waits can see newer row versions without refreshing a
 	// statement's snapshot of SessionLockInterval. Acquire both locks first,
 	// then read lifecycle and intervals in a new READ COMMITTED statement.
-	var lockedID string
-	if err := tx.QueryRow(ctx, `SELECT id FROM "Exam" WHERE id=$1 FOR SHARE`, examID).Scan(&lockedID); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return ErrNotFound
-		}
-		return err
-	}
-	if err := tx.QueryRow(ctx, `SELECT id FROM "ExamSession" WHERE id=$1 AND "examId"=$2 FOR SHARE`, sessionID, examID).Scan(&lockedID); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return ErrNotFound
-		}
-		return err
-	}
-	receivedAtValue := pgTimestamp(&receivedAt)
-	row := tx.QueryRow(ctx, `
+	batch.Queue(`SELECT id FROM "Exam" WHERE id=$1 FOR SHARE`, examID)
+	batch.Queue(`SELECT id FROM "ExamSession" WHERE id=$1 AND "examId"=$2 FOR SHARE`, sessionID, examID)
+	batch.Queue(`
 		SELECT es.status, e.status, es."activeAuthSessionId", es."activeDeviceId",
 		       es."lockedAt", es."submittedAt",
-		       es."effectiveEndTime", e."closedAt",
+		       es."startedAt", es."effectiveEndTime", e."closedAt",
 		       EXISTS (
 		         SELECT 1 FROM "SessionLockInterval" sli
 		         WHERE sli."sessionId" = es.id
@@ -238,20 +243,50 @@ func (s *Store) WithAnswerSaveState(ctx context.Context, examID, sessionID strin
 		WHERE e.id = $1 AND es.id = $2
 	`, examID, sessionID, receivedAtValue)
 
-	var out AnswerSaveState
-	if err := row.Scan(&out.SessionStatus, &out.ExamStatus,
-		&out.ActiveAuthSessionID, &out.ActiveDeviceID, &out.LockedAt,
-		&out.SubmittedAt, &out.EffectiveEndTime, &out.ExamClosedAt,
-		&out.ReceivedWhileLocked); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return ErrNotFound
-		}
+	out, err := readAnswerSaveState(tx.SendBatch(ctx, batch))
+	if err != nil {
 		return err
 	}
-	if err := use(&out); err != nil {
+	if err := use(out); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// readAnswerSaveState drains WithAnswerSaveState's batch. The batch results
+// must be closed before the transaction is used again, so every return path
+// goes through the deferred Close.
+func readAnswerSaveState(br pgx.BatchResults) (out *AnswerSaveState, err error) {
+	defer func() {
+		if cerr := br.Close(); err == nil && cerr != nil {
+			out, err = nil, cerr
+		}
+	}()
+	for i := 0; i < 2; i++ { // SET LOCAL lock_timeout, SET LOCAL synchronous_commit
+		if _, err := br.Exec(); err != nil {
+			return nil, err
+		}
+	}
+	var lockedID string
+	for i := 0; i < 2; i++ { // Exam lock, ExamSession lock
+		if err := br.QueryRow().Scan(&lockedID); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, ErrNotFound
+			}
+			return nil, err
+		}
+	}
+	var state AnswerSaveState
+	if err := br.QueryRow().Scan(&state.SessionStatus, &state.ExamStatus,
+		&state.ActiveAuthSessionID, &state.ActiveDeviceID, &state.LockedAt,
+		&state.SubmittedAt, &state.StartedAt, &state.EffectiveEndTime, &state.ExamClosedAt,
+		&state.ReceivedWhileLocked); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return &state, nil
 }
 
 // BindSebSession persists the first-seen SEB Config Key token and
@@ -410,6 +445,7 @@ type MonitorSession struct {
 	ManuallyGradedCount int            `json:"manuallyGradedCount"`
 	TotalPoints         float64        `json:"totalPoints"`
 	MaxPoints           float64        `json:"maxPoints"`
+	FocusLossEventCount int            `json:"focusLossEventCount"`
 	IntegrityEventCount int            `json:"integrityEventCount"`
 	// Mirrors the live delta key published by lib/seb-guard.ts, so a monitor
 	// connecting after the event sees the same flag the live patch carried.
@@ -430,7 +466,8 @@ func (s *Store) ListMonitorSessions(ctx context.Context, examID string) ([]Monit
 			(SELECT count(*) FROM "Grade" g WHERE g."sessionId" = es.id AND g."autoGraded" = false),
 			(SELECT coalesce(sum(g.points), 0) FROM "Grade" g WHERE g."sessionId" = es.id),
 			(SELECT coalesce(sum(g."maxPoints"), 0) FROM "Grade" g WHERE g."sessionId" = es.id),
-			(SELECT count(*) FROM "IntegrityEvent" ie WHERE ie."sessionId" = es.id),
+			(SELECT count(*) FROM "IntegrityEvent" ie WHERE ie."sessionId" = es.id AND ie.kind <> 'PAGE_FOCUS_LOST'),
+			(SELECT count(*) FROM "IntegrityEvent" ie WHERE ie."sessionId" = es.id AND ie.kind = 'PAGE_FOCUS_LOST'),
 			es."sebIntegrityFlaggedAt" IS NOT NULL, es."sebIntegrityReason",
 			es."deviceReplacedCount"
 		FROM "ExamSession" es
@@ -451,7 +488,7 @@ func (s *Store) ListMonitorSessions(ctx context.Context, examID string) ([]Monit
 			&m.StartedAt, &m.SubmittedAt, &m.SubmissionType,
 			&m.EffectiveEndTime, &m.TimeExtensionMin, &m.NamApplied, &m.LastSeenAt, &m.ReconnectCount,
 			&m.AnswerCount, &m.GradedCount, &m.ManuallyGradedCount, &m.TotalPoints, &m.MaxPoints,
-			&m.IntegrityEventCount,
+			&m.IntegrityEventCount, &m.FocusLossEventCount,
 			&m.SebIntegrityFlagged, &m.SebIntegrityReason,
 			&m.DeviceReplacedCount,
 		); err != nil {

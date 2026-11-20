@@ -40,7 +40,7 @@ export function generateExamKeySalt(): Buffer {
 }
 
 // No I/O/0/1 — this gets read off a screen and typed into SEB by hand.
-const QUIT_PASSWORD_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789" // gitleaks:allow
+const QUIT_PASSWORD_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 /**
  * 32-character alphabet divides 256 evenly, so a plain modulo introduces no
@@ -148,6 +148,10 @@ export function buildSebSettings(
     allowSiri: false,
     allowDictation: false,
     allowDictionaryLookup: false,
+    // Windows SEB's own Alt+Tab task view takes focus from the exam even
+    // with the taskbar hidden. Disable its activator to avoid false blur
+    // reports. The native Windows Alt+Tab shortcut is intercepted by SEB.
+    enableAltTab: false,
     enableAltEsc: false,
     enableCtrlEsc: false,
     enableStartMenu: false,
@@ -254,7 +258,8 @@ export function buildSebSettings(
     // F5 still reloads (browserWindowAllowReload stays at SEB's default YES;
     // answers survive a reload), but without SEB's native "reload this
     // page?" dialog. That dialog takes focus from the page, so every
-    // deliberate reload was reported as "Fenster verlassen".
+    // deliberate reload was reported as "Fenster verlassen" (observed in the
+    // Windows SEB Probeprüfung on 2026-10-12).
     showReloadWarning: false,
 
     // macOS only; both keys are needed. Windows ignores them.

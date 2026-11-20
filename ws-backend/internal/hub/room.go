@@ -21,7 +21,9 @@ import (
 // debounces per question (~2 saves/s), so a 60-token burst (a reconnect
 // replay of a long exam) plus a 10/s refill is generous headroom; an abusive
 // client that floods the socket is throttled to 10/s instead of stalling the
-// room behind its Redis round trips on every keystroke.
+// room behind its Redis round trips on every keystroke. The bucket lives in
+// sessionLimits, so reconnecting does not refill it; a real client never
+// drains it, and any gap over 6 s refills it anyway.
 const (
 	answerSaveBurst         = 60.0
 	answerSaveRefillRate    = 10.0 // tokens per second
@@ -38,23 +40,33 @@ type sessionState struct {
 	effectiveEndTime *time.Time
 	questionTypes    map[string]string
 
+	// Shared with every connection of this session for the room's lifetime;
+	// see Room.limits.
+	*sessionLimits
+}
+
+// sessionLimits is the per-session state that must survive reconnects:
+// handleUnregister drops sessionState, and if the rate limits went with it,
+// a client could refill its budget by reconnecting. Single-goroutine owned
+// like sessionState.
+type sessionLimits struct {
 	// Integrity-event bookkeeping. lastIntegrityAt rate-limits per kind so a
 	// buggy/hostile client can't flood the room or Postgres; integrityCount
-	// keeps growing past maxStoredIntegrityEvents even once we stop
-	// persisting individual rows, so the teacher-visible counter stays
-	// accurate. Both are seeded/carried over in handleRegister so a
-	// reconnect doesn't reset them.
+	// and focusLossCount keep growing past their stored-row caps
+	// (maxStoredIntegrityEvents, maxStoredFocusLossEvents) once we stop
+	// persisting individual rows, so the teacher-visible counters stay
+	// accurate.
 	lastIntegrityAt map[string]time.Time
 	integrityCount  int
+	focusLossCount  int
 
-	// Answer-save token bucket (single-goroutine owned like the rest of
-	// sessionState).
+	// Answer-save token bucket.
 	saveTokens     float64
 	lastSaveRefill time.Time
 }
 
 // allowAnswerSave is a token bucket; call it only from the room goroutine.
-func (st *sessionState) allowAnswerSave(now time.Time) bool {
+func (st *sessionLimits) allowAnswerSave(now time.Time) bool {
 	if st.saveTokens < answerSaveBurst {
 		elapsed := now.Sub(st.lastSaveRefill).Seconds()
 		if elapsed > 0 {
@@ -146,6 +158,9 @@ type Room struct {
 	students map[string]*Client // keyed by ExamSession.id
 	monitors map[*Client]struct{}
 	state    map[string]*sessionState // keyed by ExamSession.id
+	// limits outlives state: it is kept across disconnects so a reconnect
+	// can't reset rate limits, and freed with the room (idle teardown).
+	limits map[string]*sessionLimits // keyed by ExamSession.id
 
 	register   chan registration
 	unregister chan *Client
@@ -201,6 +216,7 @@ func newRoom(examID string, st RoomStore, buf AnswerBuffer, fl ExamFlusher, publ
 		students:         make(map[string]*Client),
 		monitors:         make(map[*Client]struct{}),
 		state:            make(map[string]*sessionState),
+		limits:           make(map[string]*sessionLimits),
 		register:         make(chan registration),
 		unregister:       make(chan *Client),
 		inbound:          make(chan inboundMsg, 256),
@@ -389,39 +405,47 @@ func (r *Room) handleRegister(ctx context.Context, reg registration) {
 
 	// The claim version read at authorization orders concurrent sockets: one
 	// that read the row BEFORE the first claim (version 0) must not evict the
-	// claimed owner, so strictly-older registrations are rejected above.
+	// claimed owner, so strictly-older registrations are rejected here.
 	c.claimVersion = reg.sessionAuth.ClaimVersion
-	if old, ok := r.students[c.sessionID]; ok && old != c && old.claimVersion > c.claimVersion {
+	old, replacing := r.students[c.sessionID]
+	if replacing && old != c && old.claimVersion > c.claimVersion {
 		// The new socket was authorized against an older claim than the one
 		// already registered (e.g. its SEB handshake straddled a takeover
-		// whose owner connected first). It must not evict the owner.
+		// whose owner connected first). It must not evict the owner. It is
+		// never inserted into r.students, so its unregister is a no-op and
+		// the connection gauge is untouched.
 		c.enqueue(mustEncode(protocol.TypeExamControl, "", protocol.ControlEventData{Action: protocol.ActionSessionReplaced, SessionID: c.sessionID}))
 		c.requestClose(websocket.StatusNormalClosure, "replaced by another tab or login")
 		return
 	}
-	if old, ok := r.students[c.sessionID]; ok && old != c {
+	if replacing && old != c {
 		old.enqueue(mustEncode(protocol.TypeExamControl, "", protocol.ControlEventData{Action: protocol.ActionSessionReplaced}))
 		old.requestClose(websocket.StatusNormalClosure, "replaced by new connection")
 	}
 	r.students[c.sessionID] = c
-	metrics.ActiveConnections.WithLabelValues("student").Inc()
+	if !replacing {
+		metrics.ActiveConnections.WithLabelValues("student").Inc()
+	}
 
 	st := &sessionState{
 		submitted: reg.sessionAuth.Status == "SUBMITTED" || reg.sessionAuth.Status == "AUTO_SUBMITTED",
 	}
-	// Integrity bookkeeping has to survive reconnects (an expected event
-	// mid-exam) and room restarts, otherwise the teacher-visible counter
-	// jumps back to 1, the per-session row cap resets, and the per-kind
-	// rate limit is bypassed once per reconnect. The DB count is the
-	// durable floor; a live count already past maxStoredIntegrityEvents is
-	// higher than the DB's and wins.
-	st.integrityCount = reg.sessionAuth.IntegrityEventCount
-	if prev, ok := r.state[c.sessionID]; ok && prev != nil {
-		if prev.integrityCount > st.integrityCount {
-			st.integrityCount = prev.integrityCount
-		}
-		st.lastIntegrityAt = prev.lastIntegrityAt
+	// Rate limits and integrity bookkeeping have to survive reconnects (an
+	// expected event mid-exam) and room restarts, otherwise the
+	// teacher-visible counter jumps back, the per-session row cap resets, and
+	// the answer-save and per-kind integrity limits are refilled once per
+	// reconnect. r.limits keeps them for the room's lifetime, whether the old
+	// connection was replaced or had already disconnected. The DB count is
+	// the durable floor; a live count already past maxStoredIntegrityEvents
+	// (or ahead of a write still in flight) is higher than the DB's and wins.
+	lim := r.limits[c.sessionID]
+	if lim == nil {
+		lim = &sessionLimits{}
+		r.limits[c.sessionID] = lim
 	}
+	lim.integrityCount = max(lim.integrityCount, reg.sessionAuth.IntegrityEventCount)
+	lim.focusLossCount = max(lim.focusLossCount, reg.sessionAuth.FocusLossEventCount)
+	st.sessionLimits = lim
 	st.questionTypes = make(map[string]string, len(reg.sessionAuth.Questions))
 	for _, question := range reg.sessionAuth.Questions {
 		st.questionTypes[question.ID] = question.Type
@@ -496,6 +520,13 @@ const integrityEventRateLimit = 2 * time.Second
 // individual events stop being written.
 const maxStoredIntegrityEvents = 200
 
+// maxStoredFocusLossEvents is the separate row cap for informational
+// PAGE_FOCUS_LOST. A separate budget keeps repeated clicks on macOS SEB's
+// top bar from using up the rows meant for events that need review: once
+// those stop being persisted they vanish from the history dialog, and the
+// count drops back to the DB floor after a room restart.
+const maxStoredFocusLossEvents = 50
+
 // maxIntegrityDetailLen bounds the free-form detail field. The real client
 // only ever sends short tokens ("cut", "F12", ...), but the payload is
 // student-controlled and otherwise only bounded by the 64 KB WS read limit.
@@ -539,7 +570,13 @@ func (r *Room) handleIntegrityEvent(ctx context.Context, c *Client, env protocol
 	// events into the owner's session. The counter and the monitor badge
 	// advance only once that check has passed (see handleIntegrityResult);
 	// on a plain I/O error the badge stays optimistic, as before.
+	//
+	// Informational PAGE_FOCUS_LOST events have their own stored-row cap, so
+	// they cannot use up the rows reserved for events that need review.
 	persist := st.integrityCount < maxStoredIntegrityEvents
+	if data.Kind == "PAGE_FOCUS_LOST" {
+		persist = st.focusLossCount < maxStoredFocusLossEvents
+	}
 	sessionID, kind := c.sessionID, data.Kind
 	r.offloadDurable("integrity-write", func(ctx context.Context) {
 		code := ""
@@ -581,14 +618,22 @@ func (r *Room) handleIntegrityResult(res integrityResult) {
 		res.client.requestClose(websocket.StatusNormalClosure, "replaced by another tab or login")
 		return
 	}
-	st := r.state[res.client.sessionID]
+	// Count on the session's limits, not its connection state: they outlive
+	// a reconnect, so a result landing after the socket went away still
+	// advances the teacher-visible counter.
+	st := r.limits[res.client.sessionID]
 	if st == nil {
 		return
 	}
-	st.integrityCount++
+	if res.kind == "PAGE_FOCUS_LOST" {
+		st.focusLossCount++
+	} else {
+		st.integrityCount++
+	}
 
 	r.broadcastMonitorUpdate(res.client.sessionID, map[string]any{
 		"integrityEventCount": st.integrityCount,
+		"focusLossEventCount": st.focusLossCount,
 		"lastIntegrityEvent":  map[string]any{"kind": res.kind, "detail": res.detail, "at": nowRFC3339()},
 	})
 }
@@ -699,6 +744,13 @@ func answerSaveRejection(state *store.AnswerSaveState, receivedAt time.Time, gra
 	}
 	if state.SubmittedAt != nil && receivedAt.After(*state.SubmittedAt) {
 		return "ALREADY_SUBMITTED"
+	}
+	// An SEB session reserved at join has no clock until its first verified
+	// data load; nothing may be saved before it starts. Checked ahead of the
+	// status switch so a frame racing a submit or lock of the reservation
+	// cannot slip through the pre-transition exceptions below.
+	if state.StartedAt == nil {
+		return "NOT_STARTED"
 	}
 	switch state.SessionStatus {
 	case "IN_PROGRESS":

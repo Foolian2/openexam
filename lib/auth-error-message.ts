@@ -32,6 +32,8 @@ const MESSAGES: Record<string, string> = {
     "Mit dieser E-Mail-Adresse besteht bereits ein Konto.",
   INVALID_TOKEN: "Der Link ist ungültig oder abgelaufen.",
   TOKEN_EXPIRED: "Der Link ist abgelaufen.",
+  // Email-change link opened while signed in to a different account.
+  INVALID_USER: "Dieser Link gehört zu einem anderen Konto.",
   SESSION_EXPIRED:
     "Ihre Sitzung ist abgelaufen. Bitte melden Sie sich erneut an.",
   EMAIL_ALREADY_VERIFIED: "Diese E-Mail-Adresse ist bereits bestätigt.",

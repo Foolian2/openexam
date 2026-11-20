@@ -15,7 +15,7 @@ import (
 const (
 	fixtureTakeURL   = "http://localhost:3000/exam/exam1/take"
 	fixtureConfigKey = "fixture-config-key-123"
-	fixtureToken     = "31dbc8371cd20d4a0606f137a0027bcc797574e2b4ed79462b1d74e44b47fab5" // gitleaks:allow
+	fixtureToken     = "31dbc8371cd20d4a0606f137a0027bcc797574e2b4ed79462b1d74e44b47fab5"
 )
 
 func TestExpectedToken_MatchesTypeScriptFixture(t *testing.T) {

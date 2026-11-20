@@ -96,7 +96,7 @@ test("teacher can triage the monitor and grade submissions in sequence", async (
       .filter({ hasText: "Anna Attention" })
     // Matches the "not yet granted" aria-label by its stable prefix. The full
     // label is a descriptive sentence that has already been reworded once
-    // without this locator following it; anchoring on the colon also
+    // (becf21b) without this locator following it; anchoring on the colon also
     // keeps it from matching the "bereits gewährt" state asserted below.
     const accommodation = attentionRow.getByRole("button", {
       name: /^Nachteilsausgleich:/,

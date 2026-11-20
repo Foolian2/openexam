@@ -30,6 +30,7 @@ const (
 var IntegrityEventKinds = map[string]bool{
 	"TAB_HIDDEN":           true,
 	"WINDOW_BLUR":          true,
+	"PAGE_FOCUS_LOST":      true,
 	"COPY_BLOCKED":         true,
 	"PASTE_BLOCKED":        true,
 	"CONTEXT_MENU_BLOCKED": true,

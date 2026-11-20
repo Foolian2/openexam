@@ -11,6 +11,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 source scripts/lib/production-compose.sh
+source scripts/lib/env-file.sh
+source scripts/lib/detect.sh
 # Every monitoring service sits behind the `monitoring` profile
 # (docker-compose.prod.yml), so it is never started by a plain `up`.
 COMPOSE+=(--profile monitoring)
@@ -66,11 +68,74 @@ render_var() {
 
 am_out="monitoring/alertmanager/alertmanager.yml"
 umask 077
-cp monitoring/alertmanager/alertmanager.yml.tmpl "$am_out"
+# Render to a temp file, then write THROUGH to the final path (cat > — not
+# sed -i or mv on the final file, both of which replace it by rename). That
+# keeps the file's inode — so the bind-mounted config a running Alertmanager
+# already holds (docker-compose.prod.yml) sees re-runs without a recreate —
+# and keeps an existing file's owner and group, so re-runs need no root.
+am_tmp=$(mktemp "${am_out}.XXXXXX")
+cp monitoring/alertmanager/alertmanager.yml.tmpl "$am_tmp"
 for var in SMTP_HOST SMTP_PORT SMTP_FROM SMTP_USER SMTP_PASSWORD SMTP_SECURE ALERT_EMAIL_TO; do
-  render_var "$var" "$am_out"
+  render_var "$var" "$am_tmp"
 done
-chmod 600 "$am_out"
+cat "$am_tmp" > "$am_out"
+rm -f "$am_tmp"
+chmod 640 "$am_out"
+
+# The rendered config carries SMTP_PASSWORD and is group-readable (640) so
+# the container's nobody user can read it through the one supplementary
+# group Compose adds (docker-compose.prod.yml's group_add). That group must
+# have NO human members: inheriting the setup user's PRIMARY group would
+# expose the password to everyone sharing it (`users`, `staff`, an AD
+# default group). A dedicated group makes that impossible by construction —
+# created here on the first run (needs root; sudo is fine) and reused by
+# every later run.
+as_root() {
+  if oe_is_root; then
+    "$@"
+  elif oe_has sudo; then
+    sudo "$@"
+  else
+    return 1
+  fi
+}
+am_group=openexam-monitoring
+am_gid=$(oe_group_gid "$am_group")
+if [ -z "$am_gid" ]; then
+  if as_root groupadd --system "$am_group"; then
+    am_gid=$(oe_group_gid "$am_group")
+  else
+    echo "NOTE: could not create the '$am_group' group (needs root)." >&2
+    echo "      Falling back to the setup user's own group (checked below)." >&2
+  fi
+fi
+if [ -n "$am_gid" ] && [ "$(oe_file_gid "$am_out")" != "$am_gid" ]; then
+  # The setup user owns the file but is not a member of the group, so this
+  # needs root too. Re-runs skip it: the write-through above keeps an
+  # existing file's group.
+  if ! as_root chgrp "$am_group" "$am_out"; then
+    echo "NOTE: could not chgrp $am_out to '$am_group' (needs root)." >&2
+    echo "      Falling back to the setup user's own group (checked below)." >&2
+  fi
+fi
+ALERTMANAGER_CONFIG_GID=$(oe_file_gid "$am_out")
+# Whatever group ended up on the file — the dedicated one or the fallback —
+# must not be shared with other user accounts. This is what keeps the
+# group-readable SMTP_PASSWORD private on hosts whose shared primary group
+# would otherwise leak it (DEPLOYMENT.md's "Monitoring & Alerting" section).
+if [ -z "$ALERTMANAGER_CONFIG_GID" ] \
+  || ! oe_group_private_to "$ALERTMANAGER_CONFIG_GID" "$(id -un)"; then
+  echo "ERROR: $am_out would be group-readable by accounts other" >&2
+  echo "       than $(id -un) (group ${ALERTMANAGER_CONFIG_GID:-?})," >&2
+  echo "       and it holds SMTP_PASSWORD. Give it a group with no other" >&2
+  echo "       members, e.g. the dedicated one, and re-run this script:" >&2
+  echo "         sudo groupadd --system $am_group" >&2
+  echo "         sudo chgrp $am_group $am_out" >&2
+  echo "       (see DEPLOYMENT.md's \"Monitoring & Alerting\" section)" >&2
+  exit 1
+fi
+env_set ALERTMANAGER_CONFIG_GID "$ALERTMANAGER_CONFIG_GID" .env.prod
+export ALERTMANAGER_CONFIG_GID
 
 # The cap-probe blackbox target carries the deployed Cap site key, which is
 # generated per installation (scripts/create-cap-site-key.sh) and rotated by
@@ -113,7 +178,7 @@ echo "Bringing up the monitoring stack..."
 repo_dir="$(pwd)"
 install_cron_line() {
   local line="$1"
-  ( crontab -l 2>/dev/null | grep -vF "$line" ; echo "$line" ) | crontab -
+  ( crontab -l 2>/dev/null | grep -vF "$line" || true; echo "$line" ) | crontab -
 }
 install_cron_line "0 4 * * * $repo_dir/scripts/pitr-backup.sh >> /var/log/openexam-pitr-backup.log 2>&1"
 install_cron_line "17 5 * * * $repo_dir/scripts/cert-expiry-metric.sh >> /var/log/openexam-cert-expiry.log 2>&1"

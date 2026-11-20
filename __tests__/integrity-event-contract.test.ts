@@ -50,6 +50,7 @@ describe("integrity event contract fixture", () => {
   it("mergeKnownPatchKeys keeps known keys and drops unknown ones", () => {
     const merged = mergeKnownPatchKeys({
       integrityEventCount: 4,
+      focusLossEventCount: 2,
       lastIntegrityEvent: {
         kind: "TAB_HIDDEN",
         detail: "",
@@ -70,6 +71,7 @@ describe("integrity event contract fixture", () => {
 
     expect(merged).toEqual({
       integrityEventCount: 4,
+      focusLossEventCount: 2,
       // The nested object is kept whole — patches are shallow-merged.
       lastIntegrityEvent: {
         kind: "TAB_HIDDEN",

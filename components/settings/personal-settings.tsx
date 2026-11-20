@@ -3,12 +3,16 @@ import { ProfileForm } from "@/components/settings/profile-form"
 import { EmailForm } from "@/components/settings/email-form"
 import { PasswordForm } from "@/components/settings/password-form"
 import { AccessibilitySettings } from "@/components/settings/accessibility-settings"
+import { verifiedEmailChange } from "@/lib/email-change-state"
 
 interface PersonalSettingsProps {
   userId: string
   name: string
   email: string
   callbackURL: string
+  // Raw signed email-change parameter from the page's query string (see
+  // lib/email-change-state.ts); verified here against userId.
+  emailChange?: string | string[]
   // Whether this user ever sits an exam. Only the exam-timer preference is
   // exam-specific; false hides that one toggle.
   //
@@ -26,6 +30,7 @@ export async function PersonalSettings({
   name,
   email,
   callbackURL,
+  emailChange,
   takesExams = true,
 }: PersonalSettingsProps) {
   const credentialAccount = await prisma.account.findFirst({
@@ -36,7 +41,11 @@ export async function PersonalSettings({
   return (
     <div className="flex max-w-2xl flex-col gap-6">
       <ProfileForm initialName={name} />
-      <EmailForm currentEmail={email} callbackURL={callbackURL} />
+      <EmailForm
+        currentEmail={email}
+        callbackURL={callbackURL}
+        requestedEmail={verifiedEmailChange(emailChange, userId)}
+      />
       <PasswordForm hasPassword={!!credentialAccount} />
       <AccessibilitySettings showExamTimerPref={takesExams} />
     </div>

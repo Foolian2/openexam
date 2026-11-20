@@ -15,9 +15,9 @@ const DEVTOOLS_SIZE_THRESHOLD = 160
 
 /**
  * How long the window must stay unfocused before a blur counts as leaving it.
- * Long enough to outlast both the blur/visibilitychange race and a click on
- * SEB's own chrome — see lib/blur-watch.ts for what each of those looked like
- * in production.
+ * Filters brief focus transfers and most blur/visibilitychange races. Native
+ * SEB controls can retain focus beyond this delay; macOS SEB therefore reports
+ * visible-page blur as information rather than evidence of leaving a window.
  */
 const BLUR_CONFIRM_MS = 1_500
 
@@ -80,11 +80,16 @@ export function useIntegrityMonitor({
       )
     }
 
+    const inSeb = window.SafeExamBrowser !== undefined
+    // macOS SEB's native top bar can keep focus while the exam remains
+    // visible. Web focus APIs cannot distinguish that from app switching.
+    // Keep the signal as information, without claiming the student left SEB.
+    const inMacSeb = inSeb && /Macintosh/.test(navigator.userAgent)
     const blurWatch = createBlurWatch({
       confirmMs: BLUR_CONFIRM_MS,
       isHidden: () => document.hidden,
       hasFocus: () => document.hasFocus(),
-      onLeave: () => report("WINDOW_BLUR"),
+      onLeave: () => report(inMacSeb ? "PAGE_FOCUS_LOST" : "WINDOW_BLUR"),
     })
 
     // A reload (F5 in SEB) also hides the document on its way out, which is
@@ -259,7 +264,6 @@ export function useIntegrityMonitor({
     // in an embedded WKWebView (it would flag every SEB student on every
     // poll, drowning the real signals) and SEB blocks devtools natively
     // anyway.
-    const inSeb = window.SafeExamBrowser !== undefined
     const devtoolsInterval = inSeb
       ? undefined
       : setInterval(() => {

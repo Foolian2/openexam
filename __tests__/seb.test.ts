@@ -467,6 +467,7 @@ describe("macOS lockdown mode (SEB 3.7 AAC)", () => {
     expect(settings.enablePrivateClipboardMacEnforce).toBe(true)
 
     // Windows Kiosk & Service
+    expect(settings.enableAltTab).toBe(false)
     expect(settings.enableAltEsc).toBe(false)
     expect(settings.enableCtrlEsc).toBe(false)
     expect(settings.enableStartMenu).toBe(false)

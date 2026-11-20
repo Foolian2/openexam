@@ -339,12 +339,19 @@ export async function DELETE(request: NextRequest, { params }: Params) {
     return conflict("Nur Entwürfe können gelöscht werden")
   }
 
-  await prisma.exam.delete({ where: { id } })
+  const { count } = await prisma.exam.deleteMany({
+    where: { id, creatorId: session.user.id, status: "DRAFT" },
+  })
+  if (count === 0) return conflict("Nur Entwürfe können gelöscht werden")
 
   await createAuditLog({
     action: "EXAM_DELETED",
     entityType: "Exam",
     entityId: id,
+    // No examId on purpose: AuditLog.examId is a foreign key to Exam, and the
+    // row is gone — the insert would fail the FK and createAuditLog would
+    // swallow the error, silently losing the EXAM_DELETED record. The ID is
+    // kept in entityId (and in the audit trail's action/entity columns).
     userId: session.user.id,
     ipAddress: getClientIp(request) ?? undefined,
   })

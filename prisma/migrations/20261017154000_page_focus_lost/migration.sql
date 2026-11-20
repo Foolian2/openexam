@@ -1,0 +1,1 @@
+ALTER TYPE "IntegrityEventKind" ADD VALUE 'PAGE_FOCUS_LOST';

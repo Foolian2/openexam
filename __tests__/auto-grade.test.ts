@@ -69,7 +69,11 @@ describe("autoGrade MULTIPLE_CHOICE", () => {
 const fillBlankConfig: FillBlankConfig = {
   template: "The capital of {1} is {2}.",
   blanks: [
-    { id: "b1", acceptedAnswers: ["Schweiz", "Switzerland"], caseSensitive: false },
+    {
+      id: "b1",
+      acceptedAnswers: ["Schweiz", "Switzerland"],
+      caseSensitive: false,
+    },
     { id: "b2", acceptedAnswers: ["Bern"], caseSensitive: true },
   ],
 }
@@ -220,7 +224,9 @@ describe("autoGrade MATCHING", () => {
       matchingConfig,
       {
         type: "MATCHING",
-        matches: [{ leftId: "p1", rightId: matchingRightId("other:seed", "p1") }],
+        matches: [
+          { leftId: "p1", rightId: matchingRightId("other:seed", "p1") },
+        ],
       },
       4,
       { matchingSeed: seed }
@@ -302,9 +308,16 @@ describe("autoGrade TRUE_FALSE", () => {
     expect(() =>
       autoGrade("TRUE_FALSE", null, { type: "TRUE_FALSE", selected: true }, 2)
     ).not.toThrow()
-    expect(autoGrade("TRUE_FALSE", null, { type: "TRUE_FALSE", selected: true }, 2)).toBeNull()
     expect(
-      autoGrade("TRUE_FALSE", { isCorrect: "yes" }, { type: "TRUE_FALSE", selected: true }, 2)
+      autoGrade("TRUE_FALSE", null, { type: "TRUE_FALSE", selected: true }, 2)
+    ).toBeNull()
+    expect(
+      autoGrade(
+        "TRUE_FALSE",
+        { isCorrect: "yes" },
+        { type: "TRUE_FALSE", selected: true },
+        2
+      )
     ).toBeNull()
   })
 })
@@ -390,12 +403,24 @@ describe("autoGrade SHORT_ANSWER", () => {
     expect(() =>
       autoGrade("SHORT_ANSWER", null, { type: "SHORT_ANSWER", text: "Bern" }, 2)
     ).not.toThrow()
-    expect(autoGrade("SHORT_ANSWER", null, { type: "SHORT_ANSWER", text: "Bern" }, 2)).toBeNull()
     expect(
-      autoGrade("SHORT_ANSWER", { acceptedAnswers: "nope" }, { type: "SHORT_ANSWER", text: "Bern" }, 2)
+      autoGrade("SHORT_ANSWER", null, { type: "SHORT_ANSWER", text: "Bern" }, 2)
     ).toBeNull()
     expect(
-      autoGrade("SHORT_ANSWER", { acceptedAnswers: [123] }, { type: "SHORT_ANSWER", text: "Bern" }, 2)
+      autoGrade(
+        "SHORT_ANSWER",
+        { acceptedAnswers: "nope" },
+        { type: "SHORT_ANSWER", text: "Bern" },
+        2
+      )
+    ).toBeNull()
+    expect(
+      autoGrade(
+        "SHORT_ANSWER",
+        { acceptedAnswers: [123] },
+        { type: "SHORT_ANSWER", text: "Bern" },
+        2
+      )
     ).toBeNull()
   })
 })
@@ -422,7 +447,8 @@ describe("autoGrade ORDERING", () => {
   })
 
   it("awards proportional points scaled to the fraction of correctly placed items", () => {
-    // 2 of 4 positions correct → roundHalf(4 * 2/4) = 2.
+    // 2 of 4 positions correct → maxPoints * fraction = 4 * 2/4 = 2, which
+    // already sits on the half-point grid so no rounding is involved.
     const result = autoGrade(
       "ORDERING",
       orderingConfig,
@@ -448,7 +474,10 @@ describe("autoGrade ORDERING", () => {
     const result = autoGrade(
       "ORDERING",
       orderingConfig,
-      { type: "ORDERING", orderedIds: ["a", "b", "c", "d", "forged-1", "forged-2"] },
+      {
+        type: "ORDERING",
+        orderedIds: ["a", "b", "c", "d", "forged-1", "forged-2"],
+      },
       4
     )
     expect(result?.points).toBe(4)
@@ -466,8 +495,9 @@ describe("autoGrade ORDERING", () => {
   })
 
   it("rounds to the nearest half point", () => {
-    // Only the first position is correct: ["a","x","x","x"] → 1 of 4 → 1/4.
-    // With maxPoints = 1, the raw product is 0.25 and roundHalf(0.25) = 0.5.
+    // Only the first position is correct: ["a","c","d","b"] → 1 of 4 → 1/4.
+    // With maxPoints = 1 the raw product is 0.25; the half-point grid rounds
+    // that to 0.5, still within the maximum.
     const result = autoGrade(
       "ORDERING",
       orderingConfig,
@@ -549,4 +579,102 @@ describe("autoGrade Unicode normalization (NFC)", () => {
     )
     expect(result?.points).toBe(0)
   })
+})
+
+describe("fractional question maxima", () => {
+  it.each([0.1, 0.25, 0.75, 1.25, 1.8])(
+    "preserves full credit and caps partial credit at %s",
+    (maximum) => {
+      const config: OrderingConfig = {
+        items: [
+          { id: "a", text: "A" },
+          { id: "b", text: "B" },
+        ],
+        shuffle: false,
+      }
+      // Full credit is returned exactly, even for maxima below the half-point
+      // grid (roundHalf used to award 0.5 for a 0.25 maximum).
+      expect(
+        autoGrade(
+          "ORDERING",
+          config,
+          { type: "ORDERING", orderedIds: ["a", "b"] },
+          maximum
+        )?.points
+      ).toBe(maximum)
+      // Partial credit is rounded to the half-point grid, but the result must
+      // stay inside [0, maximum].
+      const partial = autoGrade(
+        "ORDERING",
+        config,
+        { type: "ORDERING", orderedIds: ["a"] },
+        maximum
+      )!.points
+      expect(partial).toBeGreaterThanOrEqual(0)
+      expect(partial).toBeLessThanOrEqual(maximum)
+    }
+  )
+
+  it("rounds bounded partial credit down to zero for a 0.25-point maximum", () => {
+    // One of two items placed correctly on a 0.25 maximum is 0.125 raw
+    // points; the half-point grid rounds that to 0. This pins the intentional
+    // behaviour: partial credit keeps the half-point convention, while full
+    // credit (asserted below) stays exact — never the 0.5 the old roundHalf
+    // awarded for this maximum.
+    const config: OrderingConfig = {
+      items: [
+        { id: "a", text: "A" },
+        { id: "b", text: "B" },
+      ],
+      shuffle: false,
+    }
+    expect(
+      autoGrade(
+        "ORDERING",
+        config,
+        { type: "ORDERING", orderedIds: ["a"] },
+        0.25
+      )?.points
+    ).toBe(0)
+    expect(
+      autoGrade(
+        "ORDERING",
+        config,
+        { type: "ORDERING", orderedIds: ["a", "b"] },
+        0.25
+      )?.points
+    ).toBe(0.25)
+  })
+})
+
+it("preserves fractional full credit for matching and fill-in-the-blank too", () => {
+  expect(
+    autoGrade(
+      "FILL_IN_THE_BLANK",
+      fillBlankConfig,
+      {
+        type: "FILL_IN_THE_BLANK",
+        blanks: [
+          { id: "b1", value: "Schweiz" },
+          { id: "b2", value: "Bern" },
+        ],
+      },
+      0.25
+    )?.points
+  ).toBe(0.25)
+  expect(
+    autoGrade(
+      "MATCHING",
+      matchingConfig,
+      {
+        type: "MATCHING",
+        matches: matchingConfig.pairs.map((p) => ({
+          leftId: p.id,
+          rightId: matchingRightId(seed, p.id),
+        })),
+      },
+      1.25,
+      { matchingSeed: seed }
+    )?.points
+  ).toBe(1.25)
 })

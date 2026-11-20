@@ -76,6 +76,7 @@ beforeEach(() => {
     examId: EXAM_ID,
     userId: "student1",
     status: "IN_PROGRESS",
+    startedAt: new Date("2026-10-08T09:00:00Z"),
     effectiveEndTime: null,
     exam: { id: EXAM_ID, requireSeb: false },
   })
@@ -135,6 +136,7 @@ describe("PUT /api/sessions/[id]/answers: access", () => {
       examId: EXAM_ID,
       userId: "student1",
       status: "IN_PROGRESS",
+      startedAt: new Date("2026-10-08T09:00:00Z"),
       effectiveEndTime: null,
       activeAuthSessionId: "auth-2",
       exam: { id: EXAM_ID },
@@ -151,6 +153,7 @@ describe("PUT /api/sessions/[id]/answers: access", () => {
       examId: EXAM_ID,
       userId: "student1",
       status: "IN_PROGRESS",
+      startedAt: new Date("2026-10-08T09:00:00Z"),
       effectiveEndTime: null,
       activeAuthSessionId: "auth-1",
       exam: { id: EXAM_ID },
@@ -164,6 +167,7 @@ describe("PUT /api/sessions/[id]/answers: access", () => {
       examId: EXAM_ID,
       userId: "student1",
       status: "IN_PROGRESS",
+      startedAt: new Date("2026-10-08T09:00:00Z"),
       effectiveEndTime: null,
       activeAuthSessionId: "auth-1",
       activeDeviceId: UUID,
@@ -190,6 +194,7 @@ describe("PUT /api/sessions/[id]/answers: access", () => {
       examId: EXAM_ID,
       userId: "student1",
       status: "IN_PROGRESS",
+      startedAt: new Date("2026-10-08T09:00:00Z"),
       effectiveEndTime: null,
       exam: { id: EXAM_ID },
     })
@@ -212,8 +217,23 @@ describe("PUT /api/sessions/[id]/answers: access", () => {
       examId: EXAM_ID,
       userId: "student1",
       status: "IN_PROGRESS",
+      startedAt: new Date("2026-10-08T09:00:00Z"),
       effectiveEndTime: new Date(Date.now() - 5 * 60_000),
       exam: { id: EXAM_ID },
+    })
+    expect((await save()).status).toBe(409)
+    expectNothingWritten()
+  })
+
+  it("refuses the save before an SEB session's clock has started", async () => {
+    prismaMock.examSession.findUnique.mockResolvedValue({
+      id: SESSION_ID,
+      examId: EXAM_ID,
+      userId: "student1",
+      status: "IN_PROGRESS",
+      startedAt: null,
+      effectiveEndTime: null,
+      exam: { id: EXAM_ID, sebRequired: true },
     })
     expect((await save()).status).toBe(409)
     expectNothingWritten()

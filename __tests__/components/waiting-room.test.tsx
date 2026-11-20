@@ -6,6 +6,8 @@ const replace = vi.fn()
 // Stable, like Next's: the room re-renders every second (countdown clock).
 const router = { replace }
 vi.mock("next/navigation", () => ({ useRouter: () => router }))
+const { replaceDocument } = vi.hoisted(() => ({ replaceDocument: vi.fn() }))
+vi.mock("@/lib/document-navigation", () => ({ replaceDocument }))
 
 import {
   ENTER_SPREAD_MS,
@@ -53,10 +55,12 @@ beforeEach(() => {
   vi.useFakeTimers()
   vi.setSystemTime(NOW)
   replace.mockReset()
+  replaceDocument.mockReset()
   fetchMock.mockReset()
   vi.stubGlobal("fetch", fetchMock)
 })
 afterEach(() => {
+  vi.restoreAllMocks()
   vi.useRealTimers()
   vi.unstubAllGlobals()
 })
@@ -71,7 +75,7 @@ it("waits, then counts down to the shared start and opens the exam", async () =>
     "/api/sessions/s1/start-status",
     expect.anything()
   )
-  expect(replace).not.toHaveBeenCalled()
+  expect(replaceDocument).not.toHaveBeenCalled()
 
   // The teacher presses Start: the clock begins 10 s from now.
   const startedAt = new Date(Date.now() + 10_000).toISOString()
@@ -85,7 +89,9 @@ it("waits, then counts down to the shared start and opens the exam", async () =>
   await act(async () => {
     await vi.advanceTimersByTimeAsync(10_000 + ENTER_SPREAD_MS)
   })
-  expect(replace).toHaveBeenCalledWith("/exam/exam/take")
+  // A full load, never a soft navigation: SEB's Config Key check needs it.
+  expect(replaceDocument).toHaveBeenCalledWith("/exam/exam/take")
+  expect(replace).not.toHaveBeenCalled()
   // Polling stops once the start is known.
   expect(fetchMock.mock.calls.length).toBe(polls)
 })
@@ -106,11 +112,13 @@ it("follows the server's clock, not the device's", async () => {
   await act(async () => {
     await vi.advanceTimersByTimeAsync(4_000)
   })
-  expect(replace).not.toHaveBeenCalled()
+  expect(replaceDocument).not.toHaveBeenCalled()
   await act(async () => {
     await vi.advanceTimersByTimeAsync(1_000 + ENTER_SPREAD_MS)
   })
-  expect(replace).toHaveBeenCalledWith("/exam/exam/take")
+  // A full load, never a soft navigation: SEB's Config Key check needs it.
+  expect(replaceDocument).toHaveBeenCalledWith("/exam/exam/take")
+  expect(replace).not.toHaveBeenCalled()
 })
 
 it("says so when the exam is taken away before Start", async () => {
@@ -123,6 +131,10 @@ it("says so when the exam is taken away before Start", async () => {
 })
 
 it("warns after repeated failed polls and keeps trying", async () => {
+  // Pin the jitter to the middle (2 s per poll). With random delays down to
+  // 1.5 s, three polls could fit into two 2.6 s steps and the warning showed
+  // one step early, which made this test flaky in CI.
+  vi.spyOn(Math, "random").mockReturnValue(0.5)
   fetchMock.mockRejectedValue(new Error("offline"))
   renderRoom()
   await nextPoll()

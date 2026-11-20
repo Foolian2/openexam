@@ -232,8 +232,11 @@ rules:
       finding L2: file upload validates only by extension; content-type is
       client-controlled). Both File.name and File.type are copied verbatim
       out of the multipart body, so an extension or MIME allowlist proves
-      nothing about the bytes that get stored. Read the leading bytes and
-      verify the magic number before uploading, then this rule goes quiet.
+      nothing about the bytes that get stored. L2 is closed as accepted
+      policy (2026-10-17): uploaded bytes stay opaque in AnswerFile and
+      every download forces attachment, application/octet-stream and
+      nosniff. Magic-number sniffing is deliberately not planned -- read
+      SECURITY.md ("Uploaded answer files") before proposing it.
     patterns:
       # The old rule was `$FILE.type === $STR` with no scope at all, so it
       # matched every `.type === "..."` comparison in the repo -- question
@@ -250,10 +253,16 @@ rules:
       # Deliberately no suppression clause. An exclusion like
       # `sniffFileType(...)` would be satisfied by a call on unrelated data,
       # or by one whose result is never consulted -- it would let the rule go
-      # quiet without the magic-number check it is asking for, which is the
-      # failure mode this rule exists to catch. The suppression should be
-      # written against the real remediation once L2 is fixed, not invented
-      # here against a helper that does not exist yet.
+      # quiet without the check it is asking for, which is the failure mode
+      # this rule exists to catch. L2 is closed as accepted policy (2026-10-17,
+      # SECURITY.md "Uploaded answer files"): the extension check is a submission-format
+      # policy, uploaded bytes stay opaque in AnswerFile, and every download
+      # forces attachment, application/octet-stream and nosniff via
+      # downloadHeaders. Magic-number sniffing is deliberately not planned --
+      # arbitrary text and source formats are supported and have no meaningful
+      # magic number -- so the nosemgrep suppression at the extension check is
+      # the standing accepted-risk record, not a placeholder for a future
+      # remediation.
 
   - id: openexam-audit-write-failure-swallowed
     languages: [typescript]

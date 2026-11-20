@@ -69,3 +69,59 @@ func newJoinTestServer(t *testing.T, h *Hub) *httptest.Server {
 	t.Cleanup(srv.Close)
 	return srv
 }
+
+// A room that stops its run loop must remove its own hub entry, otherwise the
+// stopped room — its closed channels and retained per-session maps — stays
+// reachable for the hub's lifetime. The removal must delete only the
+// identical stopped instance so a race with a joining client cannot drop the
+// replacement room.
+func TestHub_StoppedRoomIsRemoved(t *testing.T) {
+	h := New(nil, &fakeRoomStore{}, &fakeBuffer{}, &fakeFlusher{}, 10*time.Millisecond, 0, nil)
+	defer h.Shutdown(time.Second)
+	r := h.GetOrCreateRoom("audit-exam")
+	select {
+	case <-r.done:
+	case <-time.After(time.Second):
+		t.Fatal("room did not stop")
+	}
+	h.wg.Wait()
+	h.mu.Lock()
+	retained := h.rooms["audit-exam"] == r
+	h.mu.Unlock()
+	t.Logf("stopped=%v retained in hub=%v", r.IsStopped(), retained)
+	if retained {
+		t.Fatal("stopped room is still retained")
+	}
+}
+
+// TestHub_StoppedRoomIsRemoved above cannot see HOW the entry is deleted —
+// an unconditional delete(h.rooms, examID) passes it just as well. The
+// identity check is what actually prevents a stopped room's cleanup from
+// deleting a replacement a join installed while it was draining, so it gets
+// asserted directly: a stale cleanup must leave the replacement alone.
+func TestHub_RemoveRoomIfCurrentKeepsReplacement(t *testing.T) {
+	h := New(nil, &fakeRoomStore{}, &fakeBuffer{}, &fakeFlusher{}, 10*time.Millisecond, 0, nil)
+	defer h.Shutdown(time.Second)
+
+	stale := &Room{}
+	replacement := &Room{}
+	h.mu.Lock()
+	h.rooms["audit-exam"] = replacement
+	h.mu.Unlock()
+
+	h.removeRoomIfCurrent("audit-exam", stale)
+	h.mu.Lock()
+	kept := h.rooms["audit-exam"]
+	h.mu.Unlock()
+	if kept != replacement {
+		t.Fatalf("stale room cleanup removed the replacement (kept %p, want %p)", kept, replacement)
+	}
+
+	h.removeRoomIfCurrent("audit-exam", replacement)
+	h.mu.Lock()
+	_, ok := h.rooms["audit-exam"]
+	h.mu.Unlock()
+	if ok {
+		t.Fatal("cleanup of the current room left its entry behind")
+	}
+}

@@ -12,28 +12,26 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-source scripts/lib/production-compose.sh
-
 usage() {
   cat <<'EOF'
 Usage:
   scripts/pitr-restore.sh --latest --yes-i-am-sure
-  scripts/pitr-restore.sh --target-time "2026-08-13 12:00:00+00" --yes-i-am-sure
 
 --latest         Restore the most recent base backup with no WAL replay past it.
---target-time T  Restore to the state as of T (any format Postgres's
-                  recovery_target_time accepts) — a base backup at or before
-                  T is fetched, then archived WAL is replayed up to T.
+Historical --target-time restores are disabled until recovery can be
+validated in a scratch volume before replacing the live data directory.
 --yes-i-am-sure  Required. This overwrites postgres_data's current contents.
 EOF
 }
 
-target_time=""
 latest=false
 confirmed=false
 while [ $# -gt 0 ]; do
   case "$1" in
-    --target-time) target_time="${2:-}"; shift 2 ;;
+    --target-time | --target-time=*)
+      echo "ERROR: Historical --target-time restore is disabled; validate recovery in a scratch volume first." >&2
+      echo "No services were stopped and no database files were changed." >&2
+      exit 1 ;;
     --latest) latest=true; shift ;;
     --yes-i-am-sure) confirmed=true; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -41,13 +39,9 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-if [ -z "$target_time" ] && [ "$latest" = false ]; then
-  echo "ERROR: --target-time or --latest is required" >&2
+if [ "$latest" = false ]; then
+  echo "ERROR: --latest is required (historical --target-time restores are disabled)" >&2
   usage
-  exit 1
-fi
-if [ -n "$target_time" ] && [ "$latest" = true ]; then
-  echo "ERROR: --target-time and --latest are mutually exclusive" >&2
   exit 1
 fi
 if [ "$confirmed" != true ]; then
@@ -57,6 +51,11 @@ if [ "$confirmed" != true ]; then
 fi
 
 [ -f .env.prod ] || { echo "ERROR: .env.prod missing (copy .env.example)"; exit 1; }
+
+# Sourced only after argument validation: every refusal above (historical
+# targets, missing confirmation) must happen without touching compose or
+# Docker, and before this script reads .env.prod.
+source scripts/lib/production-compose.sh
 
 if [ "$walg_backend" = disabled ]; then
   echo "ERROR: PITR is disabled; configure SFTP before restoring." >&2
@@ -85,34 +84,45 @@ if ! "${COMPOSE[@]}" run --rm --no-deps -T --entrypoint sh postgres -c '
   exit 1
 fi
 
+# Safety dump before anything is stopped or replaced. The base backup we are
+# about to fetch is only as fresh as the last wal-g push, so this dump is the
+# sole copy of everything committed since then — and the only rollback if the
+# fetched backup turns out to be unusable. Same naming and permissions as
+# scripts/backup.sh (seconds in the name so the two cannot collide).
+BACKUP_DIR="${BACKUP_DIR:-./backups}"
+umask 077
+mkdir -p "$BACKUP_DIR"
+chmod 700 "$BACKUP_DIR"
+safety="$BACKUP_DIR/openexam-$(date +%F-%H%M%S).dump"
+if [ -e "$safety" ]; then
+  echo "ERROR: $safety already exists; refusing to overwrite a dump." >&2
+  exit 1
+fi
+echo "Taking a safety dump..."
+if ! "${COMPOSE[@]}" exec -T postgres pg_dump -U openexam -Fc openexam > "$safety"; then
+  echo "ERROR: safety dump failed; nothing was changed." >&2
+  rm -f "$safety"
+  exit 1
+fi
+if [ ! -s "$safety" ]; then
+  echo "ERROR: empty safety dump $safety; nothing was changed." >&2
+  rm -f "$safety"
+  exit 1
+fi
+echo "Safety dump: $safety ($(du -h "$safety" | cut -f1))"
+
 echo "Stopping app tier and postgres..."
 "${COMPOSE[@]}" stop web ws-backend postgres
 
 echo "Fetching base backup and configuring recovery (existing postgres_data contents are replaced)..."
-# RESTORE_TARGET_TIME travels as an env var into the container (docker
-# compose's `-e VAR` without a value forwards this process's own env), not
-# interpolated into the shell string below — target_time is operator-
-# supplied text and could otherwise break the embedded script's quoting.
-RESTORE_TARGET_TIME="$target_time" "${COMPOSE[@]}" run --rm --no-deps \
-  --entrypoint sh -e RESTORE_TARGET_TIME postgres -c '
-    set -e
-    rm -rf "${PGDATA:?}"/*
-    wal-g backup-fetch "$PGDATA" LATEST
-    touch "$PGDATA/recovery.signal"
-    {
-      echo "restore_command = '"'"'wal-g wal-fetch %f %p'"'"'"
-      if [ -n "$RESTORE_TARGET_TIME" ]; then
-        echo "recovery_target_time = '"'"'$RESTORE_TARGET_TIME'"'"'"
-        echo "recovery_target_action = '"'"'promote'"'"'"
-      else
-        # --latest: stop at the first consistent state. Without an explicit
-        # target, Postgres would replay every archived WAL segment until
-        # wal-fetch fails — not the "no WAL replay" this flag promises.
-        echo "recovery_target = '"'"'immediate'"'"'"
-        echo "recovery_target_action = '"'"'promote'"'"'"
-      fi
-    } >> "$PGDATA/postgresql.auto.conf"
-  '
+# The container program is piped in with `sh -s` and assembled from
+# scripts/lib/restore-in-container.sh plus scripts/lib/recovery-conf.sh, in
+# that order. Both are plain scripts the restore drill runs directly, so
+# neither half can silently drift away from what the tests cover.
+{
+  cat scripts/lib/restore-in-container.sh
+  cat scripts/lib/recovery-conf.sh
+} | "${COMPOSE[@]}" run --rm --no-deps -T --entrypoint sh postgres -s
 
 echo "Starting postgres in recovery mode..."
 "${COMPOSE[@]}" up -d postgres

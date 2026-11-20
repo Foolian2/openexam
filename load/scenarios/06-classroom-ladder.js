@@ -6,6 +6,7 @@
 //
 // Run one rung:
 //   k6 run load/scenarios/06-classroom-ladder.js -e CLASSES=8 -e STUDENTS_PER_CLASS=25
+// Repeat this scenario with increasing student counts to measure the ladder.
 // Requires: pnpm load:seed -- --count <CLASSES*STUDENTS_PER_CLASS> --teachers <CLASSES>
 //
 // Role assignment: students and monitors deliberately share ONE k6 scenario

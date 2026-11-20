@@ -2,7 +2,7 @@
 
 import { SEB_FILE_UPLOAD_MESSAGE } from "@/lib/seb-question-policy"
 
-import { useEffect } from "react"
+import { useEffect, useRef } from "react"
 import { Controller, useForm } from "react-hook-form"
 import { zodResolver } from "@hookform/resolvers/zod"
 import { CalendarIcon, X } from "lucide-react"
@@ -211,19 +211,48 @@ export function ExamMetadataForm({
 
   const waitingRoom = watch("waitingRoom")
 
-  async function save(data: CreateExamInput) {
-    onStatusChange?.("saving")
-    try {
-      await onSubmit(data)
-      onStatusChange?.("saved")
-    } catch {
-      onStatusChange?.("error")
+  const editSeqRef = useRef(0)
+  const saveVersionRef = useRef(0)
+  const saveChainRef = useRef<Promise<void>>(Promise.resolve())
+  const mountedRef = useRef(false)
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
     }
+  }, [])
+
+  function save(data: CreateExamInput, version: number) {
+    // Serialize requests, and discard snapshots superseded while they were
+    // debounced or waiting behind an in-flight request. A switch must never
+    // be overwritten by an older full-form text snapshot. Only that version
+    // check may skip a queued request: navigating away right after a switch
+    // must not drop the save, so mountedRef gates just the status callbacks.
+    saveChainRef.current = saveChainRef.current.then(async () => {
+      if (version !== saveVersionRef.current) return
+      try {
+        await onSubmit(data)
+        if (mountedRef.current && version === saveVersionRef.current) {
+          onStatusChange?.("saved")
+        }
+      } catch {
+        if (mountedRef.current && version === saveVersionRef.current) {
+          onStatusChange?.("error")
+        }
+      }
+    })
   }
 
-  const debouncedSave = useDebouncedCallback((data: CreateExamInput) => {
-    void save(data)
-  }, 600)
+  // flushOnUnmount: the status line already said "saving" for the pending
+  // snapshot, so dropping it would lose an edit the UI promised to write.
+  // save() runs it after teardown with its status callbacks gated away.
+  const debouncedSave = useDebouncedCallback(
+    (data: CreateExamInput, version: number) => {
+      save(data, version)
+    },
+    600,
+    { flushOnUnmount: true }
+  )
 
   useEffect(() => {
     if (!autosave) return
@@ -235,18 +264,25 @@ export function ExamMetadataForm({
     // not somewhere to take a behavioural change for a memoization hint.
     // eslint-disable-next-line react-hooks/incompatible-library
     const subscription = watch((_values, { name }) => {
-      handleSubmit(
-        (data) => {
-          if (name && SWITCH_FIELDS.has(name)) {
-            void save(data)
-          } else {
-            debouncedSave(data)
-          }
-        },
-        () => {
-          // Validation failed — leave the field errors visible, don't save.
+      // Stamp the sequence synchronously, at edit time: a snapshot's version
+      // must reflect when it was edited, not when its validation resolved,
+      // so an older snapshot can never outrank a newer one. Validation only
+      // gates eligibility. No onInvalid handler: an invalid snapshot (an
+      // empty title while retyping) is not a rejected save — it must neither
+      // show the error status nor cancel a valid save already queued, so it
+      // leaves the save version untouched and the inline field errors
+      // explain what to fix.
+      const seq = ++editSeqRef.current
+      handleSubmit((data) => {
+        if (seq < saveVersionRef.current) return
+        saveVersionRef.current = seq
+        if (mountedRef.current) onStatusChange?.("saving")
+        if (name && SWITCH_FIELDS.has(name)) {
+          save(data, seq)
+        } else {
+          debouncedSave(data, seq)
         }
-      )()
+      })()
     })
     return () => subscription.unsubscribe()
     // eslint-disable-next-line react-hooks/exhaustive-deps

@@ -80,7 +80,10 @@ export async function PUT(request: NextRequest, { params }: Params) {
     return !(
       existing?.autoGraded &&
       existing.points === grade.points &&
-      (existing.feedback || undefined) === (grade.feedback || undefined)
+      // Nullish normalization, matching the client's (grade?.feedback ?? "")
+      // draft init, so "" (a meaningful "clear feedback" value) and strings
+      // like "0" are compared as-is instead of through falsy coercion.
+      (existing.feedback ?? "") === (grade.feedback ?? "")
     )
   })
 

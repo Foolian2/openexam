@@ -1,34 +1,55 @@
-# gitleaks configuration
-#
-# Extends the bundled ruleset rather than replacing it — every default rule
-# stays active on every path except the one waived below.
-
+# Keep every bundled secret rule active. Exceptions below apply only to
+# generic-api-key, only in the named file, and only to the exact known
+# public values enumerated in each entry -- never a shape or field pattern.
 [extend]
 useDefault = true
 
-[allowlist]
-description = "SEB hash test vectors are hash inputs/outputs, not credentials"
-# testdata/seb-token-vectors.json pins the cross-language contract for
-# `sha256(urlWithoutFragment + key)` that the TS and Go implementations must
-# agree on, so the fixture has to carry literal key material to be worth
-# anything. One vector is a 64-hex Browser Exam Key in the shape SEB
-# Preferences emits, which the entropy-based `generic-api-key` rule reads as
-# a credential.
-#
-# These are not credentials: they are inputs chosen to exercise the hash, and
-# every expected digest beside them is reproducible from the file itself.
-#
-# Note this excludes the file from secret scanning *entirely*, not just from
-# the one rule that fires today — a `paths` entry is matched before any
-# content rule runs, so narrowing it to `generic-api-key` is not possible
-# here. Keep the file to hash vectors only; nothing actually secret belongs
-# in it.
-#
-# testdata/seb-config-key-strings.json is the same kind of fixture for the
-# Config Key: each `configKey` is the SHA-256 of the `canonical` string beside
-# it, pinned against the upstream SEB serializers. The 64-hex digests trip
-# `generic-api-key` the same way. Keep it to hash vectors only as well.
-paths = [
-  '''^testdata/seb-token-vectors\.json$''',
-  '''^testdata/seb-config-key-strings\.json$''',
-]
+[[rules]]
+id = "generic-api-key"
+
+  [[rules.allowlists]]
+  description = "Public alphabet used to generate random SEB quit passwords"
+  condition = "AND"
+  paths = ['''(^|/)lib/seb-config\.ts$''']
+  regexes = ['''^ABCDEFGHJKLMNPQRSTUVWXYZ23456789$''']
+
+  [[rules.allowlists]]
+  description = "Reproducible SHA-256 token shared with the TypeScript test"
+  condition = "AND"
+  paths = ['''(^|/)ws-backend/internal/seb/seb_test\.go$''']
+  regexes = ['''^31dbc8371cd20d4a0606f137a0027bcc797574e2b4ed79462b1d74e44b47fab5$''']
+
+  [[rules.allowlists]]
+  description = "Historical synthetic Config Key in the original SEB unit test"
+  condition = "AND"
+  paths = ['''(^|/)__tests__/seb\.test\.ts$''']
+  # This value survives only in git history (no current file contains it);
+  # keeping it is what lets full-history scans pass.
+  regexes = ['''^abc123def456$''']
+
+  # Cross-language hash vectors: allow just the known key/digest values in
+  # their key/digest fields, leaving other secrets (and other secret rules)
+  # detectable even in these fixtures. Each regex pins one exact public test
+  # vector together with its field shape; a shape-only pattern such as
+  # "any 64-hex in this field" would also mask a planted canary.
+  [[rules.allowlists]]
+  description = "Synthetic Browser Exam Key in shared SEB hash vectors"
+  condition = "AND"
+  paths = ['''(^|/)testdata/seb-token-vectors\.json$''']
+  regexTarget = "match"
+  regexes = [
+    '''^key": "3f9a1c2b4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8"$''',
+  ]
+
+  [[rules.allowlists]]
+  description = "SHA-256 digests of the adjacent canonical SEB settings strings"
+  condition = "AND"
+  paths = ['''(^|/)testdata/seb-config-key-strings\.json$''']
+  regexTarget = "match"
+  regexes = [
+    '''^configKey": "23b7e7ab30f2d297d38d27946f6994793930d04d9b664a97bab87afc9b8ad5a9"$''',
+    '''^configKey": "1e0bae8018acdd0759a74221130a694aacf4c791c7914fd691c468ce27d2b73e"$''',
+    '''^configKey": "d5868f70fc7ab82794be9b825fe32ff45c3ab72fafcc7a3835940d3e69d195d3"$''',
+    '''^configKey": "90eda1e4b83a062358f61a217c6aede2858f4e88f62da8864a1574ca1b0645e4"$''',
+    '''^configKey": "a4fb5cdea6bb6e661ed8e93cbb0d482a52c7aeb1c4549516a2e33c88418dd4c6"$''',
+  ]

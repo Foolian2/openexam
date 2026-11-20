@@ -35,7 +35,8 @@ LEGAL_CONTROLLER_NAME, LEGAL_CONTROLLER_ADDRESS, LEGAL_CONTACT_EMAIL and
 LEGAL_HOSTING_PROVIDER exported in the environment (the school's details on
 /datenschutz and /impressum — see .env.example); SMTP_* and
 MICROSOFT_* exported in the environment are written to .env.prod; the first
-admin is created when TEACHER_PASSWORD (+ TEACHER_NAME) is exported; offsite
+admin is created when TEACHER_PASSWORD (+ TEACHER_NAME) is exported; email
+is skipped unless SMTP_HOST is exported; offsite
 backups are set up when OFF_TYPE and its OFF_* values are exported (see
 ./openexam backup-offsite --help).
 
@@ -93,7 +94,7 @@ oe_ask_smtp() {
   SMTP_ENABLED=0
   if [ -n "${SMTP_HOST:-}" ]; then
     SMTP_ENABLED=1
-  elif ui_confirm "Set up email (SMTP) for verification mails and password resets?" y; then
+  elif ui_interactive && ui_confirm "Set up email (SMTP) for verification mails and password resets?" y; then
     SMTP_ENABLED=1
   fi
   if [ "$SMTP_ENABLED" -eq 0 ]; then
@@ -126,12 +127,22 @@ oe_ask_microsoft() {
   fi
   ui_ask MICROSOFT_TENANT_ID "Tenant ID (GUID)" "${MICROSOFT_TENANT_ID:-}" oe_valid_tenant "MICROSOFT_TENANT_ID"
   ui_dim "Microsoft logins are only accepted for these email domains (comma-separated)."
+  local domain_issue
   while :; do
     ui_ask_optional SCHOOL_STUDENT_DOMAINS "Student email domains" "${SCHOOL_STUDENT_DOMAINS:-}"
     ui_ask_optional SCHOOL_TEACHER_DOMAINS "Teacher email domains" "${SCHOOL_TEACHER_DOMAINS:-}"
-    [ -n "$SCHOOL_STUDENT_DOMAINS$SCHOOL_TEACHER_DOMAINS" ] && break
-    ui_interactive || ui_die "Microsoft login needs SCHOOL_STUDENT_DOMAINS and/or SCHOOL_TEACHER_DOMAINS"
-    ui_warn "Set at least one domain, or every Microsoft login is rejected."
+    if [ -z "$SCHOOL_STUDENT_DOMAINS$SCHOOL_TEACHER_DOMAINS" ]; then
+      ui_interactive || ui_die "Microsoft login needs SCHOOL_STUDENT_DOMAINS and/or SCHOOL_TEACHER_DOMAINS"
+      ui_warn "Set at least one domain, or every Microsoft login is rejected."
+      continue
+    fi
+    # The web tier refuses to boot on these (lib/env.ts), so catch them here.
+    domain_issue=$(oe_school_domains_issue "$SCHOOL_STUDENT_DOMAINS" "$SCHOOL_TEACHER_DOMAINS") && break
+    ui_interactive || ui_die "School email domains: $domain_issue"
+    ui_warn "$domain_issue — enter both lists again."
+    # Cleared so the re-ask doesn't offer the rejected value as its default,
+    # which an empty answer could not otherwise remove.
+    SCHOOL_STUDENT_DOMAINS="" SCHOOL_TEACHER_DOMAINS=""
   done
 }
 
@@ -569,6 +580,10 @@ cmd_install() {
   ui_kv "School" "$LEGAL_CONTROLLER_NAME"
   ui_kv "Email (SMTP)" "$( [ "$SMTP_ENABLED" -eq 1 ] && echo "$SMTP_HOST:$SMTP_PORT" || echo "off")"
   ui_kv "Microsoft login" "$( [ "$MS_ENABLED" -eq 1 ] && echo "on (tenant $MICROSOFT_TENANT_ID)" || echo "off")"
+  if [ "$MS_ENABLED" -eq 1 ]; then
+    ui_kv "  Student domains" "${SCHOOL_STUDENT_DOMAINS:-none}"
+    ui_kv "  Teacher domains" "${SCHOOL_TEACHER_DOMAINS:-none}"
+  fi
   ui_kv "Monitoring" "$MONITORING"
   ui_kv "Offsite backups" "$( [ "$offsite" = yes ] && echo "$OFF_TYPE, encrypted" || echo "off")"
   ui_kv "First admin" "$( [ "$teacher" = yes ] && echo "$TEACHER_EMAIL ($TEACHER_ROLE)" || echo "none")"

@@ -20,19 +20,18 @@
 # tag would otherwise be pulled silently on the next build. Bump via
 # Dependabot and re-verify before adopting a new base.
 
-# node:26-alpine (2026-08-12)
-FROM node:26-alpine@sha256:0b36e8c136b94cd4fcf02188228e76c31ad5872eef3fec8cbd2eee500cfd9e80 AS base
-# The pinned digest ships OpenSSL 3.5.7-r0, which carries CVE-2026-14456
-# (unbounded memory growth in the QUIC server, HIGH). Alpine v3.24/main
-# already has the patched 3.5.8-r0, but upstream node:26-alpine has not been
-# rebuilt against it — bumping the pin would change nothing. Upgrade the two
-# packages in place instead, so the fail-closed Trivy gate stays meaningful
-# rather than being papered over with an ignore entry.
+# node:26-alpine (2026-11-11): Node 26.13.1, OpenSSL 3.5.9-r0
+FROM node:26-alpine@sha256:a90bda2938f2b57112d94ee2e3722c5346efca76e4a034042b5223197567a16c AS base
+# OpenSSL is the one OS package whose fixes have repeatedly landed in
+# Alpine v3.24/main before upstream node:26-alpine was rebuilt (the
+# 2026-08-12 pin shipped 3.5.7-r0 with CVE-2026-14456 while 3.5.8-r0 was
+# already out). Upgrade the two packages in place so the fail-closed Trivy
+# gate stays meaningful between base-image rebuilds instead of being papered
+# over with an ignore entry; with a current base the layer is a no-op.
 #
 # Named explicitly rather than a blanket `apk upgrade`: a full upgrade would
 # silently drift every OS package away from the pinned digest, which is the
-# reproducibility the digest pin exists to provide. Drop this once a rebuilt
-# base image ships 3.5.8-r0 (the layer then becomes a no-op, not an error).
+# reproducibility the digest pin exists to provide.
 RUN apk upgrade --no-cache libcrypto3 libssl3
 RUN npm install -g pnpm@12.3.4
 
@@ -115,7 +114,7 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY scripts/setup-walg-sftp.mjs ./scripts/
 ENTRYPOINT ["node", "scripts/setup-walg-sftp.mjs"]
 
-FROM node:26-alpine@sha256:0b36e8c136b94cd4fcf02188228e76c31ad5872eef3fec8cbd2eee500cfd9e80 AS runner
+FROM node:26-alpine@sha256:a90bda2938f2b57112d94ee2e3722c5346efca76e4a034042b5223197567a16c AS runner
 WORKDIR /app
 ENV NODE_ENV=production \
     HOSTNAME=0.0.0.0 \

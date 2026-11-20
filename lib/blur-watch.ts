@@ -1,8 +1,9 @@
 /**
- * Decides whether losing window focus means the student actually left the exam
- * window, rather than reacting to the raw `blur` event.
+ * Confirms sustained focus loss while the exam stays visible, rather than
+ * reacting to the raw `blur` event. The caller classifies the signal.
  *
- * Two false positives make the raw event unusable as a signal:
+ * Two false positives made the raw event unusable as a signal, both observed in
+ * production on 2026-08-20:
  *
  *  - `blur` fires BEFORE `document.hidden` flips, so a plain tab switch or
  *    minimise produced a WINDOW_BLUR *and* a TAB_HIDDEN for one action. The gap
@@ -12,22 +13,23 @@
  *    button, its dialogs — whenever the student touches it, while the document
  *    stays perfectly visible.
  *
- * Waiting `confirmMs` and re-checking collapses both cases: a tab switch has set
+ * Waiting `confirmMs` and re-checking filters brief transfers: a tab switch has set
  * `hidden` by then and is reported once, as TAB_HIDDEN; a glance at SEB's task
  * bar has given focus back. Switching to another application keeps focus away
- * and still reports.
+ * and still reports. Native controls can also retain focus indefinitely; on
+ * macOS SEB the caller therefore treats this as informational PAGE_FOCUS_LOST.
  *
  * Kept free of the DOM so the rule itself is testable without one; the caller
  * (hooks/use-integrity-monitor.ts) supplies the event wiring.
  */
 export interface BlurWatchOptions {
-  /** How long focus must stay away before a blur counts as leaving. */
+  /** How long focus must stay away before it is reported. */
   confirmMs: number
   /** Reads `document.hidden` at the moment the timer fires, not at blur time. */
   isHidden: () => boolean
   /** Reads `document.hasFocus()` at the moment the timer fires. */
   hasFocus: () => boolean
-  /** Invoked at most once per confirmed departure. */
+  /** Invoked at most once per confirmed focus loss. */
   onLeave: () => void
 }
 

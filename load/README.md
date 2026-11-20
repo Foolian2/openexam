@@ -306,3 +306,11 @@ pnpm test:stress
   restarting ws-backend/Redis containers mid-run) — these need
   orchestration beyond straight load generation and are a planned
   follow-up once this harness is in place, not part of this suite.
+
+### Exam-start and crash regressions
+
+- `k6 run load/scenarios/12-exam-start-rush.js`: simultaneous joins across exams.
+- `k6 run load/scenarios/13-crash-integrity.js`: save and integrity-event traffic
+  during an externally controlled service interruption.
+
+Run against a disposable installation; use the seed and environment setup above.

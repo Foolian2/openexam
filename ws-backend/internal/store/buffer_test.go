@@ -530,3 +530,144 @@ func TestFlusher_ConcurrentFlushOfSameExam_SnapshotsOnce(t *testing.T) {
 		t.Fatalf("upserts after follow-up = %+v, want sess-2 flushed second", writer.upserts)
 	}
 }
+
+// A worker interrupted before its SQL write must not strand the acked answer:
+// dirty membership survives the snapshot and only clears once the flush has
+// committed and cleaned up, so a later worker's tick rediscovers the hash.
+func TestFlusher_InterruptedWriteIsDiscoveredByNextWorker(t *testing.T) {
+	ctx := context.Background()
+	rdb := newTestRedis(t)
+	if err := NewBuffer(rdb).SaveAnswer(ctx, "audit-exam", "s", "q", json.RawMessage(`{"type":"FREE_TEXT","text":"answer"}`), AnswerMeta{}); err != nil {
+		t.Fatal(err)
+	}
+	writer := &fakeWriter{onFlush: func() { panic("simulated process interruption before SQL write") }}
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Error("expected crash boundary")
+			}
+		}()
+		_ = NewFlusher(rdb, writer, time.Second, nil).FlushExamNow(ctx, "audit-exam")
+	}()
+	next := &fakeWriter{}
+	NewFlusher(rdb, next, time.Second, nil).flushAll(ctx)
+	remaining, err := rdb.HLen(ctx, answersHashKey("audit-exam")).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dirty, _ := rdb.SMembers(ctx, dirtyExamsSet).Result()
+	t.Logf("after simulated crash + new flusher tick: pending fields=%d dirty=%v SQL writes=%d", remaining, dirty, len(next.upserts))
+	if remaining != 0 || len(dirty) != 0 || len(next.upserts) != 1 {
+		t.Fatal("new flusher did not recover the interrupted answer")
+	}
+}
+
+// crashAfterCommitWriter persists the batch and then dies before the
+// flusher's cleanup step. Wrapping the fake writer keeps the production
+// store's write semantics untouched; the crash is the test's hook.
+type crashAfterCommitWriter struct {
+	inner *fakeWriter
+}
+
+func (w *crashAfterCommitWriter) FlushAnswers(ctx context.Context, answers []AnswerUpsert) error {
+	if err := w.inner.FlushAnswers(ctx, answers); err != nil {
+		return err
+	}
+	panic("simulated crash after SQL commit, before buffer cleanup")
+}
+
+func (w *crashAfterCommitWriter) TouchLastSeenBatch(ctx context.Context, sessionIDs []string) error {
+	return w.inner.TouchLastSeenBatch(ctx, sessionIDs)
+}
+
+// A worker that commits the batch and then dies before cleanup must not
+// strand the entries: dirty membership stays until cleanup completes, so the
+// next worker's tick rediscovers the hash and re-upserts it. The duplicate
+// upsert is harmless — sequenced writes are gated on clientSeq — and both
+// the hash and the dirty set drain.
+func TestFlusher_CrashAfterCommitBeforeCleanup_NoStrandedAnswer(t *testing.T) {
+	ctx := context.Background()
+	rdb := newTestRedis(t)
+	if err := NewBuffer(rdb).SaveAnswer(ctx, "audit-exam", "s", "q", json.RawMessage(`{"type":"FREE_TEXT","text":"answer"}`), AnswerMeta{}); err != nil {
+		t.Fatal(err)
+	}
+
+	committed := &fakeWriter{}
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Error("expected crash boundary")
+			}
+		}()
+		_ = NewFlusher(rdb, &crashAfterCommitWriter{inner: committed}, time.Second, nil).FlushExamNow(ctx, "audit-exam")
+	}()
+
+	// The batch reached the store, so it must never be lost; the live hash is
+	// still the submit drain's source of truth until cleanup runs.
+	if len(committed.upserts) != 1 {
+		t.Fatalf("committed upserts = %d, want 1", len(committed.upserts))
+	}
+	if remaining, _ := rdb.HLen(ctx, answersHashKey("audit-exam")).Result(); remaining != 1 {
+		t.Fatalf("buffered fields after crash = %d, want 1", remaining)
+	}
+
+	// A fresh worker tick must recover the exam through the surviving dirty
+	// membership, re-persist the batch, and drain both keys.
+	next := &fakeWriter{}
+	NewFlusher(rdb, next, time.Second, nil).flushAll(ctx)
+
+	if remaining, _ := rdb.HLen(ctx, answersHashKey("audit-exam")).Result(); remaining != 0 {
+		t.Fatalf("pending fields after the next tick = %d, want 0 (answer stranded)", remaining)
+	}
+	if dirty, _ := rdb.SMembers(ctx, dirtyExamsSet).Result(); len(dirty) != 0 {
+		t.Fatalf("dirty exams after the next tick = %v, want none", dirty)
+	}
+	if len(next.upserts) != 1 || string(next.upserts[0].Content) != `{"type":"FREE_TEXT","text":"answer"}` {
+		t.Fatalf("next tick upserts = %+v, want the recovered duplicate", next.upserts)
+	}
+}
+
+// The flush lock is TTL-only: if its holder dies, the lock lapses on its own
+// and a successor flush must still persist the buffered answer rather than
+// short-circuiting forever. A stalled flush may delay persistence, but the
+// entries and dirty membership survive, so nothing is stranded.
+func TestFlusher_AbandonedLockLapsesAndSuccessorFlushes(t *testing.T) {
+	ctx := context.Background()
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	if err := NewBuffer(rdb).SaveAnswer(ctx, "audit-exam", "s", "q", json.RawMessage(`{"type":"FREE_TEXT","text":"answer"}`), AnswerMeta{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A worker died holding the lock; only the TTL releases it.
+	if err := rdb.Set(ctx, flushLockKey("audit-exam"), "dead-worker-token", flushLockTTL).Err(); err != nil {
+		t.Fatal(err)
+	}
+	blocked := &fakeWriter{}
+	if err := NewFlusher(rdb, blocked, time.Hour, nil).FlushExamNow(ctx, "audit-exam"); err != nil {
+		t.Fatalf("flush against the dead lock: %v", err)
+	}
+	if len(blocked.upserts) != 0 {
+		t.Fatalf("blocked flush wrote %d upserts, want 0", len(blocked.upserts))
+	}
+	if remaining, _ := rdb.HLen(ctx, answersHashKey("audit-exam")).Result(); remaining != 1 {
+		t.Fatalf("buffered fields while the dead lock holds = %d, want 1", remaining)
+	}
+
+	mr.FastForward(flushLockTTL + time.Second)
+
+	next := &fakeWriter{}
+	if err := NewFlusher(rdb, next, time.Hour, nil).FlushExamNow(ctx, "audit-exam"); err != nil {
+		t.Fatalf("successor flush after TTL lapse: %v", err)
+	}
+	if len(next.upserts) != 1 || next.upserts[0].SessionID != "s" {
+		t.Fatalf("successor upserts = %+v, want the recovered answer", next.upserts)
+	}
+	if remaining, _ := rdb.HLen(ctx, answersHashKey("audit-exam")).Result(); remaining != 0 {
+		t.Fatalf("pending fields after the successor flush = %d, want 0", remaining)
+	}
+	if held, _ := rdb.Exists(ctx, flushLockKey("audit-exam")).Result(); held != 0 {
+		t.Fatal("flush lock still held after the successor flush returned")
+	}
+}

@@ -128,6 +128,14 @@ describe("POST /api/exams/[id]/extend: exam state", () => {
     expect(lock.values).toEqual([EXAM_ID])
     expect(update.sql).toMatch(/^\s*UPDATE "ExamSession"/)
   })
+
+  it("also extends SEB sessions whose clock has not started yet", async () => {
+    await extend()
+    // NULL + interval stays NULL; the grant lands in timeExtensionMin and
+    // the clock start folds it into the deadline.
+    const [, [update]] = txMock.$queryRaw.mock.calls
+    expect(update.sql).not.toMatch(/"effectiveEndTime" IS NOT NULL/)
+  })
 })
 
 describe("POST /api/exams/[id]/extend: success", () => {

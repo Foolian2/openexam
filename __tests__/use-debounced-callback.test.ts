@@ -54,3 +54,21 @@ it("drops a pending call on unmount", () => {
   vi.advanceTimersByTime(1_000)
   expect(cb).not.toHaveBeenCalled()
 })
+
+it("runs the pending call on unmount with flushOnUnmount", () => {
+  const cb = vi.fn()
+  const hook = renderHook(
+    ({ cb }: { cb: (...a: unknown[]) => void }) =>
+      useDebouncedCallback(cb, 300, { flushOnUnmount: true }),
+    { initialProps: { cb } }
+  )
+  hook.result.current("superseded")
+  hook.result.current("kept")
+  hook.unmount()
+  // Only the newest scheduled call flushes, with its own arguments, exactly
+  // once — a later timer run must not double-fire it.
+  expect(cb).toHaveBeenCalledTimes(1)
+  expect(cb).toHaveBeenCalledWith("kept")
+  vi.advanceTimersByTime(1_000)
+  expect(cb).toHaveBeenCalledTimes(1)
+})

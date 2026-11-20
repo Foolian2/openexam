@@ -360,6 +360,11 @@ questionId])` on `Answer`; idempotency keys on submission.
 
 ## Safe Exam Browser (SEB) integration
 
+For SEB-required exams, entering the access code reserves the session. The
+student’s timer starts when the exam data first loads through a verified SEB
+request. Without SEB, the timer starts when the student joins. Shared-start
+waiting rooms keep the teacher’s common start time.
+
 File-upload questions are available only in exams without SEB. File selection
 in SEB does not work reliably. Remove these questions before enabling SEB;
 the editor and API block adding or importing them into SEB exams. Existing SEB
@@ -638,7 +643,7 @@ refused in production.
 Valkey, Go lint + tests, and a production build.
 **Security** (`.github/workflows/security.yml`, push, PR, weekly): dependency review, `pnpm
 audit`, govulncheck, Trivy image scans, Semgrep (with custom rules for missing auth, role and
-`Origin` checks). `pr-agent.yml` adds an AI review comment on each PR.
+`Origin` checks).
 
 ---
 

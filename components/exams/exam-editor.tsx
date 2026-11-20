@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
 import {
@@ -102,6 +102,13 @@ export function ExamEditor({
   const [activateConfirmOpen, setActivateConfirmOpen] = useState(false)
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle")
   const [questions, setQuestions] = useState<Question[]>(initialQuestions)
+  const mountedRef = useRef(false)
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
 
   const isNew = !exam
   const isReadOnly =
@@ -115,7 +122,10 @@ export function ExamEditor({
     exam?.status === "ARCHIVED"
 
   async function handleMetadataSave(data: CreateExamInput) {
-    setIsSaving(true)
+    // A queued autosave may resolve after navigating away: the request must
+    // still run (the metadata form deliberately keeps it alive), but state
+    // updates after teardown are noise, so gate them on the mount flag.
+    if (mountedRef.current) setIsSaving(true)
     try {
       if (isNew) {
         const result = await apiMutateToast<{ exam: EditorExam }>(
@@ -127,7 +137,7 @@ export function ExamEditor({
           }
         )
         if (!result.ok) return
-        setExam(result.data.exam)
+        if (mountedRef.current) setExam(result.data.exam)
         router.replace(`/dashboard/teacher/exams/${result.data.exam.id}/edit`)
       } else {
         const result = await apiMutateToast<{ exam: EditorExam }>(
@@ -139,10 +149,11 @@ export function ExamEditor({
             fallbackError: "Fehler beim Speichern",
           }
         )
-        if (result.ok) setExam(result.data.exam)
+        if (!result.ok) throw new Error(result.message)
+        if (mountedRef.current) setExam(result.data.exam)
       }
     } finally {
-      setIsSaving(false)
+      if (mountedRef.current) setIsSaving(false)
     }
   }
 
@@ -271,7 +282,12 @@ export function ExamEditor({
                 <AccessCodeChip code={exam.accessCode} />
               )}
               {!isReadOnly && saveStatus !== "idle" && (
-                <span className="text-xs text-muted-foreground">
+                <span
+                  role="status"
+                  aria-live="polite"
+                  data-testid="metadata-save-status"
+                  className="text-xs text-muted-foreground"
+                >
                   {saveStatus === "saving" && "Wird gespeichert…"}
                   {saveStatus === "saved" && "Gespeichert"}
                   {saveStatus === "error" && "Fehler beim Speichern"}

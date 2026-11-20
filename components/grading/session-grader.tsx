@@ -147,7 +147,7 @@ export function SessionGrader({
       grades.push({
         questionId: q.id,
         points,
-        feedback: draft.feedback || undefined,
+        feedback: draft.feedback,
       })
     }
     return grades
@@ -203,7 +203,7 @@ export function SessionGrader({
       grades.push({
         questionId: q.id,
         points,
-        feedback: draft.feedback || undefined,
+        feedback: draft.feedback,
       })
     }
     if (grades.length === 0) {
