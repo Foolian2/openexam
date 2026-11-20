@@ -81,6 +81,11 @@ type ExamSessionAuth struct {
 	// Nil is a legacy, unclaimed session.
 	ActiveDeviceID      *string
 	DeviceReplacedCount int
+	// ClaimVersion is bumped on EVERY claim, including the initial binding
+	// (unlike DeviceReplacedCount). The room orders concurrent sockets by it,
+	// so a socket that read the row before the first claim cannot evict the
+	// claimed owner.
+	ClaimVersion int
 
 	// SessionSebConfigKey is the Config Key of the personalized config issued
 	// to this session, whose startURL embeds a one-time login token (see
@@ -114,7 +119,7 @@ func (s *Store) GetExamSessionAuth(ctx context.Context, sessionID string) (*Exam
 		       es."sebConfigKey",
 		       es."sebKeyHash", es."sebUserAgent",
 		       es."sebBrowserExamKey", es."sebIntegrityFlaggedAt",
-		       es."activeAuthSessionId", es."activeDeviceId", es."deviceReplacedCount",
+		       es."activeAuthSessionId", es."activeDeviceId", es."deviceReplacedCount", es."claimVersion",
 		       (SELECT count(*) FROM "IntegrityEvent" ie WHERE ie."sessionId" = es.id)
 		FROM "ExamSession" es
 		JOIN "Exam" e ON e.id = es."examId"
@@ -128,7 +133,7 @@ func (s *Store) GetExamSessionAuth(ctx context.Context, sessionID string) (*Exam
 		&out.SessionSebConfigKey,
 		&out.SebKeyHash, &out.SebUserAgent,
 		&out.SebBrowserExamKey, &out.SebIntegrityFlaggedAt,
-		&out.ActiveAuthSessionID, &out.ActiveDeviceID, &out.DeviceReplacedCount, &out.IntegrityEventCount)
+		&out.ActiveAuthSessionID, &out.ActiveDeviceID, &out.DeviceReplacedCount, &out.ClaimVersion, &out.IntegrityEventCount)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -460,16 +465,62 @@ func (s *Store) ListMonitorSessions(ctx context.Context, examID string) ([]Monit
 // SaveIntegrityEvent persists one client-reported behavioral signal. Called
 // directly (not buffered like answers) since the Room's rate limiting
 // already keeps volume low.
-func (s *Store) SaveIntegrityEvent(ctx context.Context, sessionID, kind, detail string, clientTime time.Time) error {
+// SaveIntegrityEventIfOwner persists an integrity event only while the given
+// login+tab still owns the session. It takes the same Exam/ExamSession share
+// locks as WithAnswerSaveState and holds them through the INSERT, so a
+// concurrent takeover claim (an exclusive row update) serializes with the
+// check: either the claim waits for the event, or the event sees the new
+// owner and is refused. It returns "SESSION_REPLACED" without writing when
+// ownership moved; "" on success.
+func (s *Store) SaveIntegrityEventIfOwner(ctx context.Context, examID, sessionID, kind, detail string, clientTime time.Time, authSessionID, deviceID string) (string, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '2s'`); err != nil {
+		return "", err
+	}
+	var lockedID string
+	if err := tx.QueryRow(ctx, `SELECT id FROM "Exam" WHERE id=$1 FOR SHARE`, examID).Scan(&lockedID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", ErrNotFound
+		}
+		return "", err
+	}
+	if err := tx.QueryRow(ctx, `SELECT id FROM "ExamSession" WHERE id=$1 AND "examId"=$2 FOR SHARE`, sessionID, examID).Scan(&lockedID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", ErrNotFound
+		}
+		return "", err
+	}
+	var activeAuth, activeDevice *string
+	if err := tx.QueryRow(ctx,
+		`SELECT "activeAuthSessionId", "activeDeviceId" FROM "ExamSession" WHERE id=$1`, sessionID,
+	).Scan(&activeAuth, &activeDevice); err != nil {
+		return "", err
+	}
+	// Nil/empty claim dimensions leave legacy sessions open to their owner;
+	// once present, both the login and the tab must match the committed claim.
+	owned := (activeAuth == nil || *activeAuth == "" || *activeAuth == authSessionID) &&
+		(activeDevice == nil || *activeDevice == "" || *activeDevice == deviceID)
+	if !owned {
+		return "SESSION_REPLACED", nil
+	}
 	var detailArg any
 	if detail != "" {
 		detailArg = detail
 	}
-	_, err := s.pool.Exec(ctx, `
+	if _, err := tx.Exec(ctx, `
 		INSERT INTO "IntegrityEvent" (id, "sessionId", kind, detail, "clientTime", "createdAt")
 		VALUES ($1, $2, $3, $4, $5, now())
-	`, cuid.New(), sessionID, kind, detailArg, clientTime)
-	return err
+	`, cuid.New(), sessionID, kind, detailArg, clientTime); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", err
+	}
+	return "", nil
 }
 
 // AnswerUpsert is one buffered answer flushed from Redis to Postgres.

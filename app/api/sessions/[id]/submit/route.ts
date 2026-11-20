@@ -11,6 +11,7 @@ import { isSubmitted, OPEN_STATUSES, submitKind } from "@/lib/session-state"
 import { verifySebAccess } from "@/lib/seb-guard"
 import {
   activeDeviceWhere,
+  gateActiveDevice,
   getExamDeviceId,
   isActiveDevice,
 } from "@/lib/exam-device"
@@ -93,29 +94,13 @@ export async function POST(request: NextRequest, { params }: Params) {
       if (isSubmitted(examSession.status)) {
         // Idempotent replay (e.g. client retry after a lost response).
         if (examSession.idempotencyKey === idempotencyKey) {
-          const gate = await tx.examSession.updateMany({
-            where: {
-              id,
-              status: examSession.status,
-              ...activeDeviceWhere(session.session.id, deviceId),
-            },
-            data: { lastSeenAt: new Date() },
+          await gateActiveDevice(tx, {
+            id,
+            status: examSession.status,
+            authSessionId: session.session.id,
+            deviceId,
+            conflictMessage: "Prüfung wurde bereits abgegeben",
           })
-          if (gate.count === 0) {
-            const raced = await tx.examSession.findUnique({ where: { id } })
-            if (raced && !isActiveDevice(raced, session.session.id, deviceId)) {
-              throw new ApiError(
-                409,
-                "SESSION_REPLACED",
-                "Sitzung wurde übernommen"
-              )
-            }
-            throw new ApiError(
-              409,
-              "CONFLICT",
-              "Prüfung wurde bereits abgegeben"
-            )
-          }
           return "replay"
         }
         throw new ApiError(409, "CONFLICT", "Prüfung wurde bereits abgegeben")

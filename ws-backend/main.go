@@ -595,7 +595,9 @@ func sebHandshake(ctx context.Context, cfg *config.Config, log *slog.Logger, st 
 	return true
 }
 
-var deviceIDPattern = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+// v4 only, matching the client's crypto.randomUUID (lib/exam-tab.ts) and the
+// REST-side zod check (lib/exam-device.ts), so all layers accept one shape.
+var deviceIDPattern = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 
 // The tab identifier is public but must have the UUID shape the client sends.
 func requestedDeviceID(r *http.Request) (string, bool) {

@@ -7,7 +7,7 @@ import { formatZodError } from "@/lib/utils"
 import { OPEN_STATUSES, isOpen, pastDeadline } from "@/lib/session-state"
 import { verifySebAccess } from "@/lib/seb-guard"
 import {
-  activeDeviceWhere,
+  gateActiveDevice,
   getExamDeviceId,
   isActiveDevice,
 } from "@/lib/exam-device"
@@ -69,25 +69,12 @@ export async function PUT(request: NextRequest, { params }: Params) {
   if (!question) return notFound("Frage nicht gefunden")
   try {
     await prisma.$transaction(async (tx) => {
-      const gate = await tx.examSession.updateMany({
-        where: {
-          id,
-          status: { in: OPEN_STATUSES },
-          ...activeDeviceWhere(authed.session.id, deviceId),
-        },
-        data: { lastSeenAt: new Date() },
+      await gateActiveDevice(tx, {
+        id,
+        status: { in: OPEN_STATUSES },
+        authSessionId: authed.session.id,
+        deviceId,
       })
-      if (gate.count === 0) {
-        const current = await tx.examSession.findUnique({ where: { id } })
-        if (current && !isActiveDevice(current, authed.session.id, deviceId)) {
-          throw new ApiError(
-            409,
-            "SESSION_REPLACED",
-            "Sitzung wurde übernommen"
-          )
-        }
-        throw new ApiError(409, "CONFLICT", "Sitzung ist nicht mehr aktiv")
-      }
       if (parsed.data.bookmarked) {
         await tx.questionBookmark.upsert({
           where: {

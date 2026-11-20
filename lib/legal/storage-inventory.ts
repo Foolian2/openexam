@@ -62,6 +62,9 @@ export const STORAGE_INVENTORY: StorageEntry[] = [
     names: [
       `${ANSWER_BUFFER_KEY_PREFIX}:<Sitzung>:<Fenster>`,
       `${ANSWER_BUFFER_KEY_PREFIX}:<Sitzung>:<Fenster>:replaced`,
+      `${ANSWER_BUFFER_KEY_PREFIX}:<Sitzung>:<Fenster>:detached`,
+      // Legacy records written before per-tab scoping; adopted on next open.
+      `${ANSWER_BUFFER_KEY_PREFIX}:<Sitzung>`,
     ],
     kind: "localStorage",
     purpose:

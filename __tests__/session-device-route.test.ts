@@ -113,12 +113,13 @@ describe("POST /api/sessions/[id]/device", () => {
     expect(m.claim).not.toHaveBeenCalled()
   })
 
-  it("keys the claim budget by exam session", async () => {
+  it("keys the claim budget by exam session and fails closed", async () => {
     await post()
     expect(m.rateLimit).toHaveBeenCalledWith(
       "session-device:student-1:sess-1",
       20,
-      60
+      60,
+      "closed"
     )
   })
 })

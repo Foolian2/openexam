@@ -56,9 +56,11 @@ export interface AnswerBuffer<T = unknown> {
   clearAll(): void
   replay(load: (pending: Array<[string, T]>) => void): void
   /**
-   * Flags this tab's record as belonging to a replaced tab, so another tab's
-   * replay leaves it alone. Cleared by clearReplaced() once this tab claims
-   * the session back.
+   * Flags this tab as replaced. From then on its edits persist under a
+   * detached key, so the base record keeps exactly the pre-takeover edits
+   * that the new owner may adopt, while later edits can never overwrite the
+   * owner's answers. Cleared by clearReplaced() once this tab claims the
+   * session back.
    */
   markReplaced(): void
   clearReplaced(): void
@@ -73,6 +75,11 @@ export interface AnswerBuffer<T = unknown> {
 }
 
 const REPLACED_SUFFIX = ":replaced"
+// After a tab is replaced, its further edits are persisted under this suffix
+// instead of the record key: the record then holds only pre-takeover edits,
+// which the new owner may still adopt, while post-takeover edits never
+// overwrite the owner's answers.
+const DETACHED_SUFFIX = ":detached"
 
 // Fraction of retryIntervalMs the retry period is scattered over, so
 // `random() === 0.5` reproduces the nominal interval exactly.
@@ -97,6 +104,10 @@ export function createAnswerBuffer<T = unknown>(
     return id ? `${sessionKey}:${id}` : sessionKey
   }
   const replacedKeyOf = () => `${keyOf()}${REPLACED_SUFFIX}`
+  // Once replaced, this tab writes to a detached record: the base record
+  // keeps exactly the pre-takeover edits for the new owner to adopt.
+  let replaced = false
+  const writeKeyOf = () => (replaced ? `${keyOf()}${DETACHED_SUFFIX}` : keyOf())
   const debounceMs = options.debounceMs ?? 800
   const retryIntervalMs = options.retryIntervalMs ?? 10_000
   const maxRetries = options.maxRetries ?? 0
@@ -112,7 +123,7 @@ export function createAnswerBuffer<T = unknown>(
 
   function persistNow() {
     try {
-      const key = keyOf()
+      const key = writeKeyOf()
       if (record.size === 0) options.storage.removeItem(key)
       else
         options.storage.setItem(key, JSON.stringify(Object.fromEntries(record)))
@@ -140,10 +151,13 @@ export function createAnswerBuffer<T = unknown>(
     return []
   }
 
-  // Records of this session's other tabs that were not replaced: a tab that
-  // crashed or was closed with unsaved edits, or a record written before
-  // records were scoped by tab. A replaced tab marks its record, which stays
-  // its own: its edits after the takeover must not overwrite the owner's.
+  // Records of this session's other tabs that can be adopted: a tab that
+  // crashed or was closed with unsaved edits, a record written before
+  // records were scoped by tab, or a REPLACED tab's base record, which holds
+  // exactly its pre-takeover edits. That tab's DETACHED record (its
+  // post-takeover edits) is adoptable only once the replaced marker is gone —
+  // i.e. after the tab reclaimed the session — because until then those edits
+  // must not overwrite the owner's answers. This tab's own record is excluded.
   function orphanedKeys(): string[] {
     const { storage } = options
     const key = keyOf()
@@ -156,10 +170,13 @@ export function createAnswerBuffer<T = unknown>(
           k === null ||
           k === key ||
           (k !== sessionKey && !k.startsWith(`${sessionKey}:`)) ||
-          k.endsWith(REPLACED_SUFFIX) ||
-          storage.getItem(`${k}${REPLACED_SUFFIX}`) !== null
+          k.endsWith(REPLACED_SUFFIX)
         )
           continue
+        if (k.endsWith(DETACHED_SUFFIX)) {
+          const base = k.slice(0, -DETACHED_SUFFIX.length)
+          if (storage.getItem(`${base}${REPLACED_SUFFIX}`) !== null) continue
+        }
         keys.push(k)
       }
     } catch {
@@ -181,7 +198,11 @@ export function createAnswerBuffer<T = unknown>(
     if (orphans.length === 0) return
     persistNow()
     try {
-      for (const orphan of orphans) options.storage.removeItem(orphan)
+      for (const orphan of orphans) {
+        options.storage.removeItem(orphan)
+        // Adopted a replaced tab's pre-takeover record; its marker goes too.
+        options.storage.removeItem(`${orphan}${REPLACED_SUFFIX}`)
+      }
     } catch {
       // Adopted entries are persisted under this tab's key either way.
     }
@@ -287,8 +308,27 @@ export function createAnswerBuffer<T = unknown>(
     clearAll() {
       record.clear()
       persistNow()
+      // After a confirmed submission no tab of this session ever replays
+      // again, so remove EVERY record of the session — this tab's, other
+      // tabs' pre-takeover records, detached post-takeover edits and their
+      // markers — instead of leaving unsaved answers in localStorage.
       try {
-        options.storage.removeItem(replacedKeyOf())
+        const { storage } = options
+        if (storage.key !== undefined) {
+          const doomed: string[] = []
+          for (let i = 0; i < (storage.length ?? 0); i++) {
+            const k = storage.key(i)
+            if (
+              k !== null &&
+              (k === sessionKey || k.startsWith(`${sessionKey}:`))
+            )
+              doomed.push(k)
+          }
+          for (const k of doomed) storage.removeItem(k)
+        } else {
+          storage.removeItem(keyOf())
+          storage.removeItem(replacedKeyOf())
+        }
       } catch {
         // Nothing to clear.
       }
@@ -298,13 +338,15 @@ export function createAnswerBuffer<T = unknown>(
       load(Array.from(record.entries()))
     },
     markReplaced() {
+      replaced = true
       try {
         options.storage.setItem(replacedKeyOf(), "1")
       } catch {
-        // Without the marker another tab may adopt this record on reload.
+        // The in-memory flag still detaches this tab's writes.
       }
     },
     clearReplaced() {
+      replaced = false
       try {
         options.storage.removeItem(replacedKeyOf())
       } catch {

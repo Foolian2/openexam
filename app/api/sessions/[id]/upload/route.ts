@@ -7,7 +7,7 @@ import { storeAnswerFile } from "@/lib/answer-files"
 import { OPEN_STATUSES, isOpen, pastDeadline } from "@/lib/session-state"
 import { verifySebAccess } from "@/lib/seb-guard"
 import {
-  activeDeviceWhere,
+  gateActiveDevice,
   getExamDeviceId,
   isActiveDevice,
 } from "@/lib/exam-device"
@@ -213,28 +213,12 @@ export async function POST(request: NextRequest, { params }: Params) {
         `
         if (Number(row?.bytes ?? 0) + file.size > budgetBytes) return false
         await storeAnswerFile(fileKey, id, questionId, bytes, tx)
-        const gate = await tx.examSession.updateMany({
-          where: {
-            id,
-            status: { in: OPEN_STATUSES },
-            ...activeDeviceWhere(session.session.id, deviceId),
-          },
-          data: { lastSeenAt: new Date() },
+        await gateActiveDevice(tx, {
+          id,
+          status: { in: OPEN_STATUSES },
+          authSessionId: session.session.id,
+          deviceId,
         })
-        if (gate.count === 0) {
-          const current = await tx.examSession.findUnique({ where: { id } })
-          if (
-            current &&
-            !isActiveDevice(current, session.session.id, deviceId)
-          ) {
-            throw new ApiError(
-              409,
-              "SESSION_REPLACED",
-              "Sitzung wurde übernommen"
-            )
-          }
-          throw new ApiError(409, "CONFLICT", "Sitzung ist nicht aktiv")
-        }
         return true
       },
       { timeout: 30_000 }

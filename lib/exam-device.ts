@@ -5,6 +5,7 @@ import { redis } from "@/lib/redis"
 import { createAuditLog } from "@/lib/audit"
 import { ApiError } from "@/lib/api-response"
 import { SOCKET_JOINABLE_STATUSES } from "@/lib/session-state"
+import { logError } from "@/lib/logger"
 
 /**
  * One active login and browser tab per exam session, newest claim wins.
@@ -17,7 +18,9 @@ export interface DeviceBoundSession {
   activeDeviceId?: string | null
 }
 
-const deviceIdSchema = z.uuid()
+// v4 only, matching lib/exam-tab.ts (crypto.randomUUID) and the WS backend's
+// deviceIDPattern, so all three layers accept exactly the same shape.
+const deviceIdSchema = z.uuidv4()
 
 export function getExamDeviceId(headers: Headers): string | null {
   const parsed = deviceIdSchema.safeParse(headers.get("x-openexam-device-id"))
@@ -50,9 +53,74 @@ export function activeDeviceWhere(
           { activeAuthSessionId: authSessionId },
         ],
       },
-      { OR: [{ activeDeviceId: null }, { activeDeviceId: deviceId ?? null }] },
+      // A request without a device header is only admitted while the row is
+      // still unbound; once bound, the header must match.
+      {
+        OR:
+          deviceId == null
+            ? [{ activeDeviceId: null }]
+            : [{ activeDeviceId: null }, { activeDeviceId: deviceId }],
+      },
     ],
   }
+}
+
+type TxClient = Prisma.TransactionClient
+
+interface DeviceGateParams {
+  id: string
+  authSessionId: string
+  deviceId?: string | null
+  /** Restrict the gate to these statuses; omit for any status. */
+  status?: Prisma.ExamSessionWhereInput["status"]
+  conflictMessage?: string
+}
+
+/**
+ * After a device-gated updateMany matched zero rows, tells the takeover case
+ * apart from the plain lifecycle case. Call inside the same transaction as
+ * the gated update.
+ */
+export async function throwIfDeviceGateFailed(
+  tx: TxClient,
+  params: DeviceGateParams
+): Promise<never> {
+  const current = await tx.examSession.findUnique({
+    where: { id: params.id },
+    select: { activeAuthSessionId: true, activeDeviceId: true },
+  })
+  if (
+    current &&
+    !isActiveDevice(current, params.authSessionId, params.deviceId ?? null)
+  ) {
+    throw new ApiError(409, "SESSION_REPLACED", "Sitzung wurde übernommen")
+  }
+  throw new ApiError(
+    409,
+    "CONFLICT",
+    params.conflictMessage ?? "Sitzung ist nicht aktiv"
+  )
+}
+
+/**
+ * Locks the session row with a device-gated updateMany (bumping lastSeenAt)
+ * and throws SESSION_REPLACED/CONFLICT when it matched nothing. Every student
+ * write route funnels through this so the gate and its failure triage exist
+ * in exactly one place.
+ */
+export async function gateActiveDevice(
+  tx: TxClient,
+  params: DeviceGateParams
+): Promise<void> {
+  const gate = await tx.examSession.updateMany({
+    where: {
+      id: params.id,
+      ...(params.status !== undefined ? { status: params.status } : {}),
+      ...activeDeviceWhere(params.authSessionId, params.deviceId ?? null),
+    },
+    data: { lastSeenAt: new Date() },
+  })
+  if (gate.count === 0) await throwIfDeviceGateFailed(tx, params)
 }
 
 export type ClaimResult =
@@ -77,6 +145,7 @@ export async function claimExamDevice(params: {
         activeAuthSessionId: true,
         activeDeviceId: true,
         deviceReplacedCount: true,
+        claimVersion: true,
         status: true,
       },
     })
@@ -86,6 +155,7 @@ export async function claimExamDevice(params: {
     const previous = current.activeAuthSessionId
     const previousDevice = current.activeDeviceId
     const previousCount = current.deviceReplacedCount
+    const previousVersion = current.claimVersion
     if (previous === authSessionId && previousDevice === deviceId) {
       return { replaced: false }
     }
@@ -97,18 +167,24 @@ export async function claimExamDevice(params: {
         (previousDevice !== null && previousDevice !== deviceId))
 
     // This update locks the same row as each REST mutation's device gate.
-    // Both identities and lifecycle participate in the compare-and-swap.
+    // Both identities, the takeover count, the claim version and lifecycle
+    // participate in the compare-and-swap. claimVersion bumps on EVERY claim,
+    // including the initial binding, so WS sockets can order concurrent
+    // registrations even when the takeover count is still zero.
+    const newVersion = previousVersion + 1
     const { count } = await prisma.examSession.updateMany({
       where: {
         id: examSessionId,
         activeAuthSessionId: previous,
         activeDeviceId: previousDevice,
         deviceReplacedCount: previousCount,
+        claimVersion: previousVersion,
         status: { in: SOCKET_JOINABLE_STATUSES },
       },
       data: {
         activeAuthSessionId: authSessionId,
         activeDeviceId: deviceId,
+        claimVersion: { increment: 1 },
         ...(replaced
           ? {
               deviceReplacedCount: { increment: 1 },
@@ -121,36 +197,48 @@ export async function claimExamDevice(params: {
     if (!replaced) return { replaced: false }
 
     const replacedCount = previousCount + 1
-    await createAuditLog({
-      action: "SESSION_DEVICE_REPLACED",
-      entityType: "ExamSession",
-      entityId: examSessionId,
-      examId,
-      userId: params.userId,
-      // A new login (another browser, or a SEB relaunch) vs. another tab of
-      // the same login: lets a teacher tell the two apart.
-      metadata: {
-        count: replacedCount,
-        loginChanged: previous !== authSessionId,
-        tabChanged: previousDevice !== deviceId,
-      },
-      ipAddress: params.ip,
-      userAgent: params.userAgent,
-    })
+    try {
+      await createAuditLog({
+        action: "SESSION_DEVICE_REPLACED",
+        entityType: "ExamSession",
+        entityId: examSessionId,
+        examId,
+        userId: params.userId,
+        // A new login (another browser, or a SEB relaunch) vs. another tab of
+        // the same login: lets a teacher tell the two apart.
+        metadata: {
+          count: replacedCount,
+          loginChanged: previous !== authSessionId,
+          tabChanged: previousDevice !== deviceId,
+        },
+        ipAddress: params.ip,
+        userAgent: params.userAgent,
+      })
+    } catch (err) {
+      // The claim is already committed; a failed audit row must neither
+      // turn a successful takeover into a 500 nor suppress the takeover
+      // notification below.
+      logError("SESSION_DEVICE_REPLACED audit write failed", {
+        examSessionId,
+        err,
+      })
+    }
     // Audit I/O can let a newer claim win. Do not publish an obsolete
-    // owner; the counter also lets sockets ignore an event delayed in transit.
+    // owner; the version also lets sockets ignore an event delayed in transit.
     const settled = await prisma.examSession.findUnique({
       where: { id: examSessionId },
       select: {
         activeAuthSessionId: true,
         activeDeviceId: true,
         deviceReplacedCount: true,
+        claimVersion: true,
       },
     })
     if (
       settled?.activeAuthSessionId !== authSessionId ||
       settled.activeDeviceId !== deviceId ||
-      settled.deviceReplacedCount !== replacedCount
+      settled.deviceReplacedCount !== replacedCount ||
+      settled.claimVersion !== newVersion
     ) {
       throw new ApiError(
         409,
@@ -163,7 +251,8 @@ export async function claimExamDevice(params: {
       examSessionId,
       authSessionId,
       deviceId,
-      replacedCount
+      replacedCount,
+      newVersion
     )
     return { replaced: true, count: replacedCount }
   }
@@ -180,7 +269,8 @@ async function publishTakeover(
   examSessionId: string,
   authSessionId: string,
   deviceId: string,
-  count: number
+  count: number,
+  claimVersion: number
 ): Promise<void> {
   // Notification is best-effort. REST writes and every WS answer save check
   // durable ownership independently, including when this event is missed.
@@ -193,6 +283,7 @@ async function publishTakeover(
         activeAuthSessionId: authSessionId,
         activeDeviceId: deviceId,
         deviceReplacedCount: count,
+        claimVersion,
       })
     )
   } catch {

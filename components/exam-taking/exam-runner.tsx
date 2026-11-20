@@ -432,7 +432,16 @@ export function ExamRunner({
         await ensureExclusiveExamTabId()
         const claim = await claimExamDevice(sessionId)
         if (!claim.ok) {
-          if (!cancelled) setLoadError(claimFailureMessage(claim))
+          if (cancelled) return
+          // A claim that lost a concurrent takeover is the takeover state,
+          // not a generic load error: the tab must see the notice and choose
+          // explicitly — a reload here would silently claim the exam back
+          // and could displace the actual owner.
+          if (claim.code === "SESSION_REPLACED") {
+            setReplaced(true)
+            return
+          }
+          setLoadError(claimFailureMessage(claim))
           return
         }
         if (cancelled) return

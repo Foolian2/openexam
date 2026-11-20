@@ -14,6 +14,7 @@ vi.mock("@/lib/prisma", () => ({
 }))
 vi.mock("@/lib/redis", () => ({ redis: { publish: m.publish } }))
 vi.mock("@/lib/audit", () => ({ createAuditLog: m.audit }))
+vi.mock("@/lib/logger", () => ({ logError: vi.fn() }))
 
 import {
   claimExamDevice,
@@ -59,11 +60,12 @@ describe("isActiveDevice", () => {
 })
 
 describe("claimExamDevice", () => {
-  it("claims an unclaimed session without flagging anything", async () => {
+  it("claims an unclaimed session without flagging a takeover, but bumps the claim version", async () => {
     m.findUnique.mockResolvedValueOnce({
       activeAuthSessionId: null,
       activeDeviceId: null,
       deviceReplacedCount: 0,
+      claimVersion: 0,
       status: "IN_PROGRESS",
     })
 
@@ -74,9 +76,16 @@ describe("claimExamDevice", () => {
         activeAuthSessionId: null,
         activeDeviceId: null,
         deviceReplacedCount: 0,
+        claimVersion: 0,
         status: { in: ["IN_PROGRESS", "LOCKED"] },
       },
-      data: { activeAuthSessionId: "auth-new", activeDeviceId: DEVICE },
+      // claimVersion advances even on the initial binding, so a WS socket
+      // that read the unclaimed row at version 0 cannot evict the owner.
+      data: {
+        activeAuthSessionId: "auth-new",
+        activeDeviceId: DEVICE,
+        claimVersion: { increment: 1 },
+      },
     })
     expect(m.audit).not.toHaveBeenCalled()
     expect(m.publish).not.toHaveBeenCalled()
@@ -87,6 +96,7 @@ describe("claimExamDevice", () => {
       activeAuthSessionId: "auth-new",
       activeDeviceId: DEVICE,
       deviceReplacedCount: 0,
+      claimVersion: 1,
       status: "IN_PROGRESS",
     })
 
@@ -101,12 +111,14 @@ describe("claimExamDevice", () => {
         activeAuthSessionId: "auth-old",
         activeDeviceId: null,
         deviceReplacedCount: 0,
+        claimVersion: 1,
         status: "IN_PROGRESS",
       })
       .mockResolvedValueOnce({
         activeAuthSessionId: "auth-new",
         activeDeviceId: DEVICE,
         deviceReplacedCount: 1,
+        claimVersion: 2,
       })
 
     expect(await claim()).toEqual({ replaced: true, count: 1 })
@@ -116,11 +128,13 @@ describe("claimExamDevice", () => {
         activeAuthSessionId: "auth-old",
         activeDeviceId: null,
         deviceReplacedCount: 0,
+        claimVersion: 1,
         status: { in: ["IN_PROGRESS", "LOCKED"] },
       },
       data: {
         activeAuthSessionId: "auth-new",
         activeDeviceId: DEVICE,
+        claimVersion: { increment: 1 },
         deviceReplacedCount: { increment: 1 },
         deviceReplacedAt: expect.any(Date),
       },
@@ -143,6 +157,7 @@ describe("claimExamDevice", () => {
         activeAuthSessionId: "auth-new",
         activeDeviceId: DEVICE,
         deviceReplacedCount: 1,
+        claimVersion: 2,
       })
     )
     expect(m.publish).toHaveBeenCalledWith(
@@ -161,18 +176,21 @@ describe("claimExamDevice", () => {
         activeAuthSessionId: null,
         activeDeviceId: null,
         deviceReplacedCount: 0,
+        claimVersion: 0,
         status: "IN_PROGRESS",
       })
       .mockResolvedValueOnce({
         activeAuthSessionId: "auth-other",
         activeDeviceId: null,
         deviceReplacedCount: 0,
+        claimVersion: 1,
         status: "IN_PROGRESS",
       })
       .mockResolvedValueOnce({
         activeAuthSessionId: "auth-new",
         activeDeviceId: DEVICE,
         deviceReplacedCount: 1,
+        claimVersion: 2,
       })
     m.updateMany
       .mockResolvedValueOnce({ count: 0 })
@@ -186,6 +204,7 @@ describe("claimExamDevice", () => {
           activeAuthSessionId: "auth-other",
           activeDeviceId: null,
           deviceReplacedCount: 0,
+          claimVersion: 1,
           status: { in: ["IN_PROGRESS", "LOCKED"] },
         },
       })
@@ -199,17 +218,45 @@ describe("claimExamDevice", () => {
         activeAuthSessionId: "auth-old",
         activeDeviceId: null,
         deviceReplacedCount: 0,
+        claimVersion: 1,
         status: "IN_PROGRESS",
       })
       .mockResolvedValueOnce({
         activeAuthSessionId: "auth-new",
         activeDeviceId: DEVICE,
         deviceReplacedCount: 1,
+        claimVersion: 2,
       })
     m.publish.mockRejectedValue(new Error("redis down"))
 
     expect(await claim()).toEqual({ replaced: true, count: 1 })
     expect(m.audit).toHaveBeenCalledTimes(1)
+  })
+
+  it("still publishes the takeover when the audit write fails", async () => {
+    m.findUnique
+      .mockResolvedValueOnce({
+        activeAuthSessionId: "auth-old",
+        activeDeviceId: null,
+        deviceReplacedCount: 0,
+        claimVersion: 1,
+        status: "IN_PROGRESS",
+      })
+      .mockResolvedValueOnce({
+        activeAuthSessionId: "auth-new",
+        activeDeviceId: DEVICE,
+        deviceReplacedCount: 1,
+        claimVersion: 2,
+      })
+    m.audit.mockRejectedValue(new Error("audit db down"))
+
+    // The claim is already committed; the audit failure must not surface as
+    // a 500 or suppress the takeover notification.
+    expect(await claim()).toEqual({ replaced: true, count: 1 })
+    expect(m.publish).toHaveBeenCalledWith(
+      "exam:exam-1:control",
+      expect.stringContaining('"claimVersion":2')
+    )
   })
 })
 
@@ -228,12 +275,14 @@ describe("tab binding", () => {
         activeAuthSessionId: "auth-new",
         activeDeviceId: OTHER_DEVICE,
         deviceReplacedCount: 0,
+        claimVersion: 1,
         status: "IN_PROGRESS",
       })
       .mockResolvedValueOnce({
         activeAuthSessionId: "auth-new",
         activeDeviceId: DEVICE,
         deviceReplacedCount: 1,
+        claimVersion: 2,
       })
     expect(await claim()).toEqual({ replaced: true, count: 1 })
     expect(m.audit).toHaveBeenCalledTimes(1)
@@ -244,9 +293,15 @@ describe("tab binding", () => {
       activeAuthSessionId: "auth-new",
       activeDeviceId: null,
       deviceReplacedCount: 0,
+      claimVersion: 1,
       status: "IN_PROGRESS",
     })
     expect(await claim()).toEqual({ replaced: false })
+    expect(m.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ claimVersion: { increment: 1 } }),
+      })
+    )
     expect(m.audit).not.toHaveBeenCalled()
   })
 
@@ -255,6 +310,7 @@ describe("tab binding", () => {
       activeAuthSessionId: "auth-old",
       activeDeviceId: OTHER_DEVICE,
       deviceReplacedCount: 0,
+      claimVersion: 4,
       status: "IN_PROGRESS",
     })
     m.updateMany.mockResolvedValue({ count: 0 })
@@ -269,6 +325,8 @@ describe("tab binding", () => {
     m.findUnique.mockResolvedValue({
       activeAuthSessionId: "auth-new",
       activeDeviceId: DEVICE,
+      deviceReplacedCount: 0,
+      claimVersion: 1,
       status: "SUBMITTED",
     })
     await expect(claim()).rejects.toMatchObject({
@@ -285,6 +343,14 @@ describe("tab binding", () => {
     expect(
       getExamDeviceId(new Headers({ "x-openexam-device-id": "arbitrary" }))
     ).toBeNull()
+    // A non-v4 UUID is rejected too: client, REST and WS all require v4.
+    expect(
+      getExamDeviceId(
+        new Headers({
+          "x-openexam-device-id": "550e8400-e29b-11d4-a716-446655440000",
+        })
+      )
+    ).toBeNull()
     expect(getExamDeviceId(new Headers())).toBeNull()
   })
 })
@@ -295,12 +361,14 @@ it("suppresses a takeover notification superseded during the audit write", async
       activeAuthSessionId: "auth-old",
       activeDeviceId: OTHER_DEVICE,
       deviceReplacedCount: 3,
+      claimVersion: 5,
       status: "IN_PROGRESS",
     })
     .mockResolvedValueOnce({
       activeAuthSessionId: "auth-latest",
       activeDeviceId: OTHER_DEVICE,
       deviceReplacedCount: 5,
+      claimVersion: 7,
     })
   await expect(claim()).rejects.toMatchObject({ code: "SESSION_REPLACED" })
   expect(m.publish).not.toHaveBeenCalled()
@@ -316,6 +384,7 @@ it("claims locked sessions without opening them for writes", async () => {
     activeAuthSessionId: null,
     activeDeviceId: null,
     deviceReplacedCount: 0,
+    claimVersion: 0,
     status: "LOCKED",
   })
   expect(await claim()).toEqual({ replaced: false })

@@ -34,6 +34,10 @@ type fakeRoomStore struct {
 	// so a write never blocks on a test that isn't reading.
 	saved chan struct{}
 	err   error
+	// refuseOwner makes SaveIntegrityEventIfOwner refuse every event with
+	// SESSION_REPLACED, simulating a takeover committed after the socket's
+	// authorization read.
+	refuseOwner bool
 }
 
 func newFakeRoomStore() *fakeRoomStore {
@@ -73,12 +77,16 @@ func (f *fakeRoomStore) WithAnswerSaveState(ctx context.Context, examID, session
 	return use(state)
 }
 
-func (f *fakeRoomStore) SaveIntegrityEvent(ctx context.Context, sessionID, kind, detail string, clientTime time.Time) error {
+func (f *fakeRoomStore) SaveIntegrityEventIfOwner(ctx context.Context, examID, sessionID, kind, detail string, clientTime time.Time, authSessionID, deviceID string) (string, error) {
 	f.mu.Lock()
+	if f.refuseOwner {
+		f.mu.Unlock()
+		return "SESSION_REPLACED", nil
+	}
 	if f.err != nil {
 		err := f.err
 		f.mu.Unlock()
-		return err
+		return "", err
 	}
 	f.integrityEvents = append(f.integrityEvents, sessionID+":"+kind+":"+detail)
 	f.mu.Unlock()
@@ -86,7 +94,7 @@ func (f *fakeRoomStore) SaveIntegrityEvent(ctx context.Context, sessionID, kind,
 	case f.saved <- struct{}{}:
 	default:
 	}
-	return nil
+	return "", nil
 }
 
 // events returns a copy, since the async worker may still be writing.
@@ -188,6 +196,7 @@ func newTestServer(t *testing.T, room *Room) *testServer {
 		}
 		room.RegisterStudent(c, &store.ExamSessionAuth{
 			ID: sessionID, Status: status, DeviceReplacedCount: int(ts.claimVersion.Load()),
+			ClaimVersion:        int(ts.claimVersion.Load()),
 			IntegrityEventCount: int(ts.integritySeed.Load()),
 			Questions:           []store.QuestionAuth{{ID: "q-1", Type: "FREE_TEXT"}},
 		})
@@ -513,6 +522,91 @@ func TestRoom_ControlSessionReplaced_KeepsClaimingLogin(t *testing.T) {
 	}
 	if env := readEnvelope(t, student); env.Type != protocol.TypePong {
 		t.Fatalf("got type %q, want pong on a still-open connection", env.Type)
+	}
+}
+
+// A socket that authorized against the row BEFORE the first claim carries
+// claim version 0. When it registers after the claimed owner (version 1), it
+// must be rejected — otherwise it would evict the real owner and show the
+// takeover screen to the tab that legitimately holds the session.
+func TestRoom_Register_StaleClaimVersionDoesNotEvictOwner(t *testing.T) {
+	room, _ := newTestRoom(t, newFakeRoomStore(), &fakeBuffer{}, &fakeFlusher{}, time.Minute)
+	ts := newTestServer(t, room)
+
+	ts.claimVersion.Store(1)
+	owner := dial(t, wsURL(ts.srv.URL, "/ws/exam/x?session=sess-1"))
+	readEnvelope(t, owner) // timer:sync
+
+	ts.claimVersion.Store(0)
+	stale := dial(t, wsURL(ts.srv.URL, "/ws/exam/x?session=sess-1"))
+
+	env := readEnvelope(t, stale)
+	if env.Type != protocol.TypeExamControl {
+		t.Fatalf("got type %q, want exam:control (SESSION_REPLACED) for the stale socket", env.Type)
+	}
+	var ctrl protocol.ControlEventData
+	_ = json.Unmarshal(env.Data, &ctrl)
+	if ctrl.Action != protocol.ActionSessionReplaced {
+		t.Fatalf("got action %q, want %q", ctrl.Action, protocol.ActionSessionReplaced)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, _, err := stale.Read(ctx); err == nil {
+		t.Fatal("expected the stale connection to be closed")
+	}
+
+	// The owner must survive: still registered, still answered.
+	ping, _ := protocol.Encode(protocol.TypePing, "", nil)
+	if err := owner.Write(context.Background(), ws.MessageText, ping); err != nil {
+		t.Fatalf("write ping to owner: %v", err)
+	}
+	if env := readEnvelope(t, owner); env.Type != protocol.TypePong {
+		t.Fatalf("got type %q, want pong on the owner connection", env.Type)
+	}
+}
+
+// A SESSION_REPLACED event delayed in transit behind a newer claim carries an
+// older claim version and must not evict the socket registered under the newer
+// one; a newer version must.
+func TestRoom_ControlSessionReplaced_ClaimVersionOrdersEvents(t *testing.T) {
+	room, _ := newTestRoom(t, newFakeRoomStore(), &fakeBuffer{}, &fakeFlusher{}, time.Minute)
+	ts := newTestServer(t, room)
+
+	ts.claimVersion.Store(2)
+	student := dial(t, wsURL(ts.srv.URL, "/ws/exam/x?session=sess-1"))
+	readEnvelope(t, student) // timer:sync
+
+	// Older event (version 1 < registered 2): ignored for this socket.
+	room.control <- redisControlMessage{Type: protocol.ActionSessionReplaced, SessionID: "sess-1", ActiveAuthSessionID: "auth-other", ActiveDeviceID: "tab-other", ClaimVersion: 1}
+	// Same channel, handled after: proves the socket was NOT evicted.
+	room.control <- redisControlMessage{Type: protocol.ActionSessionLocked, SessionID: "sess-1"}
+
+	env := readEnvelope(t, student)
+	var ctrl protocol.ControlEventData
+	_ = json.Unmarshal(env.Data, &ctrl)
+	if ctrl.Action != protocol.ActionSessionLocked {
+		t.Fatalf("got action %q, want %q (older SESSION_REPLACED must not evict)", ctrl.Action, protocol.ActionSessionLocked)
+	}
+	ping, _ := protocol.Encode(protocol.TypePing, "", nil)
+	if err := student.Write(context.Background(), ws.MessageText, ping); err != nil {
+		t.Fatalf("write ping: %v", err)
+	}
+	if env := readEnvelope(t, student); env.Type != protocol.TypePong {
+		t.Fatalf("got type %q, want pong on a still-open connection", env.Type)
+	}
+
+	// Newer claim (version 3 > 2) evicts.
+	room.control <- redisControlMessage{Type: protocol.ActionSessionReplaced, SessionID: "sess-1", ActiveAuthSessionID: "auth-other", ActiveDeviceID: "tab-other", ClaimVersion: 3}
+	env = readEnvelope(t, student)
+	_ = json.Unmarshal(env.Data, &ctrl)
+	if env.Type != protocol.TypeExamControl || ctrl.Action != protocol.ActionSessionReplaced {
+		t.Fatalf("got %q/%q, want exam:control SESSION_REPLACED", env.Type, ctrl.Action)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, _, err := student.Read(ctx); err == nil {
+		t.Fatal("expected the replaced connection to be closed")
 	}
 }
 
@@ -1069,6 +1163,49 @@ func TestRoom_IntegrityEvent_UnknownKindDropped(t *testing.T) {
 	}
 }
 
+// A socket whose takeover notification was missed (Redis event lost) must not
+// be able to keep writing integrity events into the owner's session: the
+// durable ownership check refuses the write and closes the socket.
+func TestRoom_IntegrityEvent_ReplacedOwnerNotPersistedAndClosed(t *testing.T) {
+	rs := newFakeRoomStore()
+	rs.snapshot = []store.MonitorSession{{ID: "sess-1"}}
+	rs.refuseOwner = true // the committed claim moved to another login/tab
+	room, _ := newTestRoom(t, rs, &fakeBuffer{}, &fakeFlusher{}, time.Minute)
+	ts := newTestServer(t, room)
+
+	student := dial(t, wsURL(ts.srv.URL, "/ws/exam/x?session=sess-1"))
+	readEnvelope(t, student) // timer:sync
+
+	msg, _ := protocol.Encode(protocol.TypeIntegrityEvent, "", protocol.IntegrityEventData{
+		Kind: "TAB_HIDDEN", ClientTime: time.Now().UTC().Format(time.RFC3339Nano),
+	})
+	if err := student.Write(context.Background(), ws.MessageText, msg); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// Receiving the SESSION_REPLACED control implies the offloaded durable
+	// check has run, so asserting on the absent write afterwards is
+	// deterministic — no sleep needed.
+	env := readEnvelope(t, student)
+	if env.Type != protocol.TypeExamControl {
+		t.Fatalf("got type %q, want exam:control (SESSION_REPLACED)", env.Type)
+	}
+	var ctrl protocol.ControlEventData
+	_ = json.Unmarshal(env.Data, &ctrl)
+	if ctrl.Action != protocol.ActionSessionReplaced {
+		t.Fatalf("got action %q, want %q", ctrl.Action, protocol.ActionSessionReplaced)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, _, err := student.Read(ctx); err == nil {
+		t.Fatal("expected the replaced connection to be closed")
+	}
+	if events := rs.events(); len(events) != 0 {
+		t.Fatalf("got saved integrity events %v, want none from a replaced socket", events)
+	}
+}
+
 // Regression: a client-initiated close (tab closed, network drop, frontend
 // closing after SESSION_SUBMITTED) must tear the connection down without
 // deadlocking. With the defers in the wrong order, Wait ran before cancel
@@ -1243,7 +1380,7 @@ func TestRoom_AsyncWorker_DurableFallsBackInline(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		room.offloadDurable("test-inline-fallback", func(ctx context.Context) {
-			_ = rs.SaveIntegrityEvent(ctx, "sess-1", "TAB_HIDDEN", "", time.Now())
+			_, _ = rs.SaveIntegrityEventIfOwner(ctx, "exam-1", "sess-1", "TAB_HIDDEN", "", time.Now(), "auth-sess-1", "tab-sess-1")
 		})
 		close(done)
 	}()

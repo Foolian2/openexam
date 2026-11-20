@@ -104,6 +104,10 @@ type redisControlMessage struct {
 	ActiveAuthSessionID string `json:"activeAuthSessionId,omitempty"`
 	ActiveDeviceID      string `json:"activeDeviceId,omitempty"`
 	DeviceReplacedCount int    `json:"deviceReplacedCount"`
+	// ClaimVersion is the monotonic claim version (bumped on every claim,
+	// including the first). Older events must not evict a socket that
+	// registered under a newer claim.
+	ClaimVersion int `json:"claimVersion"`
 }
 
 // redisMonitorMessage is what Go instances publish to exam:{id}:monitor to
@@ -121,7 +125,7 @@ type redisMonitorMessage struct {
 type RoomStore interface {
 	ListMonitorSessions(ctx context.Context, examID string) ([]store.MonitorSession, error)
 	WithAnswerSaveState(ctx context.Context, examID, sessionID string, receivedAt time.Time, use func(*store.AnswerSaveState) error) error
-	SaveIntegrityEvent(ctx context.Context, sessionID, kind, detail string, clientTime time.Time) error
+	SaveIntegrityEventIfOwner(ctx context.Context, examID, sessionID, kind, detail string, clientTime time.Time, authSessionID, deviceID string) (string, error)
 }
 
 // AnswerBuffer is the subset of *store.Buffer a Room needs.
@@ -157,7 +161,10 @@ type Room struct {
 	// saveResults. stopping is closed at teardown. See saves.go.
 	saveLanes   map[string]*saveLane
 	saveResults chan saveResult
-	stopping    chan struct{}
+	// integrityResults carries the outcome of the offloaded, ownership-gated
+	// integrity writes back to the room goroutine (see handleIntegrityEvent).
+	integrityResults chan integrityResult
+	stopping         chan struct{}
 
 	store      RoomStore
 	buffer     AnswerBuffer
@@ -190,30 +197,31 @@ func newRoom(examID string, st RoomStore, buf AnswerBuffer, fl ExamFlusher, publ
 		log = slog.Default()
 	}
 	return &Room{
-		examID:       examID,
-		students:     make(map[string]*Client),
-		monitors:     make(map[*Client]struct{}),
-		state:        make(map[string]*sessionState),
-		register:     make(chan registration),
-		unregister:   make(chan *Client),
-		inbound:      make(chan inboundMsg, 256),
-		control:      make(chan redisControlMessage, 32),
-		monitorRel:   make(chan redisMonitorMessage, 32),
-		extBroadcast: make(chan monitorBroadcast, 32),
-		async:        make(chan asyncJob, asyncQueueDepth),
-		saveLanes:    make(map[string]*saveLane),
-		saveResults:  make(chan saveResult, 256),
-		stopping:     make(chan struct{}),
-		store:        st,
-		buffer:       buf,
-		flusher:      fl,
-		publish:      publish,
-		instanceID:   instanceID,
-		idleTimeout:  idleTimeout,
-		submitGrace:  submitGrace,
-		done:         make(chan struct{}),
-		log:          log,
-		flushWg:      &sync.WaitGroup{},
+		examID:           examID,
+		students:         make(map[string]*Client),
+		monitors:         make(map[*Client]struct{}),
+		state:            make(map[string]*sessionState),
+		register:         make(chan registration),
+		unregister:       make(chan *Client),
+		inbound:          make(chan inboundMsg, 256),
+		control:          make(chan redisControlMessage, 32),
+		monitorRel:       make(chan redisMonitorMessage, 32),
+		extBroadcast:     make(chan monitorBroadcast, 32),
+		async:            make(chan asyncJob, asyncQueueDepth),
+		saveLanes:        make(map[string]*saveLane),
+		saveResults:      make(chan saveResult, 256),
+		integrityResults: make(chan integrityResult, 64),
+		stopping:         make(chan struct{}),
+		store:            st,
+		buffer:           buf,
+		flusher:          fl,
+		publish:          publish,
+		instanceID:       instanceID,
+		idleTimeout:      idleTimeout,
+		submitGrace:      submitGrace,
+		done:             make(chan struct{}),
+		log:              log,
+		flushWg:          &sync.WaitGroup{},
 	}
 }
 
@@ -342,6 +350,9 @@ func (r *Room) run(ctx context.Context) {
 		case res := <-r.saveResults:
 			r.handleSaveResult(res)
 
+		case res := <-r.integrityResults:
+			r.handleIntegrityResult(res)
+
 		case msg := <-r.control:
 			r.handleControl(ctx, msg)
 
@@ -376,7 +387,10 @@ func (r *Room) handleRegister(ctx context.Context, reg registration) {
 		return
 	}
 
-	c.claimVersion = reg.sessionAuth.DeviceReplacedCount
+	// The claim version read at authorization orders concurrent sockets: one
+	// that read the row BEFORE the first claim (version 0) must not evict the
+	// claimed owner, so strictly-older registrations are rejected above.
+	c.claimVersion = reg.sessionAuth.ClaimVersion
 	if old, ok := r.students[c.sessionID]; ok && old != c && old.claimVersion > c.claimVersion {
 		// The new socket was authorized against an older claim than the one
 		// already registered (e.g. its SEB handshake straddled a takeover
@@ -512,37 +526,70 @@ func (r *Room) handleIntegrityEvent(ctx context.Context, c *Client, env protocol
 		detail = detail[:maxIntegrityDetailLen]
 	}
 
-	if st.integrityCount < maxStoredIntegrityEvents {
-		clientTime := now
-		if t, err := time.Parse(time.RFC3339Nano, data.ClientTime); err == nil {
-			clientTime = t
-		}
-		// The write is deliberately NOT awaited. It used to be: the counter and
-		// the monitor badge were only updated after a successful INSERT, so the
-		// badge could never run ahead of the DB-backed REST count. That
-		// ordering cost more than it bought — a synchronous Postgres write on
-		// the room goroutine, in front of every student's answer save.
-		//
-		// The new contract is that the badge is OPTIMISTIC. It reflects what
-		// the room has accepted, not what Postgres has committed. If a write
-		// fails it is logged and the badge is briefly ahead of the database;
-		// the two only visibly diverge if that failure is followed by a room
-		// teardown (60s idle) whose fresh room re-seeds integrityCount from the
-		// DB, at which point the badge steps back. Rate limiting, the stored
-		// cap and truncation all still happen on the room goroutine above, so
-		// the volume reaching Postgres is unchanged.
-		sessionID, kind := c.sessionID, data.Kind
-		r.offloadDurable("integrity-write", func(ctx context.Context) {
-			if err := r.store.SaveIntegrityEvent(ctx, sessionID, kind, detail, clientTime); err != nil {
+	clientTime := now
+	if t, err := time.Parse(time.RFC3339Nano, data.ClientTime); err == nil {
+		clientTime = t
+	}
+	// The durable write is deliberately NOT awaited on the room goroutine — a
+	// synchronous Postgres round trip in front of every student's answer save
+	// costs more than it buys. But it is ownership-gated: the write happens
+	// only while this login+tab still owns the session, checked in Postgres
+	// under the ExamSession share lock (store.SaveIntegrityEventIfOwner), so a
+	// socket whose takeover notification was missed cannot keep injecting
+	// events into the owner's session. The counter and the monitor badge
+	// advance only once that check has passed (see handleIntegrityResult);
+	// on a plain I/O error the badge stays optimistic, as before.
+	persist := st.integrityCount < maxStoredIntegrityEvents
+	sessionID, kind := c.sessionID, data.Kind
+	r.offloadDurable("integrity-write", func(ctx context.Context) {
+		code := ""
+		if persist {
+			var err error
+			code, err = r.store.SaveIntegrityEventIfOwner(ctx, r.examID, sessionID, kind, detail, clientTime, c.authSessionID, c.deviceID)
+			if err != nil {
 				r.log.Error("integrity:event save failed", "sessionId", sessionID, "error", err)
+				code = "" // I/O error: count and broadcast anyway, as before.
 			}
-		})
+		}
+		select {
+		case r.integrityResults <- integrityResult{client: c, kind: kind, detail: detail, code: code}:
+		case <-r.stopping:
+		}
+	})
+}
+
+// integrityResult is the outcome of one offloaded integrity write, handled on
+// the room goroutine so the session state and the client enqueue stay single-
+// threaded (see async.go's contract).
+type integrityResult struct {
+	client *Client
+	kind   string
+	detail string
+	// code is "SESSION_REPLACED" when the durable check found the socket no
+	// longer owns the session; "" otherwise (persisted, at the stored cap, or
+	// a plain I/O error after logging).
+	code string
+}
+
+func (r *Room) handleIntegrityResult(res integrityResult) {
+	if res.code == "SESSION_REPLACED" {
+		// The committed owner is someone else, whether or not the advisory
+		// Redis event reached this socket. Close it so it stops sending
+		// integrity events into the owner's session — the same handling a
+		// rejected answer save gets (handleSaveResult).
+		res.client.enqueue(mustEncode(protocol.TypeExamControl, "", protocol.ControlEventData{Action: protocol.ActionSessionReplaced, SessionID: res.client.sessionID}))
+		res.client.requestClose(websocket.StatusNormalClosure, "replaced by another tab or login")
+		return
+	}
+	st := r.state[res.client.sessionID]
+	if st == nil {
+		return
 	}
 	st.integrityCount++
 
-	r.broadcastMonitorUpdate(c.sessionID, map[string]any{
+	r.broadcastMonitorUpdate(res.client.sessionID, map[string]any{
 		"integrityEventCount": st.integrityCount,
-		"lastIntegrityEvent":  map[string]any{"kind": data.Kind, "detail": detail, "at": nowRFC3339()},
+		"lastIntegrityEvent":  map[string]any{"kind": res.kind, "detail": res.detail, "at": nowRFC3339()},
 	})
 }
 
@@ -743,7 +790,13 @@ func (r *Room) handleControl(ctx context.Context, msg redisControlMessage) {
 		if msg.ActiveAuthSessionID == "" || msg.ActiveDeviceID == "" {
 			return
 		}
-		if c, ok := r.students[msg.SessionID]; ok && msg.DeviceReplacedCount > c.claimVersion &&
+		// ClaimVersion orders the event against the socket's registration;
+		// fall back to the takeover count for a publisher that predates it.
+		version := msg.ClaimVersion
+		if version == 0 {
+			version = msg.DeviceReplacedCount
+		}
+		if c, ok := r.students[msg.SessionID]; ok && version > c.claimVersion &&
 			(c.authSessionID != msg.ActiveAuthSessionID || c.deviceID != msg.ActiveDeviceID) {
 			c.enqueue(mustEncode(protocol.TypeExamControl, "", protocol.ControlEventData{Action: msg.Type, SessionID: msg.SessionID}))
 			c.requestClose(websocket.StatusNormalClosure, "replaced by another tab or login")

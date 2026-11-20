@@ -581,3 +581,93 @@ func TestLifecycleReadsRefreshIntervalSnapshotAfterLockWait(t *testing.T) {
 		})
 	}
 }
+
+// SaveIntegrityEventIfOwner must refuse writes from a login/tab that no longer
+// owns the session, and serialize with a concurrent takeover claim so the
+// check sees the committed claim, not a stale row version.
+func TestSaveIntegrityEventIfOwnerGatesOnDurableClaim(t *testing.T) {
+	ctx, setup, _, _ := testPostgres(t)
+	if _, err := setup.Exec(ctx, `CREATE TABLE "Exam" (id text PRIMARY KEY, status text, "closedAt" timestamp(3)); INSERT INTO "Exam" VALUES ('e','ACTIVE',NULL); ALTER TABLE "ExamSession" ADD COLUMN "examId" text DEFAULT 'e', ADD COLUMN "activeAuthSessionId" text, ADD COLUMN "activeDeviceId" text; CREATE TABLE "IntegrityEvent" (id text PRIMARY KEY, "sessionId" text NOT NULL, kind text NOT NULL, detail text, "clientTime" timestamp(3), "createdAt" timestamp(3));`); err != nil {
+		t.Fatal(err)
+	}
+	var schema string
+	if err := setup.QueryRow(ctx, `SHOW search_path`).Scan(&schema); err != nil {
+		t.Fatal(err)
+	}
+	config, err := pgxpool.ParseConfig(os.Getenv("TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.ConnConfig.RuntimeParams["search_path"] = schema
+	config.ConnConfig.RuntimeParams["application_name"] = schema
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	st := New(pool)
+
+	count := func() int {
+		var n int
+		if err := setup.QueryRow(ctx, `SELECT count(*) FROM "IntegrityEvent"`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	// Legacy unclaimed row: any login of the owner may write.
+	code, err := st.SaveIntegrityEventIfOwner(ctx, "e", "s", "TAB_HIDDEN", "", time.Now(), "login-a", "tab-a")
+	if err != nil || code != "" {
+		t.Fatalf("unclaimed row: code=%q err=%v", code, err)
+	}
+	if count() != 1 {
+		t.Fatalf("want 1 stored event, got %d", count())
+	}
+
+	// Claimed to login-a/tab-a: the same identity writes, others are refused.
+	if _, err := setup.Exec(ctx, `UPDATE "ExamSession" SET "activeAuthSessionId"='login-a', "activeDeviceId"='tab-a' WHERE id='s'`); err != nil {
+		t.Fatal(err)
+	}
+	if code, err = st.SaveIntegrityEventIfOwner(ctx, "e", "s", "WINDOW_BLUR", "x", time.Now(), "login-a", "tab-a"); err != nil || code != "" {
+		t.Fatalf("owner: code=%q err=%v", code, err)
+	}
+	if code, err = st.SaveIntegrityEventIfOwner(ctx, "e", "s", "WINDOW_BLUR", "", time.Now(), "login-a", "tab-b"); code != "SESSION_REPLACED" || err != nil {
+		t.Fatalf("other tab: code=%q err=%v, want SESSION_REPLACED", code, err)
+	}
+	if code, err = st.SaveIntegrityEventIfOwner(ctx, "e", "s", "WINDOW_BLUR", "", time.Now(), "login-b", "tab-a"); code != "SESSION_REPLACED" || err != nil {
+		t.Fatalf("other login: code=%q err=%v, want SESSION_REPLACED", code, err)
+	}
+	if n := count(); n != 2 {
+		t.Fatalf("want 2 stored events (replaced writes refused), got %d", n)
+	}
+
+	// A claim holding the row lock serializes with the check: the reader
+	// waits on the lock, then sees the committed claim and refuses.
+	claimTx, err := setup.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = claimTx.Rollback(context.Background()) }()
+	if _, err := claimTx.Exec(ctx, `UPDATE "ExamSession" SET "activeAuthSessionId"='login-b', "activeDeviceId"='tab-b' WHERE id='s'`); err != nil {
+		t.Fatal(err)
+	}
+	finished := make(chan string, 1)
+	go func() {
+		code, err := st.SaveIntegrityEventIfOwner(ctx, "e", "s", "TAB_HIDDEN", "", time.Now(), "login-a", "tab-a")
+		if err != nil {
+			t.Errorf("locked claim: err=%v", err)
+		}
+		finished <- code
+	}()
+	// Let the reader reach the row lock before committing the claim.
+	time.Sleep(200 * time.Millisecond)
+	if err := claimTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if code := <-finished; code != "SESSION_REPLACED" {
+		t.Fatalf("after committed claim: code=%q, want SESSION_REPLACED", code)
+	}
+	if n := count(); n != 2 {
+		t.Fatalf("event written despite lost ownership, count=%d", n)
+	}
+}

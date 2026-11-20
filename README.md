@@ -443,10 +443,17 @@ tab shows a takeover screen with **Hier weiterarbeiten** to reclaim it, and the 
 replacement counter. A tab keeps its identity across reloads and navigations; a duplicated tab
 that inherits it through copied sessionStorage gets a new one, because a Web Lock shows the identity
 is still held by a live tab. Unsaved answers are buffered per tab, so a replaced tab's late edits
-never overwrite the owner's. REST writes check ownership inside their transaction, and every
-WebSocket save checks it in Postgres, so a missed Redis notification cannot authorize old saves.
+never overwrite the owner's; its pre-takeover unsaved answers are still adopted by the new owner.
+REST writes check ownership inside their transaction, and every WebSocket save and integrity event
+checks it in Postgres, so a missed Redis notification cannot authorize old writes.
 A locked session can establish ownership while remaining read-only. The counter is advisory:
 relaunching SEB after a crash can also replace a login.
+
+The newest claim always wins, and reloading a replaced tab (or pressing **Hier weiterarbeiten**)
+claims the session back, so the binding stops *concurrent* use in two tabs — it cannot detect
+sequential sharing of one account. Tab identity relies on the Web Locks API; browsers without it
+fall back to reusing the stored identity on reload, where a duplicated tab that reloads before
+opening the exam cannot be told apart from the original.
 
 | Failure | Effect |
 |---------|--------|

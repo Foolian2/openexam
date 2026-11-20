@@ -10,7 +10,7 @@ import { fileKeyBelongsTo } from "@/lib/answer-file-key"
 import { OPEN_STATUSES, pastDeadline } from "@/lib/session-state"
 import { verifySebAccess } from "@/lib/seb-guard"
 import {
-  activeDeviceWhere,
+  gateActiveDevice,
   getExamDeviceId,
   isActiveDevice,
 } from "@/lib/exam-device"
@@ -96,27 +96,15 @@ export async function PUT(request: NextRequest, { params }: Params) {
   let answer
   try {
     answer = await prisma.$transaction(async (tx) => {
-      // Re-check status inside the transaction so a concurrent lock (which
-      // also writes via a gated updateMany) can't be missed by a stale read.
-      const gate = await tx.examSession.updateMany({
-        where: {
-          id,
-          status: { in: OPEN_STATUSES },
-          ...activeDeviceWhere(session.session.id, deviceId),
-        },
-        data: { lastSeenAt: new Date() },
+      // Re-check status and ownership inside the transaction so a concurrent
+      // lock or takeover (which also writes via a gated updateMany) can't be
+      // missed by a stale read.
+      await gateActiveDevice(tx, {
+        id,
+        status: { in: OPEN_STATUSES },
+        authSessionId: session.session.id,
+        deviceId,
       })
-      if (gate.count === 0) {
-        const current = await tx.examSession.findUnique({ where: { id } })
-        if (current && !isActiveDevice(current, session.session.id, deviceId)) {
-          throw new ApiError(
-            409,
-            "SESSION_REPLACED",
-            "Sitzung wurde übernommen"
-          )
-        }
-        throw new ApiError(409, "CONFLICT", "Sitzung ist nicht aktiv")
-      }
 
       // Raw SQL because the ordering guard needs ON CONFLICT ... WHERE: only
       // replace a stored answer whose clientSeq is lower, so this write and

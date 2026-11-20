@@ -38,10 +38,15 @@ export async function POST(request: NextRequest, { params }: Params) {
   // odd button press needs only a few per minute. Keyed by exam session so
   // one session's reloads cannot exhaust the budget of another.
   const { id } = await params
+  // Fail closed: this limiter guards a security-sensitive ownership change,
+  // so a Redis outage must refuse claims, not open them (unlike the autosave
+  // limiters, which stay "open" so a Redis hiccup cannot lock students out of
+  // saving answers).
   const limit = await rateLimit(
     `session-device:${session.user.id}:${id}`,
     20,
-    60
+    60,
+    "closed"
   )
   if (!limit.allowed) {
     return rateLimited(limit.resetInSeconds)
