@@ -37,6 +37,8 @@ vi.mock("@/lib/seb-urls", () => ({
 
 type Route = typeof import("@/app/api/sessions/[id]/answers/route")
 
+const AUTH_SESSION_ID = "answers-sql-auth-session"
+
 describe.skipIf(!TEST_DATABASE_URL)("answers route against Postgres", () => {
   let prisma: PrismaClient
   let PUT: Route["PUT"]
@@ -114,8 +116,16 @@ describe.skipIf(!TEST_DATABASE_URL)("answers route against Postgres", () => {
   beforeEach(async () => {
     authMock.api.getSession.mockResolvedValue({
       user: { id: userId, role: "STUDENT" },
+      session: { id: AUTH_SESSION_ID },
     })
     await clearAnswers()
+    // Unbound, like a session nobody has claimed yet (lib/exam-device.ts).
+    if (sessionId) {
+      await prisma.examSession.update({
+        where: { id: sessionId },
+        data: { activeAuthSessionId: null, activeDeviceId: null },
+      })
+    }
   })
 
   function fixture() {
@@ -123,9 +133,9 @@ describe.skipIf(!TEST_DATABASE_URL)("answers route against Postgres", () => {
     return { sessionId, questionId }
   }
 
-  async function save(text: string, clientSeq?: number) {
+  async function put(text: string, clientSeq?: number) {
     const { sessionId, questionId } = fixture()
-    const res = await PUT(
+    return PUT(
       new NextRequest(`https://localhost/api/sessions/${sessionId}/answers`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
@@ -137,6 +147,10 @@ describe.skipIf(!TEST_DATABASE_URL)("answers route against Postgres", () => {
       }),
       { params: Promise.resolve({ id: sessionId }) }
     )
+  }
+
+  async function save(text: string, clientSeq?: number) {
+    const res = await put(text, clientSeq)
     expect(res.status).toBe(200)
     return res.json()
   }
@@ -193,6 +207,24 @@ describe.skipIf(!TEST_DATABASE_URL)("answers route against Postgres", () => {
       content: { type: "FREE_TEXT", text: "ohne seq" },
       version: 2,
       clientSeq: 5,
+    })
+  })
+
+  it("refuses a save from a login that no longer owns the session", async () => {
+    const { sessionId } = fixture()
+    await save("vorher", 1)
+    await prisma.examSession.update({
+      where: { id: sessionId },
+      data: { activeAuthSessionId: "another-login" },
+    })
+
+    const res = await put("nachher", 2)
+
+    expect(res.status).toBe(409)
+    expect((await res.json()).error.code).toBe("SESSION_REPLACED")
+    expect((await stored()).content).toEqual({
+      type: "FREE_TEXT",
+      text: "vorher",
     })
   })
 })
