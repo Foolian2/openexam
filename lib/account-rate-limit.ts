@@ -90,7 +90,13 @@ export async function accountRateLimitMessage(
  */
 export const FAILED_SIGN_IN_LIMIT = 50
 export const FAILED_SIGN_IN_WINDOW_SECONDS = 15 * 60
-/** Safety TTL for in-flight slots a crashed request never settled. */
+/**
+ * The in-flight counter expires this long after its first reservation and is
+ * never extended, so slots that are never settled (better-auth skips after
+ * hooks when an endpoint throws a non-API error, e.g. during a database
+ * outage) clear within a minute even under steady traffic. Expiry can briefly
+ * undercount attempts still running; settling never takes it below zero.
+ */
 const IN_FLIGHT_TTL_SECONDS = 60
 const FAILED_SIGN_IN_MESSAGE =
   "Zu viele fehlgeschlagene Anmeldungen von diesem Netzwerk. Bitte in 15 Minuten erneut versuchen."
@@ -101,7 +107,9 @@ local failed = tonumber(redis.call("GET", KEYS[1]) or "0")
 local pending = tonumber(redis.call("GET", KEYS[2]) or "0")
 if failed + pending >= tonumber(ARGV[1]) then return 0 end
 redis.call("INCR", KEYS[2])
-redis.call("EXPIRE", KEYS[2], ARGV[2])
+if redis.call("TTL", KEYS[2]) < 0 then
+  redis.call("EXPIRE", KEYS[2], ARGV[2])
+end
 return 1
 `
 
