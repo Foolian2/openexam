@@ -78,9 +78,11 @@ to 4, or to 3 if you also run monitoring on it.
    - `scripts/create-cap-site-key.sh` — creates the Cap site key via the
      admin API (`/server/keys` inside the Docker network, logged in with
      `CAP_ADMIN_KEY`) and writes the real `NEXT_PUBLIC_CAP_WIDGET_ENDPOINT` /
-     `CAP_SECRET_KEY` into `.env.prod`. No dashboard, no SSH tunnel.
-     Idempotent; after it changes anything you must redeploy (the widget
-     endpoint is baked into the client bundle at build time).
+     `CAP_SECRET_KEY` into `.env.prod`. No dashboard, no SSH tunnel. It also
+     gives the key a class-sized rate limit (600 requests per minute per IP)
+     unless one is already set. Idempotent; after it creates a key you must
+     redeploy (the widget endpoint is baked into the client bundle at build
+     time).
    - a second `deploy.sh` bakes the site key into the web image.
    - `scripts/issue-cert.sh` (only when DNS is ready) — real Let's Encrypt
      cert. If `certs/live/openexam` holds the self-signed placeholder it is
@@ -1127,9 +1129,9 @@ docker compose -f docker-compose.prod.yml --env-file .env.prod \
 # 4. Resume "First-time server setup" from step 3 onward (optional
 #    SMTP_*/Microsoft values; the one-command setup-prod.sh already covered
 #    TLS, cron and firewall in step 2). The Cap site key registration lived
-#    in the old host's Valkey, so check it: create-cap-site-key.sh is a no-op
-#    when the key is registered and creates (and writes) a new one when not —
-#    redeploy after it changed anything.
+#    in the old host's Valkey, so check it: create-cap-site-key.sh keeps the
+#    key when it is registered (only adding a missing rate limit) and creates
+#    (and writes) a new one when not — redeploy after it created one.
 ./scripts/deploy.sh
 ./scripts/create-cap-site-key.sh && ./scripts/deploy.sh
 ```

@@ -542,7 +542,13 @@ services:
   # rather than publishing a port directly, so the admin dashboard stays
   # unreachable from the internet (SSH-tunnel only).
   cap:
-    image: tiago2/cap@sha256:c29417b6270d1fddc6a0603c08d972f89a12de81889d09c3f97a0915422fba5e
+    # Held on Cap 3.x: 4.0 needs a manual migration (site secrets re-hashed, so
+    # /siteverify returns 403 until each key's secret is reset; v3 dashboard
+    # sessions and API keys stop working, which breaks
+    # scripts/create-cap-site-key.sh; events need a /usr/src/app/data volume)
+    # and adds bot detection that must be tested against Safe Exam Browser
+    # first. https://trycap.dev/guide/capd/migrate-v3-v4.html
+    image: tiago2/cap:3.1.17@sha256:b47424a1b4ab3e6e7205ba1ed35fa25c8817c78bf0a82a0c7dac5d3393167a03
     restart: unless-stopped
     deploy:
       resources:
