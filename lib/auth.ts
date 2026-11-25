@@ -30,6 +30,7 @@ import {
   settleSignInAttempt,
 } from "@/lib/account-rate-limit"
 import { rateLimit } from "@/lib/rate-limit"
+import { signUpPerIpMax } from "@/lib/sign-up-rate-limit"
 import { withEmailChangeState } from "@/lib/email-change-state"
 import { SESSION_MAX_AGE_SECONDS } from "@/lib/storage-keys"
 import { getClientIp } from "@/lib/client-ip"
@@ -150,7 +151,7 @@ const AUTH_PER_IP_RULE = { window: 60, max: 200 }
  * ~200 mails a minute. 40 per 10 minutes still admits a class registering
  * together in one lesson, and caps a day below what the old 5/min allowed.
  */
-const SIGN_UP_PER_IP_RULE = { window: 600, max: 40 }
+const SIGN_UP_PER_IP_RULE = { window: 600, max: signUpPerIpMax() }
 
 const ACCOUNT_MAIL_LIMIT = 10
 const ACCOUNT_MAIL_WINDOW_SECONDS = 60 * 60

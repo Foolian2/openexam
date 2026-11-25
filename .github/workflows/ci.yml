@@ -315,6 +315,9 @@ jobs:
       # No mailbox in CI: the prod build must not require (or send) email
       # verification on sign-up. CI-only flag (lib/auth.ts).
       DISABLE_EMAIL_VERIFICATION: "true"
+      # The suite registers ~50 accounts from one address; production allows
+      # 40 sign-ups per IP per 10 minutes. CI-only override (lib/sign-up-rate-limit.ts).
+      SIGN_UP_RATE_LIMIT_MAX: "1000"
       # Required by the production env validation (lib/env.ts) — they only
       # fill in /datenschutz and /impressum.
       LEGAL_CONTROLLER_NAME: OpenExam CI
