@@ -40,6 +40,10 @@ overrides:
   # still allow 1.2.1, which hangs on crafted section offsets (GHSA-68fv-2mgg-jv7q).
   source-map-js: ^1.2.2
   '@hono/node-server': ^1.19.13
+  # prisma's config loader (@prisma/config) pins effect 3.20.x, whose
+  # Schema.TemplateLiteral regex is ReDoS-prone (GHSA-7589-6fvf-x4pw).
+  # Same major, so the scoped floor is safe.
+  'effect@<3.22.1': ^3.22.1
   # @sentry/bundler-plugins still asks for glob ^13, whose minimatch is
   # vulnerable (GHSA for glob <=14.0.1 / minimatch <11.0.1). Only used for
   # source-map upload, which this deployment never runs; 14.x keeps the same
