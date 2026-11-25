@@ -9,7 +9,8 @@
 # Idempotent: if the site key already baked into .env.prod is registered in
 # cap, no key is created. Either way the key gets a class-sized rate limit if
 # it has none yet (see CAP_RATELIMIT_* below); a limit already set, e.g. in
-# cap's dashboard, is left alone. After a NEW key, REDEPLOY — the widget
+# cap's dashboard, is left alone, and so is a dashboard global limit that
+# already admits at least that rate. After a NEW key, REDEPLOY — the widget
 # endpoint is baked into the web image at build time:
 #   ./scripts/create-cap-site-key.sh && ./scripts/deploy.sh
 #
@@ -99,20 +100,36 @@ if ! docker exec -e CAP_ADMIN_KEY -e CAP_CREATE="$create" -e CAP_SITE_KEY="$site
   const current = await (await fetch(`${base}/server/keys/${siteKey}`, { headers })).json();
   if (!current.key) { console.error("reading key failed:", JSON.stringify(current)); process.exit(1); }
   const config = current.key.config;
+  const wantMax = Number(process.env.CAP_RATELIMIT_MAX);
+  const wantMs = Number(process.env.CAP_RATELIMIT_MS);
   let limit = "kept";
-  if (config.ratelimitMax == null || config.ratelimitDuration == null) {
+  let ownLimit = config.ratelimitMax != null && config.ratelimitDuration != null;
+  if (!ownLimit) {
+    // Without its own limit the key falls back to the cap global limit
+    // (dashboard setting, default 30 per 5 s). Keep a global limit that
+    // already admits at least the class-sized rate instead of lowering it.
+    const g = await (await fetch(`${base}/server/settings/ratelimit`, { headers })).json();
+    if (Number.isFinite(g.max) && Number.isFinite(g.duration) &&
+        g.max * wantMs >= wantMax * g.duration) {
+      config.ratelimitMax = g.max;
+      config.ratelimitDuration = g.duration;
+      limit = "global";
+      ownLimit = true;
+    }
+  }
+  if (!ownLimit) {
     const r = await fetch(`${base}/server/keys/${siteKey}/config`, {
       method: "PUT",
       headers,
       body: JSON.stringify({
-        ratelimitMax: Number(process.env.CAP_RATELIMIT_MAX),
-        ratelimitDuration: Number(process.env.CAP_RATELIMIT_MS),
+        ratelimitMax: wantMax,
+        ratelimitDuration: wantMs,
       }),
     });
     const res = await r.json();
     if (!res.success) { console.error("setting the rate limit failed:", JSON.stringify(res)); process.exit(1); }
-    config.ratelimitMax = Number(process.env.CAP_RATELIMIT_MAX);
-    config.ratelimitDuration = Number(process.env.CAP_RATELIMIT_MS);
+    config.ratelimitMax = wantMax;
+    config.ratelimitDuration = wantMs;
     limit = "set";
   }
   console.log(`${siteKey} ${secretKey} ${limit} ${config.ratelimitMax} ${config.ratelimitDuration}`);
@@ -125,6 +142,8 @@ read -r new_site_key new_secret_key limit_state limit_max limit_ms < "$out"
 limit_note="rate limit ${limit_max} requests per $((limit_ms / 1000)) s per IP"
 if [ "$limit_state" = set ]; then
   limit_note="set its $limit_note"
+elif [ "$limit_state" = global ]; then
+  limit_note="left it on cap's global $limit_note (already at least the class-sized limit)"
 else
   limit_note="kept its existing $limit_note"
 fi
