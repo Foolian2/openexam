@@ -22,8 +22,15 @@ import {
   capSessionRefresh,
   sessionCreatedAtFromHookContext,
 } from "@/lib/session-cap"
-import { accountKey, accountRateLimitMessage } from "@/lib/account-rate-limit"
+import {
+  accountKey,
+  accountRateLimitMessage,
+  isInvalidCredentials,
+  reserveSignInAttempt,
+  settleSignInAttempt,
+} from "@/lib/account-rate-limit"
 import { rateLimit } from "@/lib/rate-limit"
+import { signUpPerIpMax } from "@/lib/sign-up-rate-limit"
 import { withEmailChangeState } from "@/lib/email-change-state"
 import { SESSION_MAX_AGE_SECONDS } from "@/lib/storage-keys"
 import { getClientIp } from "@/lib/client-ip"
@@ -130,6 +137,22 @@ function privacyAcceptanceFields(context: HookContext | undefined) {
 // emailVerification below lets each new address through, so without this
 // one account could mail any number of distinct addresses. Fails open
 // without Redis, like the cooldown.
+/**
+ * Per-IP limit on sign-in, sign-up and passkey routes: about 200 students
+ * per minute behind one school address, the same cohort size seb-enter
+ * admits (app/exam/[id]/seb-enter/route.ts). See rateLimit.customRules.
+ */
+const AUTH_PER_IP_RULE = { window: 60, max: 200 }
+
+/**
+ * Per-IP limit on sign-up, kept well below sign-in: every sign-up sends a
+ * verification mail to an address of the caller's choosing (password sign-up
+ * accepts any domain), so a sign-in-sized limit would let one address send
+ * ~200 mails a minute. 40 per 10 minutes still admits a class registering
+ * together in one lesson, and caps a day below what the old 5/min allowed.
+ */
+const SIGN_UP_PER_IP_RULE = { window: 600, max: signUpPerIpMax() }
+
 const ACCOUNT_MAIL_LIMIT = 10
 const ACCOUNT_MAIL_WINDOW_SECONDS = 60 * 60
 
@@ -167,15 +190,22 @@ export const auth = betterAuth({
       process.env.NODE_ENV === "production" ||
       process.env.DISABLE_RATE_LIMIT !== "true",
     storage: "secondary-storage",
+    // better-auth keys every rule on client IP + path, and a school sends a
+    // whole class through one NAT address, so the sign-in rules are sized for
+    // a cohort arriving together rather than for one person (at 5/min the
+    // sixth student was refused). Sign-up is the exception, see
+    // SIGN_UP_PER_IP_RULE. They are a flood backstop only: guessing
+    // is stopped by the per-account limits in hooks.before
+    // (lib/account-rate-limit.ts) and the Cap proof-of-work each sign-in and
+    // sign-up must solve. The wildcards matter: better-auth's built-in rule
+    // for every other /sign-in/* path, Microsoft sign-in included, is 3 per
+    // 10 seconds per IP.
     customRules: {
-      "/sign-in/email": { window: 60, max: 5 },
-      "/sign-up/email": { window: 60, max: 5 },
+      "/sign-in/*": AUTH_PER_IP_RULE,
+      "/sign-up/*": SIGN_UP_PER_IP_RULE,
+      "/passkey/*": AUTH_PER_IP_RULE,
       "/request-password-reset": { window: 60, max: 3 },
       "/reset-password": { window: 60, max: 5 },
-      "/passkey/generate-authenticate-options": { window: 60, max: 5 },
-      "/passkey/verify-authentication": { window: 60, max: 5 },
-      "/passkey/generate-register-options": { window: 60, max: 5 },
-      "/passkey/verify-registration": { window: 60, max: 5 },
     },
   },
   hooks: {
@@ -188,7 +218,15 @@ export const auth = betterAuth({
           message: nameIssue,
         })
       }
-      const message = await accountRateLimitMessage(ctx.path, ctx.body)
+      // Per-IP failed sign-in limit first, so a blocked address does not
+      // also use up its targets' per-account attempts. It reserves a slot
+      // that the after hook settles; release it here if this hook refuses.
+      const ip = ctx.headers ? getClientIp({ headers: ctx.headers }) : null
+      let message = await reserveSignInAttempt(ctx.path, ip)
+      if (!message) {
+        message = await accountRateLimitMessage(ctx.path, ctx.body)
+        if (message) await settleSignInAttempt(ctx.path, ip, false)
+      }
       // The code lets the client keep this German message (with its wait
       // time) instead of the generic 429 text (lib/auth-error-message.ts).
       if (message) {
@@ -197,6 +235,15 @@ export const auth = betterAuth({
           code: "ACCOUNT_RATE_LIMITED",
         })
       }
+    }),
+    // Count wrong email/password sign-ins per IP (lib/account-rate-limit.ts).
+    // Unverified-email refusals are not counted: they mean the password was right.
+    after: createAuthMiddleware(async (ctx) => {
+      await settleSignInAttempt(
+        ctx.path,
+        ctx.headers ? getClientIp({ headers: ctx.headers }) : null,
+        isInvalidCredentials(ctx.context.returned)
+      )
     }),
   },
   session: {
