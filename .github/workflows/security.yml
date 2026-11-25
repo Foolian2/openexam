@@ -70,7 +70,7 @@ jobs:
         # Requires GitHub Dependency Graph + Advanced Security to be enabled.
         # Skip gracefully until those features are turned on for this repo.
         continue-on-error: true
-        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5
+        uses: actions/dependency-review-action@bbc44d14a204704ccc493733616cd1e93a0321ec # v5
         with:
           fail-on-severity: high
 
@@ -81,7 +81,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         # v6.1.0 is the floor for pnpm 12: every earlier release bootstraps
         # with pnpm 11, whose self-installer expects the target version to
         # expose `bin/pnpm.mjs`. pnpm 12 replaced that with a native launcher
@@ -125,7 +125,7 @@ jobs:
       # Pinned by SHA; bump deliberately after reviewing the diff.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7
         with:
           go-version: "1.27.4"
           cache-dependency-path: ws-backend/go.sum
@@ -235,7 +235,7 @@ jobs:
       - name: Upload SARIF
         # Requires GitHub Advanced Security — skip gracefully when not enabled.
         continue-on-error: true
-        uses: github/codeql-action/upload-sarif@093c0af4c358e174c90d33c5672595fb14c89183 # v4
+        uses: github/codeql-action/upload-sarif@1f7399200784d9da30eaf9fe2c9488073bd245fe # v4
         with:
           sarif_file: "trivy-${{ matrix.name }}.sarif"
           category: "trivy-${{ matrix.name }}"
@@ -434,7 +434,7 @@ jobs:
         if: always()
         # Requires GitHub Advanced Security — skip gracefully when not enabled.
         continue-on-error: true
-        uses: github/codeql-action/upload-sarif@093c0af4c358e174c90d33c5672595fb14c89183 # v4
+        uses: github/codeql-action/upload-sarif@1f7399200784d9da30eaf9fe2c9488073bd245fe # v4
         with:
           sarif_file: semgrep.sarif
           category: semgrep
