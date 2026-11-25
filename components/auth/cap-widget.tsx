@@ -21,6 +21,8 @@ declare module "react" {
       "cap-widget": React.DetailedHTMLProps<
         React.HTMLAttributes<HTMLElement> & {
           "data-cap-api-endpoint"?: string
+          "data-cap-lang"?: string
+          "data-cap-i18n-verify-aria-label"?: string
         },
         HTMLElement
       >
@@ -70,6 +72,12 @@ export function CapWidget({ onSolve }: { onSolve: (token: string) => void }) {
       <cap-widget
         ref={ref}
         data-cap-api-endpoint={process.env.NEXT_PUBLIC_CAP_WIDGET_ENDPOINT}
+        // The widget otherwise follows the browser language, not the page's
+        // lang="de". Its default aria-label also omits the visible text
+        // ("Ich bin ein Mensch"), which breaks WCAG 2.5.3 (label in name)
+        // for voice-control users, so the label starts with that text.
+        data-cap-lang="de"
+        data-cap-i18n-verify-aria-label="Ich bin ein Mensch – klicken, um zu bestätigen"
       />
     </>
   )
