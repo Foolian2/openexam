@@ -25,9 +25,9 @@ import {
 import {
   accountKey,
   accountRateLimitMessage,
-  failedSignInMessage,
   isInvalidCredentials,
-  recordFailedSignIn,
+  reserveSignInAttempt,
+  settleSignInAttempt,
 } from "@/lib/account-rate-limit"
 import { rateLimit } from "@/lib/rate-limit"
 import { withEmailChangeState } from "@/lib/email-change-state"
@@ -218,11 +218,14 @@ export const auth = betterAuth({
         })
       }
       // Per-IP failed sign-in limit first, so a blocked address does not
-      // also use up its targets' per-account attempts.
+      // also use up its targets' per-account attempts. It reserves a slot
+      // that the after hook settles; release it here if this hook refuses.
       const ip = ctx.headers ? getClientIp({ headers: ctx.headers }) : null
-      const message =
-        (await failedSignInMessage(ctx.path, ip)) ??
-        (await accountRateLimitMessage(ctx.path, ctx.body))
+      let message = await reserveSignInAttempt(ctx.path, ip)
+      if (!message) {
+        message = await accountRateLimitMessage(ctx.path, ctx.body)
+        if (message) await settleSignInAttempt(ctx.path, ip, false)
+      }
       // The code lets the client keep this German message (with its wait
       // time) instead of the generic 429 text (lib/auth-error-message.ts).
       if (message) {
@@ -235,10 +238,10 @@ export const auth = betterAuth({
     // Count wrong email/password sign-ins per IP (lib/account-rate-limit.ts).
     // Unverified-email refusals are not counted: they mean the password was right.
     after: createAuthMiddleware(async (ctx) => {
-      if (ctx.path !== "/sign-in/email") return
-      if (!isInvalidCredentials(ctx.context.returned)) return
-      await recordFailedSignIn(
-        ctx.headers ? getClientIp({ headers: ctx.headers }) : null
+      await settleSignInAttempt(
+        ctx.path,
+        ctx.headers ? getClientIp({ headers: ctx.headers }) : null,
+        isInvalidCredentials(ctx.context.returned)
       )
     }),
   },

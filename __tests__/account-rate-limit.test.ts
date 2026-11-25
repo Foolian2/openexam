@@ -1,22 +1,23 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
 const rateLimit = vi.hoisted(() => vi.fn())
-const underRateLimit = vi.hoisted(() => vi.fn())
-vi.mock("@/lib/rate-limit", () => ({ rateLimit, underRateLimit }))
+const evalScript = vi.hoisted(() => vi.fn())
+vi.mock("@/lib/rate-limit", () => ({ rateLimit }))
+vi.mock("@/lib/redis", () => ({ redis: { eval: evalScript } }))
 
 import { APIError } from "better-auth/api"
 import { BASE_ERROR_CODES } from "better-auth"
 import {
   accountKey,
   accountRateLimitMessage,
-  failedSignInMessage,
   isInvalidCredentials,
-  recordFailedSignIn,
+  reserveSignInAttempt,
+  settleSignInAttempt,
 } from "@/lib/account-rate-limit"
 
 beforeEach(() => {
-  underRateLimit.mockReset()
-  underRateLimit.mockResolvedValue(true)
+  evalScript.mockReset()
+  evalScript.mockResolvedValue(1)
   rateLimit.mockReset()
   rateLimit.mockResolvedValue({
     allowed: true,
@@ -79,43 +80,68 @@ describe("per-account credential throttle", () => {
 })
 
 describe("per-IP failed sign-in throttle", () => {
-  it("counts a failure against the IP: 50 per 15 minutes, fail-open", async () => {
-    await recordFailedSignIn("203.0.113.7")
-    expect(rateLimit).toHaveBeenCalledWith(
-      "login-failed-ip:203.0.113.7",
-      50,
-      900,
-      "open"
-    )
-  })
+  const KEYS = [
+    "ratelimit:login-failed-ip:203.0.113.7",
+    "ratelimit:login-pending-ip:203.0.113.7",
+  ]
 
-  it("only reads the counter before a sign-in, so successes are never counted", async () => {
+  it("reserves an in-flight slot against 50 failures before the password check", async () => {
     expect(
-      await failedSignInMessage("/sign-in/email", "203.0.113.7")
+      await reserveSignInAttempt("/sign-in/email", "203.0.113.7")
     ).toBeNull()
-    expect(underRateLimit).toHaveBeenCalledWith(
-      "login-failed-ip:203.0.113.7",
-      50
+    expect(evalScript).toHaveBeenCalledWith(
+      expect.stringContaining("failed + pending"),
+      2,
+      ...KEYS,
+      50,
+      60
     )
-    expect(rateLimit).not.toHaveBeenCalled()
   })
 
-  it("refuses every password sign-in from the IP once over the limit", async () => {
-    underRateLimit.mockResolvedValue(false)
-    expect(await failedSignInMessage("/sign-in/email", "203.0.113.7")).toMatch(
+  it("refuses password sign-in from the IP once failures + in-flight reach the limit", async () => {
+    evalScript.mockResolvedValue(0)
+    expect(await reserveSignInAttempt("/sign-in/email", "203.0.113.7")).toMatch(
       /Zu viele fehlgeschlagene Anmeldungen/
     )
   })
 
-  it("ignores other endpoints and requests without a client IP", async () => {
-    underRateLimit.mockResolvedValue(false)
+  it("settles the slot, counting only failures for 15 minutes", async () => {
+    await settleSignInAttempt("/sign-in/email", "203.0.113.7", true)
+    expect(evalScript).toHaveBeenLastCalledWith(
+      expect.stringContaining("DECR"),
+      2,
+      ...KEYS,
+      "1",
+      900
+    )
+    await settleSignInAttempt("/sign-in/email", "203.0.113.7", false)
+    expect(evalScript).toHaveBeenLastCalledWith(
+      expect.stringContaining("DECR"),
+      2,
+      ...KEYS,
+      "0",
+      900
+    )
+  })
+
+  it("fails open when Redis is unreachable", async () => {
+    evalScript.mockRejectedValue(new Error("down"))
     expect(
-      await failedSignInMessage("/sign-up/email", "203.0.113.7")
+      await reserveSignInAttempt("/sign-in/email", "203.0.113.7")
     ).toBeNull()
-    expect(await failedSignInMessage("/sign-in/email", null)).toBeNull()
-    await recordFailedSignIn(null)
-    expect(underRateLimit).not.toHaveBeenCalled()
-    expect(rateLimit).not.toHaveBeenCalled()
+    await expect(
+      settleSignInAttempt("/sign-in/email", "203.0.113.7", true)
+    ).resolves.toBeUndefined()
+  })
+
+  it("ignores other endpoints and requests without a client IP", async () => {
+    expect(
+      await reserveSignInAttempt("/sign-up/email", "203.0.113.7")
+    ).toBeNull()
+    expect(await reserveSignInAttempt("/sign-in/email", null)).toBeNull()
+    await settleSignInAttempt("/sign-in/social", "203.0.113.7", true)
+    await settleSignInAttempt("/sign-in/email", null, true)
+    expect(evalScript).not.toHaveBeenCalled()
   })
 
   it("recognises better-auth's wrong email/password error and nothing else", () => {
