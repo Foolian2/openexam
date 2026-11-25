@@ -11,9 +11,14 @@ const mocks = vi.hoisted(() => ({
   refund: vi.fn(),
   storedBytes: vi.fn(),
   advisoryLock: vi.fn(),
+  gate: vi.fn(),
+  reread: vi.fn(),
 }))
 vi.mock("@/lib/api-auth", () => ({
-  requireSession: vi.fn(async () => ({ user: { id: "u1", role: "STUDENT" } })),
+  requireSession: vi.fn(async () => ({
+    user: { id: "u1", role: "STUDENT" },
+    session: { id: "auth-1" },
+  })),
 }))
 vi.mock("@/lib/prisma", () => ({
   prisma: {
@@ -25,6 +30,7 @@ vi.mock("@/lib/prisma", () => ({
         $executeRaw: mocks.advisoryLock,
         $queryRaw: mocks.storedBytes,
         answerFile: {},
+        examSession: { updateMany: mocks.gate, findUnique: mocks.reread },
       }),
   },
 }))
@@ -82,6 +88,7 @@ beforeEach(() => {
   mocks.budget.mockResolvedValue(20)
   mocks.storedBytes.mockResolvedValue([{ bytes: null }])
   mocks.advisoryLock.mockResolvedValue(1)
+  mocks.gate.mockResolvedValue({ count: 1 })
 })
 describe("replacement upload durability", () => {
   it("keeps the previously saved attachment when a replacement is only uploaded", async () => {
@@ -117,6 +124,18 @@ describe("replacement upload durability", () => {
     expect(mocks.refund).toHaveBeenCalledOnce()
   })
 
+  it("rolls back stored bytes when a takeover wins and refunds the budget", async () => {
+    mocks.gate.mockResolvedValue({ count: 0 })
+    mocks.reread.mockResolvedValue({ activeAuthSessionId: "auth-2" })
+    const res = await upload()
+    expect(res.status).toBe(409)
+    expect((await res.json()).error.code).toBe("SESSION_REPLACED")
+    // The insert ran on the transaction client, so the gate's throw rolls
+    // it back with the transaction.
+    expect(mocks.store.mock.calls[0][4]).toBeDefined()
+    expect(mocks.refund).toHaveBeenCalledOnce()
+  })
+
   it("counts stored bytes and inserts under a per-session advisory lock", async () => {
     const order: string[] = []
     mocks.advisoryLock.mockImplementation(async () => {
@@ -130,9 +149,15 @@ describe("replacement upload durability", () => {
     mocks.store.mockImplementation(async () => {
       order.push("insert")
     })
+    mocks.gate.mockImplementation(async () => {
+      order.push("gate")
+      return { count: 1 }
+    })
     const res = await upload()
     expect(res.status).toBe(200)
-    expect(order).toEqual(["lock", "sum", "insert"])
+    // The session row lock (the gate) is taken last, so a large insert
+    // does not hold up answer flushes, autosaves or takeover claims.
+    expect(order).toEqual(["lock", "sum", "insert", "gate"])
     const lockSql = mocks.advisoryLock.mock.calls[0][0] as {
       join?: (s: string) => string
     } & string[]

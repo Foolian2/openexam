@@ -130,6 +130,7 @@ func TestRoom_BroadcastMonitorUpdate_PublishesOnlyFixturePatchKeys(t *testing.T)
 		"timeExtensionMin":    5,
 		"sebIntegrityFlagged": true,
 		"sebIntegrityReason":  "bek_changed",
+		"deviceReplacedCount": 1,
 	}
 
 	room.BroadcastMonitorUpdate("sess-1", want)

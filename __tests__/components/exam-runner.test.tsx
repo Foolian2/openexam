@@ -22,6 +22,12 @@ vi.mock("@/hooks/use-integrity-monitor", () => ({
 }))
 vi.mock("@/lib/seb-client", () => ({ sebFetch: m.fetch, getSebKey: vi.fn() }))
 vi.mock("@/lib/api-mutate", () => ({ apiMutate: m.api }))
+// The runner claims the session for this tab before loading; these tests
+// count apiMutate calls for the submit flow only, so the claim always succeeds.
+vi.mock("@/lib/exam-device-client", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/exam-device-client")>()),
+  claimExamDevice: vi.fn(async () => ({ ok: true })),
+}))
 vi.mock("@/components/accessibility-provider", () => ({
   useAccessibility: () => ({ prefs: { hideExamTimer: false } }),
 }))
@@ -328,8 +334,10 @@ it("persists the pending buffer on unmount before tearing it down", async () => 
   typeAnswer("Typed late")
   cleanup()
   // The debounced write has not fired yet (800ms); unmount must flush the
-  // record so the pending answer survives for crash-recovery replay.
-  expect(JSON.parse(store.get("openexam:pending:s") ?? "null")).toEqual({
+  // record so the pending answer survives for crash-recovery replay. The
+  // record is scoped to this tab (openexam:pending:<session>:<tab>).
+  const key = [...store.keys()].find((k) => k.startsWith("openexam:pending:s:"))
+  expect(JSON.parse((key && store.get(key)) ?? "null")).toEqual({
     q: { type: "FREE_TEXT", text: "Typed late" },
   })
 })

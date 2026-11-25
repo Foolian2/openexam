@@ -58,6 +58,12 @@ import { useClock } from "@/hooks/use-clock"
 import { replaceDocument } from "@/lib/document-navigation"
 import { getSebKey, sebFetch } from "@/lib/seb-client"
 import { apiMutate } from "@/lib/api-mutate"
+import {
+  claimExamDevice,
+  claimFailureMessage,
+  onSessionReplaced,
+} from "@/lib/exam-device-client"
+import { ensureExclusiveExamTabId, getExamTabId } from "@/lib/exam-tab"
 import { sessionGate } from "@/lib/session-state"
 import {
   PRE_EXAM_THEME_HEARTBEAT_MS,
@@ -156,6 +162,7 @@ export function ExamRunner({
   const router = useRouter()
   const { theme: savedTheme } = useTheme()
   const [state, setState] = useState<SessionState | null>(null)
+  const sessionLoaded = state !== null
   const [loadError, setLoadError] = useState("")
   const [answers, setAnswers] = useState<Record<string, AnswerContent>>({})
   const [saveStates, setSaveStates] = useState<Record<string, SaveState>>({})
@@ -164,6 +171,11 @@ export function ExamRunner({
   const [submitting, setSubmitting] = useState(false)
   const [submitError, setSubmitError] = useState("")
   const [sessionLocked, setSessionLocked] = useState(false)
+  // Another login or tab took this session over (lib/exam-device.ts). The
+  // server refuses this tab's saves from then on, so everything stops until
+  // the student explicitly takes the session back.
+  const [replaced, setReplaced] = useState(false)
+  const [reclaiming, setReclaiming] = useState(false)
   const [textSize, setTextSize] = useState<ExamTextSize>(
     () => readExamTextSize() ?? "md"
   )
@@ -216,7 +228,7 @@ export function ExamRunner({
   // including when a managed browser denies access to localStorage.
   const bufferRef = useRef<AnswerBuffer<AnswerContent> | null>(null)
   if (bufferRef.current === null)
-    bufferRef.current = createLocalAnswerBuffer(sessionId)
+    bufferRef.current = createLocalAnswerBuffer(sessionId, getExamTabId)
   // Orders this tab's saves against each other and against what the server
   // already holds; seeded from the loaded answers before any save goes out.
   const [saveSeq] = useState(() => createClientSeq())
@@ -335,7 +347,7 @@ export function ExamRunner({
 
   const socket = useExamSocket({
     sessionId,
-    enabled: sebReady && state !== null,
+    enabled: sebReady && state !== null && !replaced,
     sebRequired,
     onControl: useCallback(
       (data: { action: string }) => {
@@ -345,6 +357,9 @@ export function ExamRunner({
             break
           case "SESSION_UNLOCKED":
             setSessionLocked(false)
+            break
+          case "SESSION_REPLACED":
+            setReplaced(true)
             break
           case "EXAM_CLOSED":
           case "SESSION_SUBMITTED":
@@ -417,7 +432,9 @@ export function ExamRunner({
         fallbackError: "save failed",
       })
       if (!result.ok) {
-        // Kept in localStorage; the retry loop picks it up again.
+        // Kept in localStorage; the retry loop picks it up again, or the
+        // reload after taking the session back replays it.
+        if (result.code === "SESSION_REPLACED") setReplaced(true)
         setSaveStates((s) => ({ ...s, [questionId]: "error" }))
         return false
       }
@@ -436,9 +453,38 @@ export function ExamRunner({
     let cancelled = false
     async function load() {
       try {
+        // Claim the session for this login before anything else, so the
+        // load below and the socket opened after it are not refused as a
+        // replaced login. Loading must stop on a failed claim: an unclaimed
+        // legacy row would otherwise admit concurrent clients.
+        // A duplicated tab starts with its original's identity; it must
+        // claim under its own, or the two would share one claim.
+        await ensureExclusiveExamTabId()
+        const claim = await claimExamDevice(sessionId)
+        if (!claim.ok) {
+          if (cancelled) return
+          // A claim that lost a concurrent takeover is the takeover state,
+          // not a generic load error: the tab must see the notice and choose
+          // explicitly — a reload here would silently claim the exam back
+          // and could displace the actual owner.
+          if (claim.code === "SESSION_REPLACED") {
+            setReplaced(true)
+            return
+          }
+          setLoadError(claimFailureMessage(claim))
+          return
+        }
+        if (cancelled) return
+        // This tab owns the session again; its record may be replayed by
+        // other tabs of this session once it is gone.
+        bufferRef.current?.clearReplaced()
         const res = await sebFetch(`/api/sessions/${sessionId}`)
         const data = await res.json()
         if (!res.ok) {
+          if (data.error?.code === "SESSION_REPLACED") {
+            setReplaced(true)
+            return
+          }
           if (data.error?.code === "NOT_STARTED") {
             // Shared start not reached yet (the take page let us through a
             // moment early): wait for it in the waiting room. A full load,
@@ -493,16 +539,29 @@ export function ExamRunner({
     }
   }, [sessionId, examId, saveAnswer, saveSeq, router, sebReady])
 
-  // Retry loop for failed saves.
+  // A replaced tab's record must not be replayed by the tab that owns the
+  // session now: edits made here after the takeover would overwrite newer
+  // answers. It stays this tab's own for a reclaim.
   useEffect(() => {
-    if (!sebReady) return
+    if (replaced) bufferRef.current?.markReplaced()
+  }, [replaced])
+
+  useEffect(
+    () => onSessionReplaced(sessionId, () => setReplaced(true)),
+    [sessionId]
+  )
+
+  // Retry loop for failed saves. Paused once replaced: every retry would be
+  // refused, and the buffered answers replay after taking the session back.
+  useEffect(() => {
+    if (!sebReady || !sessionLoaded || replaced) return
     const stop = bufferRef.current?.startRetryLoop(saveAnswer)
     return () => stop?.()
-  }, [sessionId, saveAnswer, sebReady])
+  }, [sessionId, saveAnswer, sebReady, sessionLoaded, replaced])
 
   // Poll session/exam status so a teacher lock or exam close is reflected live.
   useEffect(() => {
-    if (!sebReady) return
+    if (!sebReady || !sessionLoaded || replaced) return
     let cancelled = false
     let activeRequest: AbortController | null = null
     let requestTimeout: ReturnType<typeof setTimeout> | undefined
@@ -514,11 +573,18 @@ export function ExamRunner({
         // this one to settle, so a half-open connection must not stop status
         // updates for the rest of the exam. Abort also releases the request.
         const data = await Promise.race([
-          (async (): Promise<SessionState | null> => {
+          (async (): Promise<SessionState | "REPLACED" | null> => {
             const res = await sebFetch(`/api/sessions/${sessionId}`, {
               signal: controller.signal,
             })
-            return res.ok ? res.json() : null
+            if (res.ok) return res.json()
+            // The poll never claims: that would let this tab silently take
+            // the session back from the login that replaced it.
+            if (res.status === 409) {
+              const body = await res.json().catch(() => null)
+              if (body?.error?.code === "SESSION_REPLACED") return "REPLACED"
+            }
+            return null
           })(),
           new Promise<never>((_, reject) => {
             requestTimeout = setTimeout(() => {
@@ -528,6 +594,10 @@ export function ExamRunner({
           }),
         ])
         if (!data || cancelled) return
+        if (data === "REPLACED") {
+          setReplaced(true)
+          return
+        }
         const gate = sessionGate(data.session.status, data.exam.status)
         if (gate === "LOCKED") {
           setSessionLocked(true)
@@ -580,7 +650,7 @@ export function ExamRunner({
       clearTimeout(requestTimeout)
       activeRequest?.abort()
     }
-  }, [sessionId, router, socket.connected, sebReady])
+  }, [sessionId, router, socket.connected, sebReady, sessionLoaded, replaced])
 
   const handleSubmit = useCallback(
     async (auto: boolean) => {
@@ -657,6 +727,11 @@ export function ExamRunner({
       // clearing answers as though our API had confirmed the submission.
       const alreadySubmitted =
         !result.ok && result.status === 409 && result.code === "CONFLICT"
+      if (!result.ok && result.code === "SESSION_REPLACED") {
+        setReplaced(true)
+        setSubmitting(false)
+        return
+      }
       if (!result.ok && !alreadySubmitted) {
         setSubmitError(result.message)
         setSubmitting(false)
@@ -773,6 +848,7 @@ export function ExamRunner({
           fallbackError: "Markierung konnte nicht gespeichert werden",
         })
         if (!result.ok) {
+          if (result.code === "SESSION_REPLACED") setReplaced(true)
           setBookmarkedQuestionIds((current) => {
             const next = new Set(current)
             if (desired) next.delete(questionId)
@@ -809,6 +885,26 @@ export function ExamRunner({
           </div>
         </div>
       </div>
+    )
+  }
+
+  if (replaced) {
+    return (
+      <ReplacedScreen
+        reclaiming={reclaiming}
+        onReclaim={async () => {
+          setReclaiming(true)
+          // Taking the session back is the same claim the other
+          // login made; the reload replays this tab's unsaved answers.
+          const claim = await claimExamDevice(sessionId)
+          if (claim.ok) {
+            window.location.reload()
+            return
+          }
+          setReclaiming(false)
+          toast.error(claimFailureMessage(claim))
+        }}
+      />
     )
   }
 
@@ -1305,4 +1401,51 @@ function QuestionInput({
     sessionId,
     idPrefix: `tf-${question.id}-`,
   })
+}
+
+/**
+ * Shown once another tab or login took the session over. Announced as an
+ * alert, with focus moved to the reclaim button: the editor that held focus
+ * is gone.
+ */
+function ReplacedScreen({
+  reclaiming,
+  onReclaim,
+}: {
+  reclaiming: boolean
+  onReclaim: () => void
+}) {
+  const reclaimRef = useRef<HTMLButtonElement>(null)
+  useEffect(() => {
+    reclaimRef.current?.focus()
+  }, [])
+  return (
+    <div className="flex min-h-svh items-center justify-center p-6">
+      <div
+        role="alert"
+        className="flex max-w-md flex-col items-center gap-4 text-center"
+      >
+        <h1 className="flex items-center gap-2 text-base font-normal text-destructive">
+          <AlertTriangle className="h-5 w-5" aria-hidden="true" />
+          Diese Prüfung wurde auf einem anderen Gerät oder in einem anderen
+          Fenster geöffnet.
+        </h1>
+        <p className="text-sm text-muted-foreground">
+          Hier können keine Antworten mehr gespeichert werden. Die Lehrperson
+          wurde informiert. Wenn Sie selbst das Gerät gewechselt haben, arbeiten
+          Sie dort weiter. Wenn Sie hier weiterarbeiten, werden Eingaben aus
+          diesem Fenster, die noch nicht gespeichert waren, übernommen.
+        </p>
+        <div className="flex flex-wrap items-center justify-center gap-2">
+          <Button ref={reclaimRef} disabled={reclaiming} onClick={onReclaim}>
+            {reclaiming && <Spinner data-icon="inline-start" />}
+            Hier weiterarbeiten
+          </Button>
+          <Button asChild variant="ghost">
+            <Link href="/dashboard/student">Zum Dashboard</Link>
+          </Button>
+        </div>
+      </div>
+    </div>
+  )
 }

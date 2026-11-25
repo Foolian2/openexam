@@ -9,6 +9,11 @@ import { submitAnswerSchema } from "@/lib/validators/answer"
 import { fileKeyBelongsTo } from "@/lib/answer-file-key"
 import { OPEN_STATUSES, pastDeadline } from "@/lib/session-state"
 import { verifySebAccess } from "@/lib/seb-guard"
+import {
+  gateActiveDevice,
+  getExamDeviceId,
+  isActiveDevice,
+} from "@/lib/exam-device"
 import { publicRequestUrl } from "@/lib/seb-urls"
 import {
   ApiError,
@@ -16,6 +21,7 @@ import {
   forbidden,
   notFound,
   rateLimited,
+  sessionReplaced,
   validationError,
 } from "@/lib/api-response"
 
@@ -26,6 +32,7 @@ export async function PUT(request: NextRequest, { params }: Params) {
   const authed = await requireSession(request)
   if (authed instanceof NextResponse) return authed
   const session = authed
+  const deviceId = getExamDeviceId(request.headers)
 
   // Generous: this is the autosave path, called on every keystroke pause.
   const limit = await rateLimit(`session-answers:${session.user.id}`, 120, 60)
@@ -51,6 +58,9 @@ export async function PUT(request: NextRequest, { params }: Params) {
   })
   if (!guard.ok) {
     return forbidden("Safe Exam Browser erforderlich")
+  }
+  if (!isActiveDevice(examSession, session.session.id, deviceId)) {
+    return sessionReplaced()
   }
   if (pastDeadline(examSession.effectiveEndTime)) {
     return conflict("Bearbeitungszeit ist abgelaufen")
@@ -91,14 +101,15 @@ export async function PUT(request: NextRequest, { params }: Params) {
   let answer
   try {
     answer = await prisma.$transaction(async (tx) => {
-      // Re-check status inside the transaction so a concurrent lock (which
-      // also writes via a gated updateMany) can't be missed by a stale read.
-      const gate = await tx.examSession.updateMany({
-        where: { id, status: { in: OPEN_STATUSES } },
-        data: { lastSeenAt: new Date() },
+      // Re-check status and ownership inside the transaction so a concurrent
+      // lock or takeover (which also writes via a gated updateMany) can't be
+      // missed by a stale read.
+      await gateActiveDevice(tx, {
+        id,
+        status: { in: OPEN_STATUSES },
+        authSessionId: session.session.id,
+        deviceId,
       })
-      if (gate.count === 0)
-        throw new ApiError(409, "CONFLICT", "Sitzung ist nicht aktiv")
 
       // Raw SQL because the ordering guard needs ON CONFLICT ... WHERE: only
       // replace a stored answer whose clientSeq is lower, so this write and

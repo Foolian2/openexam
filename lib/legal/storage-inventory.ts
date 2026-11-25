@@ -59,11 +59,24 @@ export const STORAGE_INVENTORY: StorageEntry[] = [
     duration: days(SIDEBAR_COOKIE_MAX_AGE),
   },
   {
-    names: [`${ANSWER_BUFFER_KEY_PREFIX}:<Sitzung>`],
+    names: [
+      `${ANSWER_BUFFER_KEY_PREFIX}:<Sitzung>:<Fenster>`,
+      `${ANSWER_BUFFER_KEY_PREFIX}:<Sitzung>:<Fenster>:replaced`,
+      `${ANSWER_BUFFER_KEY_PREFIX}:<Sitzung>:<Fenster>:detached`,
+      // Legacy records written before per-tab scoping; adopted on next open.
+      `${ANSWER_BUFFER_KEY_PREFIX}:<Sitzung>`,
+    ],
     kind: "localStorage",
     purpose:
-      "Zwischenspeicher für Prüfungsantworten, damit bei Verbindungsabbruch oder Absturz nichts verloren geht.",
+      "Zwischenspeicher für Prüfungsantworten, damit bei Verbindungsabbruch oder Absturz nichts verloren geht. Getrennt je Browserfenster, damit ein übernommenes Fenster keine neueren Antworten überschreibt.",
     duration: "Bis die Antworten beim Server angekommen sind",
+  },
+  {
+    names: ["openexam.examTabId"],
+    kind: "sessionStorage",
+    purpose:
+      "Zufällige Kennung des Browserfensters, damit eine Prüfung nur in einem Fenster gleichzeitig bearbeitet wird.",
+    duration: "Bis das Browserfenster geschlossen wird",
   },
   {
     names: [`${SUBMIT_KEY_PREFIX}:<Sitzung>`],

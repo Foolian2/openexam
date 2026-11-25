@@ -124,11 +124,11 @@ type fakeStore struct {
 	err       error
 }
 
-func (f fakeStore) LookupSession(ctx context.Context, token string) (string, string, time.Time, error) {
+func (f fakeStore) LookupSession(ctx context.Context, token string) (string, string, string, time.Time, error) {
 	if f.err != nil {
-		return "", "", time.Time{}, f.err
+		return "", "", "", time.Time{}, f.err
 	}
-	return f.userID, f.role, f.expiresAt, nil
+	return "auth-session-1", f.userID, f.role, f.expiresAt, nil
 }
 
 func TestValidateRequest_Valid(t *testing.T) {
