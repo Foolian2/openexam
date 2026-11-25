@@ -1,11 +1,22 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
 const rateLimit = vi.hoisted(() => vi.fn())
-vi.mock("@/lib/rate-limit", () => ({ rateLimit }))
+const underRateLimit = vi.hoisted(() => vi.fn())
+vi.mock("@/lib/rate-limit", () => ({ rateLimit, underRateLimit }))
 
-import { accountKey, accountRateLimitMessage } from "@/lib/account-rate-limit"
+import { APIError } from "better-auth/api"
+import { BASE_ERROR_CODES } from "better-auth"
+import {
+  accountKey,
+  accountRateLimitMessage,
+  failedSignInMessage,
+  isInvalidCredentials,
+  recordFailedSignIn,
+} from "@/lib/account-rate-limit"
 
 beforeEach(() => {
+  underRateLimit.mockReset()
+  underRateLimit.mockResolvedValue(true)
   rateLimit.mockReset()
   rateLimit.mockResolvedValue({
     allowed: true,
@@ -64,5 +75,65 @@ describe("per-account credential throttle", () => {
     expect(await accountRateLimitMessage("/sign-in/email", {})).toBeNull()
     expect(await accountRateLimitMessage("/sign-in/email", null)).toBeNull()
     expect(rateLimit).not.toHaveBeenCalled()
+  })
+})
+
+describe("per-IP failed sign-in throttle", () => {
+  it("counts a failure against the IP: 50 per 15 minutes, fail-open", async () => {
+    await recordFailedSignIn("203.0.113.7")
+    expect(rateLimit).toHaveBeenCalledWith(
+      "login-failed-ip:203.0.113.7",
+      50,
+      900,
+      "open"
+    )
+  })
+
+  it("only reads the counter before a sign-in, so successes are never counted", async () => {
+    expect(
+      await failedSignInMessage("/sign-in/email", "203.0.113.7")
+    ).toBeNull()
+    expect(underRateLimit).toHaveBeenCalledWith(
+      "login-failed-ip:203.0.113.7",
+      50
+    )
+    expect(rateLimit).not.toHaveBeenCalled()
+  })
+
+  it("refuses every password sign-in from the IP once over the limit", async () => {
+    underRateLimit.mockResolvedValue(false)
+    expect(await failedSignInMessage("/sign-in/email", "203.0.113.7")).toMatch(
+      /Zu viele fehlgeschlagene Anmeldungen/
+    )
+  })
+
+  it("ignores other endpoints and requests without a client IP", async () => {
+    underRateLimit.mockResolvedValue(false)
+    expect(
+      await failedSignInMessage("/sign-up/email", "203.0.113.7")
+    ).toBeNull()
+    expect(await failedSignInMessage("/sign-in/email", null)).toBeNull()
+    await recordFailedSignIn(null)
+    expect(underRateLimit).not.toHaveBeenCalled()
+    expect(rateLimit).not.toHaveBeenCalled()
+  })
+
+  it("recognises better-auth's wrong email/password error and nothing else", () => {
+    expect(
+      isInvalidCredentials(
+        APIError.from(
+          "UNAUTHORIZED",
+          BASE_ERROR_CODES.INVALID_EMAIL_OR_PASSWORD
+        )
+      )
+    ).toBe(true)
+    // An unverified address means the password was right.
+    expect(
+      isInvalidCredentials(
+        APIError.from("FORBIDDEN", BASE_ERROR_CODES.EMAIL_NOT_VERIFIED)
+      )
+    ).toBe(false)
+    expect(isInvalidCredentials({ token: "t", user: {} })).toBe(false)
+    expect(isInvalidCredentials(undefined)).toBe(false)
   })
 })

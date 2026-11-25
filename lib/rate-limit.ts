@@ -83,3 +83,29 @@ export async function rateLimit(
     }
   }
 }
+
+/**
+ * Reads a `rateLimit` counter without counting a hit: true while `key` is
+ * still under `limit`. For limits that count only some outcomes (e.g. failed
+ * sign-ins) but must refuse every request once exceeded. Fails open and
+ * honours DISABLE_RATE_LIMIT like `rateLimit`.
+ */
+export async function underRateLimit(
+  key: string,
+  limit: number
+): Promise<boolean> {
+  if (
+    process.env.DISABLE_RATE_LIMIT === "true" &&
+    process.env.NODE_ENV !== "production"
+  ) {
+    return true
+  }
+  try {
+    const count = Number((await redis.get(`ratelimit:${key}`)) ?? 0)
+    if (count < limit) return true
+    rateLimitRejections.inc({ reason: "limit" })
+    return false
+  } catch {
+    return true
+  }
+}

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto"
 import { z } from "zod"
-import { rateLimit } from "@/lib/rate-limit"
+import { rateLimit, underRateLimit } from "@/lib/rate-limit"
 
 /**
  * Per-account throttles on credential endpoints, layered on better-auth's
@@ -57,4 +57,62 @@ export async function accountRateLimitMessage(
     "open"
   )
   return result.allowed ? null : rule.message
+}
+
+/**
+ * Failed password sign-ins per client IP. better-auth's per-IP sign-in rule
+ * has to admit a whole class behind one school NAT address (lib/auth.ts), which
+ * on its own would let one address try a common password against ~200
+ * accounts a minute (password spraying) without tripping the per-account
+ * limit above. Counting only failures keeps a class that signs in correctly
+ * unaffected, while spraying from one address stops after FAILED_SIGN_IN_LIMIT
+ * wrong guesses. Sized for typos across several classes on one school
+ * address; a successful sign-in does not reset it, so an attacker cannot clear
+ * the count by interleaving their own account.
+ */
+export const FAILED_SIGN_IN_LIMIT = 50
+export const FAILED_SIGN_IN_WINDOW_SECONDS = 15 * 60
+const FAILED_SIGN_IN_MESSAGE =
+  "Zu viele fehlgeschlagene Anmeldungen von diesem Netzwerk. Bitte in 15 Minuten erneut versuchen."
+
+function failedSignInKey(ip: string): string {
+  return `login-failed-ip:${ip}`
+}
+
+/**
+ * The German error message when password sign-in from `ip` is blocked by too
+ * many recent failures, otherwise null. Only reads the counter; failures are
+ * counted by recordFailedSignIn. Fails open on Redis errors.
+ */
+export async function failedSignInMessage(
+  path: string,
+  ip: string | null
+): Promise<string | null> {
+  if (path !== "/sign-in/email" || !ip) return null
+  return (await underRateLimit(failedSignInKey(ip), FAILED_SIGN_IN_LIMIT))
+    ? null
+    : FAILED_SIGN_IN_MESSAGE
+}
+
+/** Counts one wrong email/password sign-in from `ip`. Fails open. */
+export async function recordFailedSignIn(ip: string | null): Promise<void> {
+  if (!ip) return
+  await rateLimit(
+    failedSignInKey(ip),
+    FAILED_SIGN_IN_LIMIT,
+    FAILED_SIGN_IN_WINDOW_SECONDS,
+    "open"
+  )
+}
+
+/** better-auth's wrong email or password refusal on /sign-in/email. */
+export function isInvalidCredentials(returned: unknown): boolean {
+  // Duck-typed: the error is better-call's APIError, which need not be the
+  // same class instance that better-auth/api re-exports.
+  if (typeof returned !== "object" || returned === null) return false
+  const { statusCode, body } = returned as {
+    statusCode?: unknown
+    body?: { code?: unknown }
+  }
+  return statusCode === 401 && body?.code === "INVALID_EMAIL_OR_PASSWORD"
 }

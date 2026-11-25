@@ -26,6 +26,9 @@ All notable changes to OpenExam are documented here. The format follows
   address (200/min, was 5/min; Microsoft sign-in was 3 per 10 s) and sign-up
   for a class registering together (40 per 10 min). Per-account limits and the
   Cap proof-of-work still bound guessing.
+- Limit failed password sign-ins to 50 per 15 minutes per IP, so the higher
+  per-IP sign-in limit cannot be used to try one password against many
+  accounts. Correct sign-ins are not counted, so a class is not affected.
 - Give the Cap site key a class-sized rate limit (600/min per IP, was Cap's
   default 30 per 5 s); `create-cap-site-key.sh` sets it on existing keys too.
 
