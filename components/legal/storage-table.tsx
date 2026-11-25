@@ -11,7 +11,7 @@ import {
 export function StorageTable() {
   return (
     <div className="rounded-lg border">
-      <Table>
+      <Table scrollLabel="Cookies und lokaler Speicher">
         <TableHeader>
           <TableRow>
             <TableHead>Name</TableHead>
